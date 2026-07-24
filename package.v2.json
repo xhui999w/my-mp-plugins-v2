@@ -1,13 +1,14 @@
-{
-  "hello_world": {
+[
+  {
+    "id": "hello_world",
     "name": "妖妖舞订阅转存助手",
     "description": "自动解析TG/PT资源并转存至115网盘",
-    "labels": "工具",
     "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png",
     "author": "YourName",
-    "level": 1,
-    "release": true,
-    "path": "plugins.v2/hello_world"
+    "tags": ["工具"],
+    "zip_url": "https://github.com/xhui999w/my-mp-plugins-v2/archive/refs/heads/main.zip",
+    "repository": "https://github.com/xhui999w/my-mp-plugins-v2",
+    "homepage": ""
   }
-}
+]
