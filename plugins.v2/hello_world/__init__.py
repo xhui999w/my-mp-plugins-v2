@@ -3,17 +3,19 @@ from typing import Any, List, Dict, Tuple, Optional
 
 from app.core.config import settings
 from app.log import logger
-# V2 正确基类导入
 from app.core.plugin import PluginBase
 
 
 class HelloWorld(PluginBase):
-    plugin_id = "hello_world"
     plugin_name = "115订阅转存助手"
     plugin_desc = "自动解析TG/PT资源并转存至115网盘"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
     plugin_version = "1.0.1"
-    plugin_author = "YourName"
+    plugin_author = "xhui999w"
+    author_url = "https://github.com/xhui999w"
+    plugin_config_prefix = "helloworld_"
+    plugin_order = 20
+    auth_level = 1
 
     _enabled = False
     _onlyonce = False
@@ -33,10 +35,19 @@ class HelloWorld(PluginBase):
                 logger.warning("【115转存助手】未配置 115 Cookie，转存功能无法生效！")
 
             if self._onlyonce:
-                # 使用框架自带延迟异步任务，不新建调度器
                 self.async_task(self.sync, delay=3)
                 self._onlyonce = False
                 self.update_config({"onlyonce": False})
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        return []
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -97,13 +108,9 @@ class HelloWorld(PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
             return []
-        return [{"id": "HelloWorld", "name": "115转存服务", "trigger": "interval", "func": self.sync, "hours": 6}]
-
-    def get_state(self) -> bool:
-        return self._enabled
+        return [{"id": "HelloWorld", "name": "115转存服务", "trigger": "interval", "func": self.sync, "kwargs": {"hours": 6}}]
 
     def stop_service(self):
-        """框架自动管理定时任务，无需手动处理调度器"""
         pass
 
     def sync(self):
