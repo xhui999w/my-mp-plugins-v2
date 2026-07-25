@@ -1,8 +1,8 @@
 {
-  "hello_world": {
+  "HelloWorld": {
     "name": "115订阅转存助手",
     "description": "自动解析TG/PT资源并转存至115网盘",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "icon": "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png",
     "author": "xhui999w",
     "level": 1
