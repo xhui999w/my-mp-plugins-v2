@@ -15,7 +15,7 @@ from urllib.parse import urlparse, parse_qs
 import requests
 from bs4 import BeautifulSoup
 
-from app.plugins import _PluginBase
+from app.core.plugin import PluginBase
 from app.log import logger
 
 # MP订阅系统集成
@@ -23,7 +23,7 @@ from app.db.subscribe_oper import SubscribeOper
 from app.schemas.types import MediaType
 
 
-class Tg115Transfer(_PluginBase):
+class Tg115Transfer(PluginBase):
     """
     115网盘转存助手
     自动监控TG公开频道中的115分享链接，转存到115网盘指定目录
