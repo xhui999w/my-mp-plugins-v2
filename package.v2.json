@@ -2,9 +2,13 @@
   "HelloWorld": {
     "name": "115订阅转存助手",
     "description": "自动解析TG/PT资源并转存至115网盘",
+    "labels": "转存,115,下载",
     "version": "1.0.2",
     "icon": "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png",
     "author": "xhui999w",
-    "level": 1
+    "level": 1,
+    "history": {
+      "v1.0.2": "初始版本：实现115 Cookie配置和定时转存框架"
+    }
   }
 }
