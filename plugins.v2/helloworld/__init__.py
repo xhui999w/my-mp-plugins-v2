@@ -10,7 +10,7 @@ class HelloWorld(PluginBase):
     plugin_name = "115订阅转存助手"
     plugin_desc = "自动解析TG/PT资源并转存至115网盘"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "helloworld_"
