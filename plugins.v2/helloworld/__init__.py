@@ -3,10 +3,10 @@ from typing import Any, List, Dict, Tuple, Optional
 
 from app.core.config import settings
 from app.log import logger
-from app.core.plugin import PluginBase
+from app.plugins import _PluginBase
 
 
-class HelloWorld(PluginBase):
+class HelloWorld(_PluginBase):
     plugin_name = "115订阅转存助手"
     plugin_desc = "自动解析TG/PT资源并转存至115网盘"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
