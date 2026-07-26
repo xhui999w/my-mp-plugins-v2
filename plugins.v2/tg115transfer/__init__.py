@@ -33,7 +33,7 @@ class Tg115Transfer(_PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.5"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -116,7 +116,9 @@ class Tg115Transfer(_PluginBase):
                 if self._scheduler.get_jobs():
                     self._scheduler.start()
                 self._onlyonce = False
-                self.update_config({"onlyonce": False})
+                saved_config = dict(config)
+                saved_config["onlyonce"] = False
+                self.update_config(saved_config)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -862,7 +864,12 @@ class Tg115Transfer(_PluginBase):
                     "Chrome/125.0.0.0 Safari/537.36"
                 )
             }
-            resp = requests.get(url, headers=headers, timeout=30)
+            resp = requests.get(
+                url,
+                headers=headers,
+                proxies=settings.PROXY,
+                timeout=30
+            )
             resp.raise_for_status()
             resp.encoding = "utf-8"
 
@@ -1271,11 +1278,16 @@ class Tg115Transfer(_PluginBase):
             return
         try:
             url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
-            requests.post(url, json={
-                "chat_id": self._admin_user_id,
-                "text": text,
-                "parse_mode": "HTML"
-            }, timeout=15)
+            requests.post(
+                url,
+                json={
+                    "chat_id": self._admin_user_id,
+                    "text": text,
+                    "parse_mode": "HTML"
+                },
+                proxies=settings.PROXY,
+                timeout=15
+            )
         except Exception as e:
             logger.error(f"【115转存助手】通知发送失败: {e}")
 
@@ -1400,11 +1412,16 @@ class Tg115Transfer(_PluginBase):
             return {"code": 1, "data": {"ok": False, "message": "Bot Token 或管理员ID 未配置"}}
         try:
             url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
-            resp = requests.post(url, json={
-                "chat_id": self._admin_user_id,
-                "text": "✅ 115转存助手 Bot 测试消息\n如果您看到这条消息，说明通知配置正常。",
-                "parse_mode": "HTML"
-            }, timeout=15)
+            resp = requests.post(
+                url,
+                json={
+                    "chat_id": self._admin_user_id,
+                    "text": "✅ 115转存助手 Bot 测试消息\n如果您看到这条消息，说明通知配置正常。",
+                    "parse_mode": "HTML"
+                },
+                proxies=settings.PROXY,
+                timeout=15
+            )
             if resp.json().get("ok"):
                 return {"code": 0, "data": {"ok": True, "message": "测试消息已发送"}}
             return {"code": 1, "data": {"ok": False, "message": resp.json().get("description", "发送失败")}}
