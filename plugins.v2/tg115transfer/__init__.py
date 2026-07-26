@@ -33,7 +33,7 @@ class Tg115Transfer(_PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.2.5"
+    plugin_version = "1.2.6"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -1033,11 +1033,12 @@ class Tg115Transfer(_PluginBase):
                     "share_code": share_code,
                     "receive_code": receive_code,
                     "limit": limit,
-                    "offset": offset
+                    "offset": offset,
+                    "cid": ""
                 }
-                snap_resp = requests.post(
+                snap_resp = requests.get(
                     "https://webapi.115.com/share/snap",
-                    data=snap_data, headers=headers, timeout=30
+                    params=snap_data, headers=headers, timeout=30
                 )
                 snap_json = snap_resp.json()
 

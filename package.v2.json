@@ -3,11 +3,12 @@
     "name": "115网盘转存助手",
     "description": "自动监控TG频道中的115分享链接并转存到指定目录（支持MP订阅集成）",
     "labels": "转存,115,下载,TG监控,订阅集成",
-    "version": "1.2.5",
+    "version": "1.2.6",
     "icon": "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png",
     "author": "xhui999w",
     "level": 1,
     "history": {
+      "v1.2.6": "修复115分享信息接口请求方式错误导致转存返回405的问题",
       "v1.2.5": "修复立即运行后Cookie、频道和目录等配置被清空的问题",
       "v1.2.4": "Telegram抓取和Bot通知自动复用MoviePilot代理",
       "v1.2.3": "适配当前MoviePilot V2插件基类，并改用可写的数据目录",
