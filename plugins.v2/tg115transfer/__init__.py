@@ -8,9 +8,10 @@ import time
 import hashlib
 import sqlite3
 import os
+from html import unescape
 from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -33,7 +34,7 @@ class Tg115Transfer(_PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -678,8 +679,19 @@ class Tg115Transfer(_PluginBase):
                 ON messages(status)""")
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_messages_created
                 ON messages(created_at)""")
+            # v1.2.6 之前因 share/snap 错用 POST 而失败的记录需要重新处理。
+            # 仅清除该已知错误，不影响其他成功或失败记录。
+            retry_count = conn.execute(
+                """DELETE FROM messages
+                   WHERE status = 'failed'
+                     AND result LIKE '%405 METHOD NOT ALLOWED%'"""
+            ).rowcount
             conn.commit()
             conn.close()
+            if retry_count:
+                logger.info(
+                    f"【115转存助手】已释放 {retry_count} 条旧版405失败记录，将重新尝试转存"
+                )
         except Exception as e:
             logger.error(f"【115转存助手】数据库初始化失败: {e}")
 
@@ -824,6 +836,49 @@ class Tg115Transfer(_PluginBase):
         url = re.sub(r"https?://anxia\.com/", "https://115.com/", url)
         return url
 
+    def _share_url_from_href(self, href: str) -> str:
+        """
+        从超链接中提取115分享地址。
+
+        支持：
+        - “点击跳转”等文字背后的直接115/115cdn/anxia链接
+        - Telegram或其他页面用 url= 参数包装的跳转链接
+        - URL编码后的115分享链接
+        """
+        if not href:
+            return ""
+
+        candidates = [unescape(href.strip())]
+        checked = set()
+
+        while candidates and len(checked) < 10:
+            candidate = candidates.pop(0)
+            if not candidate or candidate in checked:
+                continue
+            checked.add(candidate)
+
+            decoded = unquote(candidate)
+            if decoded != candidate:
+                candidates.append(decoded)
+
+            match = re.search(
+                r"https?://(?:115|115cdn|anxia)\.com/s/[A-Za-z0-9]+"
+                r"(?:\?[^\s\"'<>#]*)?",
+                decoded,
+                flags=re.IGNORECASE
+            )
+            if match:
+                return self._normalize_share_url(match.group(0))
+
+            try:
+                query = parse_qs(urlparse(decoded).query)
+                for key in ("url", "target", "redirect", "redirect_url", "link"):
+                    candidates.extend(query.get(key, []))
+            except Exception:
+                continue
+
+        return ""
+
     def _extract_links_from_element(self, element, message_text: str = "") -> List[Dict]:
         """
         从HTML元素中提取所有115分享链接（修复3）
@@ -834,13 +889,18 @@ class Tg115Transfer(_PluginBase):
         # 1. 提取所有 <a> 标签 href
         for a_tag in element.find_all("a"):
             href = a_tag.get("href", "").strip()
-            if href and self.SHARE_PATTERN.search(href):
-                href = self._normalize_share_url(href)
-                found.append({"url": href, "context": message_text})
+            share_url = self._share_url_from_href(href)
+            if share_url:
+                found.append({"url": share_url, "context": message_text})
 
         # 2. 提取纯文本中的裸URL
         raw_text = element.get_text(separator=" ", strip=True)
-        for m in re.finditer(r"https?://(?:115|115cdn|anxia)\.com/s/\w+", raw_text):
+        for m in re.finditer(
+            r"https?://(?:115|115cdn|anxia)\.com/s/[A-Za-z0-9]+"
+            r"(?:\?[^\s\"'<>#]*)?",
+            raw_text,
+            flags=re.IGNORECASE
+        ):
             url = self._normalize_share_url(m.group(0))
             # 避免与 <a> 标签重复
             if not any(f["url"] == url for f in found):
@@ -912,9 +972,9 @@ class Tg115Transfer(_PluginBase):
                 # 3c. 按钮中的链接
                 for btn in div.select("a.tgme_widget_message_inline_button"):
                     btn_href = btn.get("href", "").strip()
-                    if btn_href and self.SHARE_PATTERN.search(btn_href):
-                        btn_href = self._normalize_share_url(btn_href)
-                        all_links.append({"url": btn_href, "context": full_text})
+                    share_url = self._share_url_from_href(btn_href)
+                    if share_url:
+                        all_links.append({"url": share_url, "context": full_text})
 
                 # 3d. 转发消息来源中的链接
                 fwd_div = div.select_one("div.tgme_widget_message_forwarded_from")
