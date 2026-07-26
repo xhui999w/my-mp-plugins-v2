@@ -33,7 +33,7 @@ class Tg115Transfer(PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
