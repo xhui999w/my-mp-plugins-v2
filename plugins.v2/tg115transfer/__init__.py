@@ -34,7 +34,7 @@ class Tg115Transfer(_PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.2.7"
+    plugin_version = "1.3.0"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -54,6 +54,7 @@ class Tg115Transfer(_PluginBase):
     # 115网盘
     _cookie_115 = ""        # 115 Cookie
     _save_dir = "0"         # 115保存目录ID（0=根目录）
+    _offline_enabled = False  # 启用 magnet/ed2k 离线下载
 
     # 策略
     _check_interval = 10    # 检查间隔（分钟）
@@ -88,6 +89,7 @@ class Tg115Transfer(_PluginBase):
             self._channels = config.get("channels", "").strip()
             self._cookie_115 = config.get("cookie_115", "").strip()
             self._save_dir = str(config.get("save_dir", "0") or "0")
+            self._offline_enabled = config.get("offline_enabled", False)
             interval = config.get("check_interval", 10)
             self._check_interval = int(interval) if str(interval).isdigit() else 10
             self._dedup_mode = config.get("dedup_mode", "skip")
@@ -398,6 +400,24 @@ class Tg115Transfer(_PluginBase):
                                     }
                                 ]
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {'component': 'VSwitch', 'props': {
+                                        'model': 'offline_enabled',
+                                        'label': '启用115离线下载（磁力 / ED2K）'
+                                    }},
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'text',
+                                            'text': '开启后，频道中的 magnet 和 ed2k 链接会自动提交到115离线任务，并保存到上方目录。'
+                                        }
+                                    }
+                                ]
+                            },
                         ]
                     },
                     # ========== 区域四：订阅集成 ==========
@@ -490,6 +510,7 @@ class Tg115Transfer(_PluginBase):
             "channels": "oneonefivewpfx",
             "cookie_115": "",
             "save_dir": "0",
+            "offline_enabled": False,
             "check_interval": 10,
             "dedup_mode": "skip",
             "max_items": 50,
@@ -879,6 +900,36 @@ class Tg115Transfer(_PluginBase):
 
         return ""
 
+    @staticmethod
+    def _extract_offline_urls(text: str) -> List[str]:
+        """从文本或超链接中提取 magnet、ed2k 离线下载地址。"""
+        if not text:
+            return []
+
+        content = unescape(text.strip())
+        found = []
+
+        # magnet 参数可能包含多个 tracker，保留完整链接。
+        magnet_pattern = re.compile(
+            r"magnet:\?xt=urn:btih:[A-Za-z0-9]{32,64}"
+            r"(?:&[^\s\"'<>]+)*",
+            flags=re.IGNORECASE
+        )
+        # ED2K 文件链接格式：
+        # ed2k://|file|文件名|大小|32位哈希|/
+        ed2k_pattern = re.compile(
+            r"ed2k://\|file\|[^\r\n\"'<>]+?\|\d+\|[A-Fa-f0-9]{32}\|/",
+            flags=re.IGNORECASE
+        )
+
+        for pattern in (magnet_pattern, ed2k_pattern):
+            for match in pattern.finditer(content):
+                url = match.group(0).rstrip(".,，。;；")
+                if url not in found:
+                    found.append(url)
+
+        return found
+
     def _extract_links_from_element(self, element, message_text: str = "") -> List[Dict]:
         """
         从HTML元素中提取所有115分享链接（修复3）
@@ -891,7 +942,18 @@ class Tg115Transfer(_PluginBase):
             href = a_tag.get("href", "").strip()
             share_url = self._share_url_from_href(href)
             if share_url:
-                found.append({"url": share_url, "context": message_text})
+                found.append({
+                    "url": share_url,
+                    "context": message_text,
+                    "link_type": "share"
+                })
+            elif self._offline_enabled:
+                for offline_url in self._extract_offline_urls(href):
+                    found.append({
+                        "url": offline_url,
+                        "context": message_text,
+                        "link_type": "offline"
+                    })
 
         # 2. 提取纯文本中的裸URL
         raw_text = element.get_text(separator=" ", strip=True)
@@ -904,7 +966,21 @@ class Tg115Transfer(_PluginBase):
             url = self._normalize_share_url(m.group(0))
             # 避免与 <a> 标签重复
             if not any(f["url"] == url for f in found):
-                found.append({"url": url, "context": message_text})
+                found.append({
+                    "url": url,
+                    "context": message_text,
+                    "link_type": "share"
+                })
+
+        # 3. 提取正文中的磁力和ED2K链接
+        if self._offline_enabled:
+            for offline_url in self._extract_offline_urls(raw_text):
+                if not any(f["url"] == offline_url for f in found):
+                    found.append({
+                        "url": offline_url,
+                        "context": message_text,
+                        "link_type": "offline"
+                    })
 
         return found
 
@@ -974,7 +1050,18 @@ class Tg115Transfer(_PluginBase):
                     btn_href = btn.get("href", "").strip()
                     share_url = self._share_url_from_href(btn_href)
                     if share_url:
-                        all_links.append({"url": share_url, "context": full_text})
+                        all_links.append({
+                            "url": share_url,
+                            "context": full_text,
+                            "link_type": "share"
+                        })
+                    elif self._offline_enabled:
+                        for offline_url in self._extract_offline_urls(btn_href):
+                            all_links.append({
+                                "url": offline_url,
+                                "context": full_text,
+                                "link_type": "offline"
+                            })
 
                 # 3d. 转发消息来源中的链接
                 fwd_div = div.select_one("div.tgme_widget_message_forwarded_from")
@@ -1002,6 +1089,7 @@ class Tg115Transfer(_PluginBase):
                         "source_url": msg_url,
                         "share_url": share_url,
                         "message_text": link.get("context", full_text),
+                        "link_type": link.get("link_type", "share"),
                     })
 
             logger.info(
@@ -1165,6 +1253,95 @@ class Tg115Transfer(_PluginBase):
             return False, f"网络错误: {e}"
         except Exception as e:
             return False, f"转存异常: {e}"
+
+    def add_115_offline_task(self, task_url: str) -> Tuple[bool, str]:
+        """将 magnet 或 ed2k 链接提交到115离线下载。"""
+        if not self._offline_enabled:
+            return False, "115离线下载未启用"
+        if not self._cookie_115:
+            return False, "115 Cookie 未配置"
+        if not self._extract_offline_urls(task_url):
+            return False, "不支持的离线链接格式"
+
+        headers = {
+            "Cookie": self._cookie_115,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://115.com",
+            "Referer": "https://115.com/?tab=offline&mode=wangpan"
+        }
+
+        try:
+            # 离线接口需要当前账号UID。
+            user_resp = requests.get(
+                "https://my.115.com/?ct=ajax&ac=get_user_aq",
+                headers=headers,
+                timeout=30
+            )
+            user_json = user_resp.json()
+            uid = (user_json.get("data") or {}).get("uid", "")
+            if not uid:
+                return False, "获取115账号UID失败，Cookie可能已过期"
+
+            # 获取本次离线任务所需的 sign 和 time。
+            sign_resp = requests.get(
+                "https://115.com/?ct=offline&ac=space",
+                headers=headers,
+                timeout=30
+            )
+            sign_json = sign_resp.json()
+            sign_data = sign_json.get("data") or {}
+            sign = sign_json.get("sign") or sign_data.get("sign")
+            sign_time = sign_json.get("time") or sign_data.get("time")
+            if not sign or not sign_time:
+                error = (
+                    sign_json.get("error_msg")
+                    or sign_json.get("error")
+                    or "无法获取离线任务签名"
+                )
+                return False, f"115离线签名获取失败: {error}"
+
+            payload = {
+                "url": task_url,
+                "savepath": "",
+                "wp_path_id": self._save_dir,
+                "uid": uid,
+                "sign": sign,
+                "time": sign_time
+            }
+            task_resp = requests.post(
+                "https://115.com/web/lixian/?ct=lixian&ac=add_task_url",
+                data=payload,
+                headers=headers,
+                timeout=60
+            )
+            task_json = task_resp.json()
+
+            if task_json.get("state"):
+                return True, "115离线任务提交成功"
+
+            error = (
+                task_json.get("error_msg")
+                or task_json.get("error")
+                or task_json.get("message")
+                or "未知错误"
+            )
+            # 任务已存在说明115端已经接收过，不重复提交也算成功。
+            if any(word in str(error) for word in ("任务已存在", "链接已存在", "重复任务")):
+                return True, f"115离线任务已存在，跳过重复提交: {error}"
+            return False, f"115离线任务提交失败: {error}"
+
+        except requests.RequestException as e:
+            return False, f"115离线网络错误: {e}"
+        except ValueError:
+            return False, "115离线接口返回了无法解析的数据"
+        except Exception as e:
+            return False, f"115离线任务异常: {e}"
 
     def _test_115_cookie(self) -> Tuple[bool, str]:
         """测试115 Cookie是否有效，返回 (有效, 脱敏信息)"""
@@ -1410,13 +1587,19 @@ class Tg115Transfer(_PluginBase):
             share_url = msg["share_url"]
             message_text = msg.get("message_text", "")
             subscribe_name = msg.get("subscribe_name", "")
+            link_type = msg.get("link_type", "share")
 
             logger.info(
                 f"【115转存助手】[{processed}/{self._max_items}] "
-                f"发现: {share_url}"
+                f"发现{'离线链接' if link_type == 'offline' else '115分享'}: {share_url}"
             )
 
-            ok, msg_text = self.transfer_115(share_url, message_text)
+            if link_type == "offline":
+                ok, msg_text = self.add_115_offline_task(share_url)
+                action_name = "115离线任务提交"
+            else:
+                ok, msg_text = self.transfer_115(share_url, message_text)
+                action_name = "115转存"
             status = "success" if ok else "failed"
 
             self._save_record(
@@ -1436,7 +1619,7 @@ class Tg115Transfer(_PluginBase):
                 total_fail += 1
 
             notify_text = (
-                f"{'✅' if ok else '❌'} 115转存{'成功' if ok else '失败'}\n"
+                f"{'✅' if ok else '❌'} {action_name}{'成功' if ok else '失败'}\n"
                 f"📎 {share_url}\n"
                 f"📝 {msg_text}"
             )
