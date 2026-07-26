@@ -16,7 +16,7 @@ import requests
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from app.core.plugin import PluginBase
+from app.plugins import _PluginBase
 from app.core.config import settings
 from app.log import logger
 
@@ -25,7 +25,7 @@ from app.db.subscribe_oper import SubscribeOper
 from app.schemas.types import MediaType
 
 
-class Tg115Transfer(PluginBase):
+class Tg115Transfer(_PluginBase):
     """
     115网盘转存助手
     自动监控TG公开频道中的115分享链接，转存到115网盘指定目录
@@ -33,7 +33,7 @@ class Tg115Transfer(PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -98,9 +98,7 @@ class Tg115Transfer(PluginBase):
             self._admin_user_id = config.get("admin_user_id", "").strip()
 
         # 初始化数据库
-        plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        db_dir = os.path.join(plugin_dir, "data")
-        os.makedirs(db_dir, exist_ok=True)
+        db_dir = str(self.get_data_path())
         self._db_path = os.path.join(db_dir, "tg115transfer.db")
         self._init_database()
 

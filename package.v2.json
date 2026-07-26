@@ -3,11 +3,12 @@
     "name": "115网盘转存助手",
     "description": "自动监控TG频道中的115分享链接并转存到指定目录（支持MP订阅集成）",
     "labels": "转存,115,下载,TG监控,订阅集成",
-    "version": "1.2.2",
+    "version": "1.2.3",
     "icon": "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png",
     "author": "xhui999w",
     "level": 1,
     "history": {
+      "v1.2.3": "适配当前MoviePilot V2插件基类，并改用可写的数据目录",
       "v1.2.2": "修复插件清单 ID 大小写不一致导致安装后无法加载的问题",
       "v1.2.1": "修复立即运行和详情页 API 未注册的问题",
       "v1.2.0": "新增MP订阅集成：读取订阅列表、标题匹配、缺集过滤、仅转存缺失资源",
