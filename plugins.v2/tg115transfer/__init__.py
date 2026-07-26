@@ -11,7 +11,7 @@ import os
 from html import unescape
 from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,7 +34,7 @@ class Tg115Transfer(_PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -73,8 +73,13 @@ class Tg115Transfer(_PluginBase):
     SUPPORTED_DOMAINS = [
         "115.com", "115cdn.com", "anxia.com"
     ]
-    SHARE_PATTERN = re.compile(
-        r"https?://(?:115|115cdn|anxia)\.com/s/\w+"
+    # 安全跳转白名单：只解析这些域名，不访问未知跳转页。
+    TRUSTED_SHARE_DOMAINS = ("115.com", "115cdn.com", "anxia.com")
+    TRUSTED_WRAPPER_DOMAINS = ("t.me", "telegram.me", "telegram.org")
+    WRAPPER_QUERY_KEYS = ("url", "target", "redirect", "redirect_url", "link")
+    JUMP_LABEL_PATTERN = re.compile(
+        r"点击跳转|直达链接|立即查看|打开链接|获取资源|一键转存",
+        flags=re.IGNORECASE
     )
 
     # ============================================================
@@ -262,7 +267,7 @@ class Tg115Transfer(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '【Telegram 来源】配置要监控的公开频道。公开频道无需Bot进频道，插件通过 t.me/s/ 页面抓取。'
+                                            'text': '【Telegram 来源】配置要监控的公开频道。插件仅解析Telegram页面中的可信115、磁力和ED2K地址；广告域名、短链及未知跳转页不会被访问。'
                                         }
                                     }
                                 ]
@@ -848,14 +853,37 @@ class Tg115Transfer(_PluginBase):
     #  TG频道爬取与链接提取
     # ============================================================
 
+    @staticmethod
+    def _host_in_allowlist(host: str, allowlist: Tuple[str, ...]) -> bool:
+        """精确匹配白名单域名及其子域名，避免 evil115.com 之类的伪装域名。"""
+        host = (host or "").lower().strip(".")
+        return any(host == domain or host.endswith(f".{domain}") for domain in allowlist)
+
     def _normalize_share_url(self, url: str) -> str:
-        """
-        规范化115分享链接（修复2）
-        将 115cdn.com / anxia.com 统一转为 115.com
-        """
-        url = re.sub(r"https?://115cdn\.com/", "https://115.com/", url)
-        url = re.sub(r"https?://anxia\.com/", "https://115.com/", url)
-        return url
+        """校验并规范化可信115分享链接，只保留分享码和提取码。"""
+        try:
+            parsed = urlparse(unescape(url.strip()))
+            if parsed.scheme.lower() not in ("http", "https"):
+                return ""
+            if not self._host_in_allowlist(
+                parsed.hostname or "", self.TRUSTED_SHARE_DOMAINS
+            ):
+                return ""
+
+            match = re.match(r"^/s/([A-Za-z0-9]+)", parsed.path, flags=re.IGNORECASE)
+            if not match:
+                return ""
+
+            normalized = f"https://115.com/s/{match.group(1)}"
+            query = parse_qs(parsed.query)
+            for key in ("password", "pwd", "code", "提取码"):
+                value = (query.get(key) or [""])[0].strip()
+                if value:
+                    normalized += f"?{urlencode({'password': value})}"
+                    break
+            return normalized
+        except Exception:
+            return ""
 
     def _share_url_from_href(self, href: str) -> str:
         """
@@ -863,8 +891,10 @@ class Tg115Transfer(_PluginBase):
 
         支持：
         - “点击跳转”等文字背后的直接115/115cdn/anxia链接
-        - Telegram或其他页面用 url= 参数包装的跳转链接
+        - Telegram可信页面用 url= 参数包装的跳转链接
         - URL编码后的115分享链接
+
+        安全规则：未知网站、广告短链和需要执行JavaScript的页面一律不访问。
         """
         if not href:
             return ""
@@ -882,19 +912,20 @@ class Tg115Transfer(_PluginBase):
             if decoded != candidate:
                 candidates.append(decoded)
 
-            match = re.search(
-                r"https?://(?:115|115cdn|anxia)\.com/s/[A-Za-z0-9]+"
-                r"(?:\?[^\s\"'<>#]*)?",
-                decoded,
-                flags=re.IGNORECASE
-            )
-            if match:
-                return self._normalize_share_url(match.group(0))
-
             try:
-                query = parse_qs(urlparse(decoded).query)
-                for key in ("url", "target", "redirect", "redirect_url", "link"):
-                    candidates.extend(query.get(key, []))
+                parsed = urlparse(decoded)
+                host = parsed.hostname or ""
+                if parsed.scheme.lower() not in ("http", "https"):
+                    continue
+
+                if self._host_in_allowlist(host, self.TRUSTED_SHARE_DOMAINS):
+                    return self._normalize_share_url(decoded)
+
+                # 只允许Telegram官方域名作为包装页，并且只拆参数，不发网络请求。
+                if self._host_in_allowlist(host, self.TRUSTED_WRAPPER_DOMAINS):
+                    query = parse_qs(parsed.query)
+                    for key in self.WRAPPER_QUERY_KEYS:
+                        candidates.extend(query.get(key, []))
             except Exception:
                 continue
 
@@ -930,6 +961,41 @@ class Tg115Transfer(_PluginBase):
 
         return found
 
+    def _offline_urls_from_href(self, href: str) -> List[str]:
+        """安全解析超链接中的离线地址，不访问未知跳转网站。"""
+        if not href:
+            return []
+
+        candidates = [unescape(href.strip())]
+        checked = set()
+
+        while candidates and len(checked) < 10:
+            candidate = candidates.pop(0)
+            if not candidate or candidate in checked:
+                continue
+            checked.add(candidate)
+
+            decoded = unquote(candidate)
+            direct = self._extract_offline_urls(decoded)
+            if direct and decoded.lower().startswith(("magnet:", "ed2k://")):
+                return direct
+
+            try:
+                parsed = urlparse(decoded)
+                if parsed.scheme.lower() not in ("http", "https"):
+                    continue
+                if not self._host_in_allowlist(
+                    parsed.hostname or "", self.TRUSTED_WRAPPER_DOMAINS
+                ):
+                    continue
+                query = parse_qs(parsed.query)
+                for key in self.WRAPPER_QUERY_KEYS:
+                    candidates.extend(query.get(key, []))
+            except Exception:
+                continue
+
+        return []
+
     def _extract_links_from_element(self, element, message_text: str = "") -> List[Dict]:
         """
         从HTML元素中提取所有115分享链接（修复3）
@@ -941,19 +1007,35 @@ class Tg115Transfer(_PluginBase):
         for a_tag in element.find_all("a"):
             href = a_tag.get("href", "").strip()
             share_url = self._share_url_from_href(href)
+            offline_urls = (
+                self._offline_urls_from_href(href)
+                if self._offline_enabled else []
+            )
             if share_url:
                 found.append({
                     "url": share_url,
                     "context": message_text,
                     "link_type": "share"
                 })
-            elif self._offline_enabled:
-                for offline_url in self._extract_offline_urls(href):
+            elif offline_urls:
+                for offline_url in offline_urls:
                     found.append({
                         "url": offline_url,
                         "context": message_text,
                         "link_type": "offline"
                     })
+            if (
+                not share_url
+                and not offline_urls
+                and self.JUMP_LABEL_PATTERN.search(a_tag.get_text(" ", strip=True))
+            ):
+                try:
+                    host = urlparse(href).hostname or "未知域名"
+                except Exception:
+                    host = "无效链接"
+                logger.debug(
+                    f"【115转存助手】安全跳过非白名单跳转链接（未访问）: {host}"
+                )
 
         # 2. 提取纯文本中的裸URL
         raw_text = element.get_text(separator=" ", strip=True)
@@ -1056,7 +1138,7 @@ class Tg115Transfer(_PluginBase):
                             "link_type": "share"
                         })
                     elif self._offline_enabled:
-                        for offline_url in self._extract_offline_urls(btn_href):
+                        for offline_url in self._offline_urls_from_href(btn_href):
                             all_links.append({
                                 "url": offline_url,
                                 "context": full_text,
