@@ -14,8 +14,10 @@ from urllib.parse import urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.core.plugin import PluginBase
+from app.core.config import settings
 from app.log import logger
 
 # MP订阅系统集成
@@ -31,7 +33,7 @@ class Tg115Transfer(PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -63,6 +65,7 @@ class Tg115Transfer(PluginBase):
 
     # ==================== 运行时 ====================
     _db_path = ""
+    _scheduler = None
 
     # 支持的域名列表
     SUPPORTED_DOMAINS = [
@@ -106,7 +109,14 @@ class Tg115Transfer(PluginBase):
                 logger.warning("【115转存助手】未配置115 Cookie，转存功能无法生效")
 
             if self._onlyonce:
-                self.async_task(self.monitor_channels, delay=3)
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                self._scheduler.add_job(
+                    func=self.monitor_channels,
+                    trigger="date",
+                    run_date=datetime.now() + timedelta(seconds=3)
+                )
+                if self._scheduler.get_jobs():
+                    self._scheduler.start()
                 self._onlyonce = False
                 self.update_config({"onlyonce": False})
 
@@ -121,32 +131,37 @@ class Tg115Transfer(PluginBase):
         """注册API端点，供前端调用"""
         return [
             {
-                "path": "test_cookie",
-                "method": "POST",
+                "path": "/test_cookie",
+                "endpoint": self.api_test_cookie,
+                "methods": ["POST"],
                 "summary": "测试115Cookie",
                 "description": "检查115 Cookie是否有效并返回账号脱敏信息"
             },
             {
-                "path": "test_bot",
-                "method": "POST",
+                "path": "/test_bot",
+                "endpoint": self.api_test_bot,
+                "methods": ["POST"],
                 "summary": "测试TG Bot",
                 "description": "向管理员发送一条测试通知消息"
             },
             {
-                "path": "scan_now",
-                "method": "POST",
+                "path": "/scan_now",
+                "endpoint": self.api_scan_now,
+                "methods": ["POST"],
                 "summary": "立即扫描",
                 "description": "立即触发一次频道扫描和转存"
             },
             {
-                "path": "stats",
-                "method": "GET",
+                "path": "/stats",
+                "endpoint": self.api_stats,
+                "methods": ["GET"],
                 "summary": "运行统计",
                 "description": "获取最近扫描状态和今日统计"
             },
             {
-                "path": "check_dir",
-                "method": "POST",
+                "path": "/check_dir",
+                "endpoint": self.api_check_dir,
+                "methods": ["POST"],
                 "summary": "检查目录",
                 "description": "检查115保存目录ID是否有效"
             },
@@ -623,6 +638,12 @@ class Tg115Transfer(PluginBase):
 
     def stop_service(self):
         """服务停止时保存状态"""
+        if self._scheduler:
+            try:
+                self._scheduler.shutdown(wait=False)
+            except Exception:
+                pass
+            self._scheduler = None
         self._save_stats({
             "next_scan_time": "",
             "status": "stopped"
@@ -1396,7 +1417,13 @@ class Tg115Transfer(PluginBase):
         """立即触发扫描（API）"""
         if not self._enabled:
             return {"code": 1, "data": {"ok": False, "message": "插件未启用，请先启用插件"}}
-        self.async_task(self.monitor_channels, delay=1)
+        scheduler = BackgroundScheduler(timezone=settings.TZ)
+        scheduler.add_job(
+            func=self.monitor_channels,
+            trigger="date",
+            run_date=datetime.now() + timedelta(seconds=1)
+        )
+        scheduler.start()
         return {"code": 0, "data": {"ok": True, "message": "扫描任务已触发"}}
 
     def api_stats(self, **kwargs) -> Dict:
