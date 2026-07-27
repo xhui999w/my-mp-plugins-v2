@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MoviePilot-V2-673AB7" alt="MoviePilot V2">
-  <img src="https://img.shields.io/badge/Version-1.3.1-00AEEF" alt="Version 1.3.1">
+  <img src="https://img.shields.io/badge/Version-1.4.0-00AEEF" alt="Version 1.4.0">
   <img src="https://img.shields.io/badge/Language-Python-3776AB" alt="Python">
 </p>
 
@@ -27,7 +27,7 @@ Telegram 公开频道
         ↓
 可信域名与链接类型检查
         ↓
-115 分享转存 / 115 离线下载
+115 分享转存 / 影巢OpenAPI解锁 / 115 离线下载
         ↓
 保存记录、去重、统计和通知
 ```
@@ -45,6 +45,8 @@ Telegram 公开频道
 - 可通过 Telegram Bot 向指定账号发送成功、失败和本轮汇总通知。
 - 自动复用 MoviePilot 的网络代理访问 Telegram 页面和 Bot API。
 - 插件详情页显示运行状态、今日统计和最近处理记录。
+- 识别 `hdhive.com/resource/...`，通过影巢官方 OpenAPI 解锁后复用原有115转存流程。
+- 自动刷新过期的影巢 Access Token，并单独记录等待、成功和失败状态。
 
 ## 安全跳转策略
 
@@ -72,9 +74,9 @@ Telegram 包装链接只读取 `url`、`target`、`redirect`、`redirect_url` �
 | MoviePilot 订阅缺集过滤 | ✅ 可选 |
 | Telegram 私有频道 | ❌ 暂不支持 |
 | 广告、陌生短链和未知跳转页 | ❌ 主动拒绝 |
-| 影巢页面自动登录、解锁和转存 | ❌ 暂未接入 |
+| 影巢OpenAPI解锁和115转存 | ✅ 需要官方应用及OAuth授权 |
 
-> 影巢相关功能需要官方 OpenAPI/OAuth 授权。目前插件不会模拟登录，也不会绕过网站权限。
+> 插件只调用影巢官方 OpenAPI，不模拟登录，也不会绕过网站权限。
 
 ## 安装
 
@@ -88,7 +90,7 @@ https://github.com/xhui999w/my-mp-plugins-v2
 
 ### 2. 刷新插件市场
 
-刷新后搜索 **115 网盘转存助手**，确认显示的版本为 `1.3.1` 或更高版本。
+刷新后搜索 **115 网盘转存助手**，确认显示的版本为 `1.4.0` 或更高版本。
 
 ### 3. 安装插件
 
@@ -214,6 +216,7 @@ Cookie 相当于账号登录凭证：
 
 ## 版本记录
 
+- `1.4.0`：新增影巢OpenAPI资源解锁、Token自动刷新、独立目录和去重记录。
 - `1.3.1`：新增安全跳转白名单，不访问广告、短链及未知跳转页。
 - `1.3.0`：新增磁力和 ED2K 识别及 115 离线下载。
 - `1.2.7`：支持提取“点击跳转”等超链接中的 115 地址。

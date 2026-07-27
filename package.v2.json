@@ -1,13 +1,14 @@
 {
   "Tg115Transfer": {
     "name": "115网盘转存助手",
-    "description": "自动监控TG频道中的115分享链接并转存到指定目录（支持MP订阅集成）",
-    "labels": "转存,115,下载,TG监控,订阅集成",
-    "version": "1.3.1",
+    "description": "自动监控TG频道中的115与影巢资源，并转存到指定115目录",
+    "labels": "转存,115,下载,TG监控,订阅集成,影巢",
+    "version": "1.4.0",
     "icon": "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png",
     "author": "xhui999w",
     "level": 1,
     "history": {
+      "v1.4.0": "新增影巢OpenAPI集成：识别hdhive资源、OAuth Token自动刷新、解锁115链接、复用现有转存及独立去重记录",
       "v1.3.1": "新增安全跳转白名单：仅解析115官方域名和Telegram可信包装参数，广告、短链及未知跳转页不访问",
       "v1.3.0": "新增Telegram磁力链接和ED2K链接识别，可自动提交到115离线下载并保存到指定目录",
       "v1.2.7": "支持提取“点击跳转”等超链接中的115地址，并自动重试旧版405失败记录",

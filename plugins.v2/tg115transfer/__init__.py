@@ -25,6 +25,13 @@ from app.log import logger
 from app.db.subscribe_oper import SubscribeOper
 from app.schemas.types import MediaType
 
+from .hdhive import (
+    HDHiveClient,
+    HDHiveError,
+    extract_hdhive_urls,
+    normalize_hdhive_url,
+)
+
 
 class Tg115Transfer(_PluginBase):
     """
@@ -34,7 +41,7 @@ class Tg115Transfer(_PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.3.1"
+    plugin_version = "1.4.0"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -45,11 +52,24 @@ class Tg115Transfer(_PluginBase):
     _enabled = False
     _onlyonce = False
 
+    DEFAULT_HDHIVE_CHANNEL_URL = "https://t.me/oneonefivewpfx"
+    DEFAULT_HDHIVE_CHECK_INTERVAL = 10
+
     # ==================== 配置项 ====================
     # Telegram
     _channels = ""          # 公开频道列表（每行一个）
     _bot_token = ""         # Bot Token（可选，用于通知）
     _admin_user_id = ""     # 管理员TG用户ID（可选）
+
+    # 影巢频道
+    _hdhive_enabled = False
+    _hdhive_channel_url = DEFAULT_HDHIVE_CHANNEL_URL
+    _hdhive_save_dir = "0"
+    _hdhive_check_interval = DEFAULT_HDHIVE_CHECK_INTERVAL
+    _hdhive_api_base = "https://hdhive.com"
+    _hdhive_api_secret = ""
+    _hdhive_access_token = ""
+    _hdhive_refresh_token = ""
 
     # 115网盘
     _cookie_115 = ""        # 115 Cookie
@@ -68,6 +88,7 @@ class Tg115Transfer(_PluginBase):
     # ==================== 运行时 ====================
     _db_path = ""
     _scheduler = None
+    _config = {}
 
     # 支持的域名列表
     SUPPORTED_DOMAINS = [
@@ -81,6 +102,14 @@ class Tg115Transfer(_PluginBase):
         r"点击跳转|直达链接|立即查看|打开链接|获取资源|一键转存",
         flags=re.IGNORECASE
     )
+    HDHIVE_STATUS_WAITING = "等待"
+    HDHIVE_STATUS_SUCCESS = "成功"
+    HDHIVE_STATUS_FAILED = "失败"
+    HDHIVE_STATUSES = {
+        HDHIVE_STATUS_WAITING,
+        HDHIVE_STATUS_SUCCESS,
+        HDHIVE_STATUS_FAILED,
+    }
 
     # ============================================================
     #  插件生命周期
@@ -88,6 +117,7 @@ class Tg115Transfer(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """初始化插件，读取配置"""
+        self._config = dict(config or {})
         if config:
             self._enabled = config.get("enabled", False)
             self._onlyonce = config.get("onlyonce", False)
@@ -104,6 +134,39 @@ class Tg115Transfer(_PluginBase):
             self._subscribe_mode = config.get("subscribe_mode", "disabled")
             self._bot_token = config.get("bot_token", "").strip()
             self._admin_user_id = config.get("admin_user_id", "").strip()
+            self._hdhive_enabled = config.get("hdhive_enabled", False)
+            self._hdhive_channel_url = str(
+                config.get("hdhive_channel_url")
+                or self.DEFAULT_HDHIVE_CHANNEL_URL
+            ).strip()
+            self._hdhive_save_dir = str(
+                config.get("hdhive_save_dir", "0") or "0"
+            ).strip()
+            hdhive_interval = config.get(
+                "hdhive_check_interval",
+                self.DEFAULT_HDHIVE_CHECK_INTERVAL
+            )
+            self._hdhive_check_interval = (
+                int(hdhive_interval)
+                if str(hdhive_interval).isdigit()
+                else self.DEFAULT_HDHIVE_CHECK_INTERVAL
+            )
+            self._hdhive_check_interval = min(
+                max(self._hdhive_check_interval, 1),
+                1440
+            )
+            self._hdhive_api_base = str(
+                config.get("hdhive_api_base") or "https://hdhive.com"
+            ).strip().rstrip("/")
+            self._hdhive_api_secret = str(
+                config.get("hdhive_api_secret") or ""
+            ).strip()
+            self._hdhive_access_token = str(
+                config.get("hdhive_access_token") or ""
+            ).strip()
+            self._hdhive_refresh_token = str(
+                config.get("hdhive_refresh_token") or ""
+            ).strip()
 
         # 初始化数据库
         db_dir = str(self.get_data_path())
@@ -121,6 +184,12 @@ class Tg115Transfer(_PluginBase):
                     trigger="date",
                     run_date=datetime.now() + timedelta(seconds=3)
                 )
+                if self._hdhive_enabled:
+                    self._scheduler.add_job(
+                        func=self.monitor_hdhive_channel,
+                        trigger="date",
+                        run_date=datetime.now() + timedelta(seconds=5)
+                    )
                 if self._scheduler.get_jobs():
                     self._scheduler.start()
                 self._onlyonce = False
@@ -151,6 +220,13 @@ class Tg115Transfer(_PluginBase):
                 "methods": ["POST"],
                 "summary": "测试TG Bot",
                 "description": "向管理员发送一条测试通知消息"
+            },
+            {
+                "path": "/test_hdhive",
+                "endpoint": self.api_test_hdhive,
+                "methods": ["POST"],
+                "summary": "测试影巢OpenAPI",
+                "description": "检查影巢应用Secret和用户Access Token"
             },
             {
                 "path": "/scan_now",
@@ -339,7 +415,143 @@ class Tg115Transfer(_PluginBase):
                             },
                         ]
                     },
-                    # ========== 区域三：115 网盘 ==========
+                    # ========== 区域三：影巢频道 ==========
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '【影巢频道】独立配置影巢公开频道、自动转存、115目标目录和检测间隔。关闭自动转存时不会处理影巢资源。'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VSwitch', 'props': {
+                                        'model': 'hdhive_enabled',
+                                        'label': '启用影巢自动转存'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'hdhive_check_interval',
+                                            'label': '影巢检测间隔（分钟）',
+                                            'type': 'number',
+                                            'min': 1,
+                                            'max': 1440,
+                                            'hint': '建议 5~30 分钟'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'hdhive_channel_url',
+                                            'label': '影巢频道地址',
+                                            'placeholder': 'https://t.me/oneonefivewpfx',
+                                            'hint': '填写公开频道地址，支持 https://t.me/频道名'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'hdhive_save_dir',
+                                            'label': '影巢目标115目录ID',
+                                            'placeholder': '0（根目录）',
+                                            'hint': '从115网页版地址栏获取 cid 参数'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'text': '【影巢OpenAPI】需要应用 Secret（X-API-Key）及用户 OAuth Token，授权范围需包含 meta、query、unlock。敏感值只保存在插件配置中。'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_api_secret',
+                                        'label': '影巢 App Secret',
+                                        'type': 'password'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_access_token',
+                                        'label': '影巢 Access Token',
+                                        'type': 'password'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_refresh_token',
+                                        'label': '影巢 Refresh Token',
+                                        'type': 'password',
+                                        'hint': 'Access Token过期后自动刷新'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_api_base',
+                                        'label': '影巢OpenAPI地址',
+                                        'placeholder': 'https://hdhive.com'
+                                    }}
+                                ]
+                            },
+                        ]
+                    },
+                    # ========== 区域四：115 网盘 ==========
                     {
                         'component': 'VRow',
                         'content': [
@@ -425,7 +637,7 @@ class Tg115Transfer(_PluginBase):
                             },
                         ]
                     },
-                    # ========== 区域四：订阅集成 ==========
+                    # ========== 区域五：订阅集成 ==========
                     {
                         'component': 'VRow',
                         'content': [
@@ -477,7 +689,7 @@ class Tg115Transfer(_PluginBase):
                             },
                         ]
                     },
-                    # ========== 区域五：通知 ==========
+                    # ========== 区域六：通知 ==========
                     {
                         'component': 'VRow',
                         'content': [
@@ -513,6 +725,14 @@ class Tg115Transfer(_PluginBase):
             "enabled": False,
             "onlyonce": False,
             "channels": "oneonefivewpfx",
+            "hdhive_enabled": False,
+            "hdhive_channel_url": self.DEFAULT_HDHIVE_CHANNEL_URL,
+            "hdhive_save_dir": "0",
+            "hdhive_check_interval": self.DEFAULT_HDHIVE_CHECK_INTERVAL,
+            "hdhive_api_base": "https://hdhive.com",
+            "hdhive_api_secret": "",
+            "hdhive_access_token": "",
+            "hdhive_refresh_token": "",
             "cookie_115": "",
             "save_dir": "0",
             "offline_enabled": False,
@@ -541,6 +761,7 @@ class Tg115Transfer(_PluginBase):
             f"上次扫描: {last_scan}  |  "
             f"下次扫描: {next_scan}  |  "
             f"监控频道: {len([c for c in self._channels.split(chr(10)) if c.strip()]) if self._channels else 0} 个"
+            f"  |  影巢自动转存: {'已启用' if self._hdhive_enabled else '未启用'}"
             f"  |  订阅模式: {sub_text}"
         )
 
@@ -655,13 +876,24 @@ class Tg115Transfer(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
             return []
-        return [{
-            "id": "Tg115Transfer",
-            "name": "115转存监控服务",
-            "trigger": "interval",
-            "func": self.monitor_channels,
-            "kwargs": {"minutes": self._check_interval}
-        }]
+        services = []
+        if self._channels.strip():
+            services.append({
+                "id": "Tg115Transfer",
+                "name": "115转存监控服务",
+                "trigger": "interval",
+                "func": self.monitor_channels,
+                "kwargs": {"minutes": self._check_interval}
+            })
+        if self._hdhive_enabled and self._hdhive_channel_url:
+            services.append({
+                "id": "Tg115TransferHDHive",
+                "name": "影巢资源监控服务",
+                "trigger": "interval",
+                "func": self.monitor_hdhive_channel,
+                "kwargs": {"minutes": self._hdhive_check_interval}
+            })
+        return services
 
     def stop_service(self):
         """服务停止时保存状态"""
@@ -681,7 +913,7 @@ class Tg115Transfer(_PluginBase):
     # ============================================================
 
     def _init_database(self):
-        """初始化数据库：消息去重表 + 统计表"""
+        """初始化数据库：消息去重表 + 影巢记录表 + 统计表"""
         try:
             conn = sqlite3.connect(self._db_path)
             conn.execute("""CREATE TABLE IF NOT EXISTS messages (
@@ -696,6 +928,18 @@ class Tg115Transfer(_PluginBase):
                 result TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+            # 影巢使用独立记录表，不修改现有 messages 表，兼容旧数据库。
+            conn.execute("""CREATE TABLE IF NOT EXISTS hdhive_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_message_id TEXT NOT NULL,
+                hdhive_url TEXT NOT NULL,
+                resource_name TEXT DEFAULT '',
+                share_url TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT '等待',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (telegram_message_id, hdhive_url)
+            )""")
             conn.execute("""CREATE TABLE IF NOT EXISTS plugin_stats (
                 key TEXT PRIMARY KEY,
                 value TEXT,
@@ -705,6 +949,10 @@ class Tg115Transfer(_PluginBase):
                 ON messages(status)""")
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_messages_created
                 ON messages(created_at)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_hdhive_status
+                ON hdhive_records(status)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_hdhive_updated
+                ON hdhive_records(updated_at)""")
             # v1.2.6 之前因 share/snap 错用 POST 而失败的记录需要重新处理。
             # 仅清除该已知错误，不影响其他成功或失败记录。
             retry_count = conn.execute(
@@ -720,6 +968,210 @@ class Tg115Transfer(_PluginBase):
                 )
         except Exception as e:
             logger.error(f"【115转存助手】数据库初始化失败: {e}")
+
+    def _is_hdhive_processed(self, telegram_message_id: str,
+                              hdhive_url: str) -> bool:
+        """
+        检查影巢资源是否已经处理。
+
+        默认跳过“等待”和“成功”记录；reprocess 模式允许重试“失败”记录。
+        """
+        if not telegram_message_id or not hdhive_url:
+            return False
+        try:
+            conn = sqlite3.connect(self._db_path)
+            row = conn.execute(
+                """SELECT status FROM hdhive_records
+                   WHERE telegram_message_id = ? AND hdhive_url = ?""",
+                (telegram_message_id, hdhive_url)
+            ).fetchone()
+            conn.close()
+            if not row:
+                return False
+            if (
+                self._dedup_mode == "reprocess"
+                and row[0] == self.HDHIVE_STATUS_FAILED
+            ):
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"【115转存助手】检查影巢处理记录失败: {e}")
+            return False
+
+    def _save_hdhive_record(self, telegram_message_id: str,
+                             hdhive_url: str,
+                             resource_name: str = "",
+                             share_url: str = "",
+                             status: str = HDHIVE_STATUS_WAITING) -> bool:
+        """新增或更新影巢资源处理记录。"""
+        if not telegram_message_id or not hdhive_url:
+            logger.error("【115转存助手】影巢记录缺少Telegram消息ID或影巢链接")
+            return False
+        if status not in self.HDHIVE_STATUSES:
+            logger.error(f"【115转存助手】无效的影巢记录状态: {status}")
+            return False
+
+        try:
+            conn = sqlite3.connect(self._db_path)
+            conn.execute(
+                """INSERT INTO hdhive_records
+                   (telegram_message_id, hdhive_url, resource_name,
+                    share_url, status)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(telegram_message_id, hdhive_url) DO UPDATE SET
+                       resource_name = CASE
+                           WHEN excluded.resource_name != ''
+                           THEN excluded.resource_name
+                           ELSE hdhive_records.resource_name
+                       END,
+                       share_url = CASE
+                           WHEN excluded.share_url != ''
+                           THEN excluded.share_url
+                           ELSE hdhive_records.share_url
+                       END,
+                       status = excluded.status,
+                       updated_at = CURRENT_TIMESTAMP""",
+                (
+                    telegram_message_id,
+                    hdhive_url,
+                    resource_name,
+                    share_url,
+                    status,
+                )
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"【115转存助手】保存影巢处理记录失败: {e}")
+            return False
+
+    def _claim_hdhive_record(self, telegram_message_id: str,
+                             hdhive_url: str) -> bool:
+        """原子占用一条影巢任务，避免两个定时任务同时转存。"""
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=10)
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT status FROM hdhive_records
+                   WHERE telegram_message_id = ? AND hdhive_url = ?""",
+                (telegram_message_id, hdhive_url)
+            ).fetchone()
+            if row and not (
+                self._dedup_mode == "reprocess"
+                and row[0] == self.HDHIVE_STATUS_FAILED
+            ):
+                conn.rollback()
+                conn.close()
+                return False
+            conn.execute(
+                """INSERT INTO hdhive_records
+                   (telegram_message_id, hdhive_url, status)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(telegram_message_id, hdhive_url) DO UPDATE SET
+                       status = excluded.status,
+                       updated_at = CURRENT_TIMESTAMP""",
+                (
+                    telegram_message_id,
+                    hdhive_url,
+                    self.HDHIVE_STATUS_WAITING,
+                )
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"【115转存助手】占用影巢处理任务失败: {e}")
+            return False
+
+    def _persist_hdhive_tokens(self, tokens: Dict[str, Any]):
+        """保存OpenAPI自动刷新的Token，不输出敏感值。"""
+        self._hdhive_access_token = str(
+            tokens.get("access_token") or self._hdhive_access_token
+        ).strip()
+        self._hdhive_refresh_token = str(
+            tokens.get("refresh_token") or self._hdhive_refresh_token
+        ).strip()
+        self._config["hdhive_access_token"] = self._hdhive_access_token
+        self._config["hdhive_refresh_token"] = self._hdhive_refresh_token
+        self.update_config(dict(self._config))
+        logger.info("【115转存助手】影巢OAuth Token已自动刷新并保存")
+
+    def _build_hdhive_client(self) -> HDHiveClient:
+        return HDHiveClient(
+            api_secret=self._hdhive_api_secret,
+            access_token=self._hdhive_access_token,
+            refresh_token=self._hdhive_refresh_token,
+            base_url=self._hdhive_api_base,
+            proxies=settings.PROXY,
+            on_token_refresh=self._persist_hdhive_tokens,
+        )
+
+    def _process_hdhive_message(self, msg: Dict[str, Any]) -> Tuple[bool, str]:
+        """解析影巢资源并复用现有115转存函数。"""
+        hdhive_url = normalize_hdhive_url(msg.get("share_url", ""))
+        telegram_message_id = str(
+            msg.get("telegram_message_id") or msg.get("msg_id") or ""
+        )
+        if not hdhive_url:
+            return False, "无效的影巢资源链接"
+        if not self._hdhive_enabled:
+            return False, "影巢自动转存未启用"
+        if not self._claim_hdhive_record(
+            telegram_message_id,
+            hdhive_url,
+        ):
+            return True, "影巢资源已处理或正在处理，跳过"
+
+        resource_name = ""
+        share_url = ""
+        try:
+            resource = self._build_hdhive_client().resolve_resource(hdhive_url)
+            resource_name = str(resource.get("name") or "").strip()
+            share_url = str(resource.get("share_url") or "").strip()
+            password = str(resource.get("password") or "").strip()
+            if password:
+                separator = "&" if "?" in share_url else "?"
+                share_url = (
+                    f"{share_url}{separator}"
+                    f"{urlencode({'password': password})}"
+                )
+            share_url = self._normalize_share_url(share_url)
+            if not share_url:
+                raise HDHiveError(
+                    "INVALID_115_SHARE",
+                    "影巢未返回有效的115分享链接",
+                )
+
+            ok, result = self.transfer_115(
+                share_url,
+                msg.get("message_text", ""),
+                target_dir=self._hdhive_save_dir,
+            )
+            self._save_hdhive_record(
+                telegram_message_id,
+                hdhive_url,
+                resource_name,
+                share_url,
+                self.HDHIVE_STATUS_SUCCESS if ok
+                else self.HDHIVE_STATUS_FAILED,
+            )
+            return ok, result
+        except HDHiveError as e:
+            result = f"影巢OpenAPI失败: {e.safe_message()}"
+            logger.error(f"【115转存助手】{result}")
+        except Exception as e:
+            result = f"影巢处理异常: {e}"
+            logger.exception("【115转存助手】影巢资源处理异常")
+
+        self._save_hdhive_record(
+            telegram_message_id,
+            hdhive_url,
+            resource_name,
+            share_url,
+            self.HDHIVE_STATUS_FAILED,
+        )
+        return False, result
 
     def _gen_msg_id(self, data_post: str, share_url: str) -> str:
         """
@@ -1007,6 +1459,7 @@ class Tg115Transfer(_PluginBase):
         for a_tag in element.find_all("a"):
             href = a_tag.get("href", "").strip()
             share_url = self._share_url_from_href(href)
+            hdhive_url = normalize_hdhive_url(unquote(unescape(href)))
             offline_urls = (
                 self._offline_urls_from_href(href)
                 if self._offline_enabled else []
@@ -1017,6 +1470,12 @@ class Tg115Transfer(_PluginBase):
                     "context": message_text,
                     "link_type": "share"
                 })
+            elif hdhive_url:
+                found.append({
+                    "url": hdhive_url,
+                    "context": message_text,
+                    "link_type": "hdhive"
+                })
             elif offline_urls:
                 for offline_url in offline_urls:
                     found.append({
@@ -1026,6 +1485,7 @@ class Tg115Transfer(_PluginBase):
                     })
             if (
                 not share_url
+                and not hdhive_url
                 and not offline_urls
                 and self.JUMP_LABEL_PATTERN.search(a_tag.get_text(" ", strip=True))
             ):
@@ -1039,6 +1499,13 @@ class Tg115Transfer(_PluginBase):
 
         # 2. 提取纯文本中的裸URL
         raw_text = element.get_text(separator=" ", strip=True)
+        for url in extract_hdhive_urls(raw_text):
+            if not any(f["url"] == url for f in found):
+                found.append({
+                    "url": url,
+                    "context": message_text,
+                    "link_type": "hdhive"
+                })
         for m in re.finditer(
             r"https?://(?:115|115cdn|anxia)\.com/s/[A-Za-z0-9]+"
             r"(?:\?[^\s\"'<>#]*)?",
@@ -1131,11 +1598,20 @@ class Tg115Transfer(_PluginBase):
                 for btn in div.select("a.tgme_widget_message_inline_button"):
                     btn_href = btn.get("href", "").strip()
                     share_url = self._share_url_from_href(btn_href)
+                    hdhive_url = normalize_hdhive_url(
+                        unquote(unescape(btn_href))
+                    )
                     if share_url:
                         all_links.append({
                             "url": share_url,
                             "context": full_text,
                             "link_type": "share"
+                        })
+                    elif hdhive_url:
+                        all_links.append({
+                            "url": hdhive_url,
+                            "context": full_text,
+                            "link_type": "hdhive"
                         })
                     elif self._offline_enabled:
                         for offline_url in self._offline_urls_from_href(btn_href):
@@ -1166,6 +1642,7 @@ class Tg115Transfer(_PluginBase):
 
                     results.append({
                         "msg_id": msg_id,
+                        "telegram_message_id": data_post,
                         "channel": channel,
                         "date": msg_date,
                         "source_url": msg_url,
@@ -1225,7 +1702,8 @@ class Tg115Transfer(_PluginBase):
         m = re.search(r"115\.com/s/(\w+)", share_url)
         return m.group(1) if m else None
 
-    def transfer_115(self, share_url: str, message_text: str = "") -> Tuple[bool, str]:
+    def transfer_115(self, share_url: str, message_text: str = "",
+                     target_dir: Optional[str] = None) -> Tuple[bool, str]:
         """
         转存115分享链接到用户网盘（修复4+5）
         - 支持从消息文本提取提取码（修复4）
@@ -1315,7 +1793,7 @@ class Tg115Transfer(_PluginBase):
                 "share_code": share_code,
                 "receive_code": receive_code,
                 "file_id": ",".join(all_file_ids),
-                "cid": self._save_dir
+                "cid": str(target_dir if target_dir is not None else self._save_dir)
             }
             recv_resp = requests.post(
                 "https://webapi.115.com/share/receive",
@@ -1615,6 +2093,83 @@ class Tg115Transfer(_PluginBase):
     #  主监控逻辑
     # ============================================================
 
+    @staticmethod
+    def _channel_name_from_url(value: str) -> str:
+        """把公开频道地址或频道名转换成t.me/s所需的名称。"""
+        value = (value or "").strip().strip("/")
+        if not value:
+            return ""
+        if "://" not in value:
+            return value.lstrip("@")
+        try:
+            parsed = urlparse(value)
+            if (parsed.hostname or "").lower() not in (
+                "t.me",
+                "telegram.me",
+                "telegram.org",
+            ):
+                return ""
+            parts = [p for p in parsed.path.split("/") if p]
+            if parts and parts[0].lower() == "s":
+                parts = parts[1:]
+            return parts[0].lstrip("@") if parts else ""
+        except Exception:
+            return ""
+
+    def monitor_hdhive_channel(self):
+        """独立扫描配置的影巢公开频道。"""
+        if not self._enabled or not self._hdhive_enabled:
+            return
+        if not self._cookie_115:
+            logger.warning("【115转存助手】未配置115 Cookie，跳过影巢监控")
+            return
+        channel = self._channel_name_from_url(self._hdhive_channel_url)
+        if not channel:
+            logger.error("【115转存助手】影巢频道地址无效")
+            return
+
+        messages = [
+            msg for msg in self.scrape_channel(channel)
+            if msg.get("link_type") == "hdhive"
+        ]
+        success = 0
+        failed = 0
+        for index, msg in enumerate(messages[:self._max_items], start=1):
+            logger.info(
+                f"【115转存助手】[{index}/{self._max_items}] "
+                f"处理影巢资源: {msg['share_url']}"
+            )
+            ok, result = self._process_hdhive_message(msg)
+            status = "success" if ok else "failed"
+            self._save_record(
+                msg_id=msg["msg_id"],
+                channel=msg["channel"],
+                date=msg["date"],
+                source_url=msg["source_url"],
+                share_url=msg["share_url"],
+                subscribe_name="",
+                status=status,
+                result=result,
+            )
+            success += int(ok)
+            failed += int(not ok)
+            logger.info(
+                f"【115转存助手】影巢处理"
+                f"{'成功' if ok else '失败'}: {result}"
+            )
+            if not result.startswith("影巢资源已处理"):
+                self.send_notify(
+                    f"{'✅' if ok else '❌'} 影巢转存"
+                    f"{'成功' if ok else '失败'}\n"
+                    f"📎 {msg['share_url']}\n📝 {result}"
+                )
+            time.sleep(3)
+
+        logger.info(
+            f"【115转存助手】影巢监控完成 | "
+            f"发现 {len(messages)} 条 | 成功 {success} 条 | 失败 {failed} 条"
+        )
+
     def monitor_channels(self):
         """主循环：扫描所有频道，提取链接并转存"""
         if not self._cookie_115:
@@ -1673,12 +2228,17 @@ class Tg115Transfer(_PluginBase):
 
             logger.info(
                 f"【115转存助手】[{processed}/{self._max_items}] "
-                f"发现{'离线链接' if link_type == 'offline' else '115分享'}: {share_url}"
+                f"发现"
+                f"{'离线链接' if link_type == 'offline' else ('影巢资源' if link_type == 'hdhive' else '115分享')}: "
+                f"{share_url}"
             )
 
             if link_type == "offline":
                 ok, msg_text = self.add_115_offline_task(share_url)
                 action_name = "115离线任务提交"
+            elif link_type == "hdhive":
+                ok, msg_text = self._process_hdhive_message(msg)
+                action_name = "影巢转存"
             else:
                 ok, msg_text = self.transfer_115(share_url, message_text)
                 action_name = "115转存"
@@ -1764,8 +2324,45 @@ class Tg115Transfer(_PluginBase):
             trigger="date",
             run_date=datetime.now() + timedelta(seconds=1)
         )
+        if self._hdhive_enabled:
+            scheduler.add_job(
+                func=self.monitor_hdhive_channel,
+                trigger="date",
+                run_date=datetime.now() + timedelta(seconds=2)
+            )
         scheduler.start()
         return {"code": 0, "data": {"ok": True, "message": "扫描任务已触发"}}
+
+    def api_test_hdhive(self, **kwargs) -> Dict:
+        """测试影巢应用认证与用户OAuth认证。"""
+        try:
+            client = self._build_hdhive_client()
+            client.ping()
+            user = client.get_me()
+            display_name = str(
+                user.get("nickname")
+                or user.get("username")
+                or user.get("name")
+                or "已授权用户"
+            )
+            return {
+                "code": 0,
+                "data": {
+                    "ok": True,
+                    "message": f"影巢OpenAPI认证有效：{display_name}",
+                },
+            }
+        except HDHiveError as e:
+            return {
+                "code": 1,
+                "data": {"ok": False, "message": e.safe_message()},
+            }
+        except Exception as e:
+            logger.exception("【115转存助手】测试影巢OpenAPI异常")
+            return {
+                "code": 1,
+                "data": {"ok": False, "message": f"测试异常: {e}"},
+            }
 
     def api_stats(self, **kwargs) -> Dict:
         """获取运行统计（API）"""
