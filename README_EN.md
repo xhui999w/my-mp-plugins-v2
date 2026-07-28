@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MoviePilot-V2-673AB7" alt="MoviePilot V2">
-  <img src="https://img.shields.io/badge/Version-1.3.1-00AEEF" alt="Version 1.3.1">
+  <img src="https://img.shields.io/badge/Version-1.4.0-00AEEF" alt="Version 1.4.0">
   <img src="https://img.shields.io/badge/Language-Python-3776AB" alt="Python">
 </p>
 
@@ -27,7 +27,7 @@ Read text, buttons, and hyperlinks
           ↓
 Validate the domain and link type
           ↓
-115 share transfer / 115 offline download
+115 transfer / HDHive OpenAPI unlock / 115 offline download
           ↓
 Save history, deduplicate, count, and notify
 ```
@@ -45,6 +45,8 @@ Save history, deduplicate, count, and notify
 - Can send success, failure, and scan-summary notifications through a Telegram Bot.
 - Reuses the MoviePilot proxy for Telegram pages and the Bot API.
 - Shows status, daily statistics, and recent records on the plugin details page.
+- Resolves `hdhive.com/resource/...` through the official HDHive OpenAPI and reuses the existing 115 transfer flow.
+- Refreshes expired HDHive access tokens and stores separate pending, successful, and failed records.
 
 ## Safe redirect policy
 
@@ -72,9 +74,9 @@ Telegram wrapper links are limited to the `url`, `target`, `redirect`, `redirect
 | MoviePilot missing-subscription filtering | ✅ Optional |
 | Private Telegram channels | ❌ Not supported |
 | Ads, unknown short links, and unknown redirects | ❌ Intentionally rejected |
-| Automated HDHive login, unlock, and transfer | ❌ Not integrated |
+| HDHive OpenAPI unlock and 115 transfer | ✅ Requires an approved app and OAuth authorization |
 
-> HDHive integration requires official OpenAPI/OAuth authorization. The plugin does not emulate a login or bypass access controls.
+> The plugin uses only the official HDHive OpenAPI. It does not emulate a login or bypass access controls.
 
 ## Installation
 
@@ -88,7 +90,7 @@ https://github.com/xhui999w/my-mp-plugins-v2
 
 ### 2. Refresh the market
 
-Search for **115 Cloud Transfer Assistant** (`115网盘转存助手`) and confirm that version `1.3.1` or later is displayed.
+Search for **115 Cloud Transfer Assistant** (`115网盘转存助手`) and confirm that version `1.4.0` or later is displayed.
 
 ### 3. Install
 
@@ -214,6 +216,7 @@ No. The plugin reads the public Telegram page at `t.me/s/...` and does not sign 
 
 ## Changelog
 
+- `1.4.0`: added HDHive OpenAPI unlock, automatic token refresh, a separate destination, and deduplication records.
 - `1.3.1`: added a safe redirect allowlist; ads, short links, and unknown redirects are not visited.
 - `1.3.0`: added magnet/ED2K detection and 115 offline-download submission.
 - `1.2.7`: added support for 115 URLs behind jump-link labels.
