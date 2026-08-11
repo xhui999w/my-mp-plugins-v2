@@ -1,0 +1,11 @@
+services:
+  hdhive-oauth:
+    image: ghcr.io/xhui999w/hdhive-oauth:latest
+    container_name: hdhive-oauth
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data

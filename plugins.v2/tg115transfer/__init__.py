@@ -8,6 +8,7 @@ import time
 import hashlib
 import sqlite3
 import os
+import secrets
 from html import unescape
 from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
@@ -31,6 +32,7 @@ from .hdhive import (
     extract_hdhive_urls,
     normalize_hdhive_url,
 )
+from .hdhive_gateway import HDHiveGatewayClient, HDHiveGatewayError
 
 
 class Tg115Transfer(_PluginBase):
@@ -41,7 +43,7 @@ class Tg115Transfer(_PluginBase):
     plugin_name = "115网盘转存助手"
     plugin_desc = "自动监控TG频道中的115分享链接并转存到指定目录"
     plugin_icon = "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_author = "xhui999w"
     author_url = "https://github.com/xhui999w"
     plugin_config_prefix = "tg115transfer_"
@@ -70,6 +72,13 @@ class Tg115Transfer(_PluginBase):
     _hdhive_api_secret = ""
     _hdhive_access_token = ""
     _hdhive_refresh_token = ""
+    _hdhive_gateway_url = ""
+    _hdhive_installation_id = ""
+    _hdhive_installation_key = ""
+    _hdhive_mp_subscribe_enabled = False
+    _hdhive_mp_subscribe_interval = 60
+    _hdhive_max_unlock_points = 0
+    _hdhive_max_resources_per_subscribe = 1
 
     # 115网盘
     _cookie_115 = ""        # 115 Cookie
@@ -167,6 +176,42 @@ class Tg115Transfer(_PluginBase):
             self._hdhive_refresh_token = str(
                 config.get("hdhive_refresh_token") or ""
             ).strip()
+            self._hdhive_gateway_url = str(
+                config.get("hdhive_gateway_url") or ""
+            ).strip().rstrip("/")
+            self._hdhive_installation_id = str(
+                config.get("hdhive_installation_id") or ""
+            ).strip()
+            self._hdhive_installation_key = str(
+                config.get("hdhive_installation_key") or ""
+            ).strip()
+            self._hdhive_mp_subscribe_enabled = bool(
+                config.get("hdhive_mp_subscribe_enabled", False)
+            )
+            mp_interval = config.get("hdhive_mp_subscribe_interval", 60)
+            self._hdhive_mp_subscribe_interval = (
+                int(mp_interval) if str(mp_interval).isdigit() else 60
+            )
+            self._hdhive_mp_subscribe_interval = min(
+                max(self._hdhive_mp_subscribe_interval, 5), 1440
+            )
+            max_points = config.get("hdhive_max_unlock_points", 0)
+            self._hdhive_max_unlock_points = (
+                int(max_points) if str(max_points).isdigit() else 0
+            )
+            max_resources = config.get(
+                "hdhive_max_resources_per_subscribe", 1
+            )
+            self._hdhive_max_resources_per_subscribe = min(
+                max(int(max_resources) if str(max_resources).isdigit() else 1, 1),
+                10,
+            )
+
+        if not self._hdhive_installation_id:
+            self._hdhive_installation_id = secrets.token_urlsafe(24)
+            self._config["hdhive_installation_id"] = self._hdhive_installation_id
+            if config is not None:
+                self.update_config(dict(self._config))
 
         # 初始化数据库
         db_dir = str(self.get_data_path())
@@ -189,6 +234,12 @@ class Tg115Transfer(_PluginBase):
                         func=self.monitor_hdhive_channel,
                         trigger="date",
                         run_date=datetime.now() + timedelta(seconds=5)
+                    )
+                if self._hdhive_mp_subscribe_enabled:
+                    self._scheduler.add_job(
+                        func=self.monitor_hdhive_subscriptions,
+                        trigger="date",
+                        run_date=datetime.now() + timedelta(seconds=7)
                     )
                 if self._scheduler.get_jobs():
                     self._scheduler.start()
@@ -227,6 +278,13 @@ class Tg115Transfer(_PluginBase):
                 "methods": ["POST"],
                 "summary": "测试影巢OpenAPI",
                 "description": "检查影巢应用Secret和用户Access Token"
+            },
+            {
+                "path": "/hdhive_oauth_status",
+                "endpoint": self.api_hdhive_oauth_status,
+                "methods": ["GET"],
+                "summary": "影巢OAuth状态",
+                "description": "返回授权状态和一次性授权链接"
             },
             {
                 "path": "/scan_now",
@@ -499,9 +557,97 @@ class Tg115Transfer(_PluginBase):
                                         'props': {
                                             'type': 'warning',
                                             'variant': 'tonal',
-                                            'text': '【影巢OpenAPI】需要应用 Secret（X-API-Key）及用户 OAuth Token，授权范围需包含 meta、query、unlock。敏感值只保存在插件配置中。'
+                                            'text': '【影巢OAuth服务】推荐使用阿里云Docker服务保存App Secret和OAuth Token，MoviePilot只保存安装凭据。'
                                         }
                                     }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_gateway_url',
+                                        'label': '影巢OAuth服务地址',
+                                        'placeholder': 'https://hdhive.120345.xyz'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_installation_key',
+                                        'label': '安装密钥',
+                                        'type': 'password',
+                                        'hint': '必须与OAuth服务INSTALLATION_KEY一致'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_installation_id',
+                                        'label': '安装标识（自动生成）',
+                                        'readonly': True
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VSwitch', 'props': {
+                                        'model': 'hdhive_mp_subscribe_enabled',
+                                        'label': '启用MP订阅主动查询影巢'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_mp_subscribe_interval',
+                                        'label': 'MP订阅检查间隔（分钟）',
+                                        'type': 'number', 'min': 5, 'max': 1440
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_max_unlock_points',
+                                        'label': '单资源最高解锁积分',
+                                        'type': 'number', 'min': 0,
+                                        'hint': '0=只处理免费或已解锁资源'
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField', 'props': {
+                                        'model': 'hdhive_max_resources_per_subscribe',
+                                        'label': '每个订阅单次最多转存',
+                                        'type': 'number', 'min': 1, 'max': 10
+                                    }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {'component': 'VAlert', 'props': {
+                                        'type': 'info', 'variant': 'text',
+                                        'text': '以下App Secret/Token仅为旧版个人直连兼容。配置OAuth服务后可留空。'
+                                    }}
                                 ]
                             },
                             {
@@ -733,6 +879,13 @@ class Tg115Transfer(_PluginBase):
             "hdhive_api_secret": "",
             "hdhive_access_token": "",
             "hdhive_refresh_token": "",
+            "hdhive_gateway_url": "",
+            "hdhive_installation_id": "",
+            "hdhive_installation_key": "",
+            "hdhive_mp_subscribe_enabled": False,
+            "hdhive_mp_subscribe_interval": 60,
+            "hdhive_max_unlock_points": 0,
+            "hdhive_max_resources_per_subscribe": 1,
             "cookie_115": "",
             "save_dir": "0",
             "offline_enabled": False,
@@ -752,6 +905,7 @@ class Tg115Transfer(_PluginBase):
 
         last_scan = stats.get("last_scan_time", "从未运行")
         next_scan = stats.get("next_scan_time", "未设置")
+        oauth_url = self._build_hdhive_gateway().build_authorize_url()
 
         # 统计摘要
         sub_mode_label = {"disabled": "未集成", "only_missing": "仅转存缺失"}
@@ -782,6 +936,37 @@ class Tg115Transfer(_PluginBase):
                                     'text': status_text
                                 }
                             }
+                        ]
+                    }
+                ]
+            },
+            {
+                'component': 'VRow',
+                'content': [
+                    {
+                        'component': 'VCol',
+                        'props': {'cols': 12},
+                        'content': [
+                            {
+                                'component': 'VAlert',
+                                'props': {
+                                    'type': 'info', 'variant': 'tonal',
+                                    'text': (
+                                        '已配置影巢OAuth服务，点击下方按钮授权。'
+                                        if oauth_url else
+                                        '影巢OAuth服务未配置，请先在插件配置填写服务地址和安装密钥。'
+                                    )
+                                }
+                            },
+                            *([{
+                                'component': 'VBtn',
+                                'props': {
+                                    'href': oauth_url,
+                                    'target': '_blank',
+                                    'color': 'primary'
+                                },
+                                'text': '前往影巢OAuth授权'
+                            }] if oauth_url else [])
                         ]
                     }
                 ]
@@ -893,6 +1078,14 @@ class Tg115Transfer(_PluginBase):
                 "func": self.monitor_hdhive_channel,
                 "kwargs": {"minutes": self._hdhive_check_interval}
             })
+        if self._hdhive_mp_subscribe_enabled:
+            services.append({
+                "id": "Tg115TransferHDHiveSubscriptions",
+                "name": "MP订阅影巢检索服务",
+                "trigger": "interval",
+                "func": self.monitor_hdhive_subscriptions,
+                "kwargs": {"minutes": self._hdhive_mp_subscribe_interval}
+            })
         return services
 
     def stop_service(self):
@@ -940,6 +1133,21 @@ class Tg115Transfer(_PluginBase):
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (telegram_message_id, hdhive_url)
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS hdhive_subscription_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subscribe_id TEXT NOT NULL,
+                tmdb_id TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                season INTEGER DEFAULT 0,
+                resource_slug TEXT NOT NULL,
+                resource_name TEXT DEFAULT '',
+                share_url TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT '等待',
+                result TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (subscribe_id, resource_slug)
+            )""")
             conn.execute("""CREATE TABLE IF NOT EXISTS plugin_stats (
                 key TEXT PRIMARY KEY,
                 value TEXT,
@@ -953,6 +1161,8 @@ class Tg115Transfer(_PluginBase):
                 ON hdhive_records(status)""")
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_hdhive_updated
                 ON hdhive_records(updated_at)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_hdhive_sub_status
+                ON hdhive_subscription_records(status)""")
             # v1.2.6 之前因 share/snap 错用 POST 而失败的记录需要重新处理。
             # 仅清除该已知错误，不影响其他成功或失败记录。
             retry_count = conn.execute(
@@ -1107,6 +1317,24 @@ class Tg115Transfer(_PluginBase):
             on_token_refresh=self._persist_hdhive_tokens,
         )
 
+    def _build_hdhive_gateway(self) -> HDHiveGatewayClient:
+        return HDHiveGatewayClient(
+            service_url=self._hdhive_gateway_url,
+            installation_id=self._hdhive_installation_id,
+            installation_key=self._hdhive_installation_key,
+            proxies=settings.PROXY,
+        )
+
+    def _resolve_hdhive_resource(self, hdhive_url: str) -> Dict[str, Any]:
+        """Gateway first; keep legacy direct credentials as a fallback."""
+        gateway = self._build_hdhive_gateway()
+        if gateway.configured:
+            return gateway.resolve_resource(
+                resource_url=hdhive_url,
+                max_unlock_points=self._hdhive_max_unlock_points,
+            )
+        return self._build_hdhive_client().resolve_resource(hdhive_url)
+
     def _process_hdhive_message(self, msg: Dict[str, Any]) -> Tuple[bool, str]:
         """解析影巢资源并复用现有115转存函数。"""
         hdhive_url = normalize_hdhive_url(msg.get("share_url", ""))
@@ -1126,7 +1354,7 @@ class Tg115Transfer(_PluginBase):
         resource_name = ""
         share_url = ""
         try:
-            resource = self._build_hdhive_client().resolve_resource(hdhive_url)
+            resource = self._resolve_hdhive_resource(hdhive_url)
             resource_name = str(resource.get("name") or "").strip()
             share_url = str(resource.get("share_url") or "").strip()
             password = str(resource.get("password") or "").strip()
@@ -1160,6 +1388,9 @@ class Tg115Transfer(_PluginBase):
         except HDHiveError as e:
             result = f"影巢OpenAPI失败: {e.safe_message()}"
             logger.error(f"【115转存助手】{result}")
+        except HDHiveGatewayError as e:
+            result = f"影巢OAuth服务失败: {e}"
+            logger.error(f"【115转存助手】{result}")
         except Exception as e:
             result = f"影巢处理异常: {e}"
             logger.exception("【115转存助手】影巢资源处理异常")
@@ -1172,6 +1403,60 @@ class Tg115Transfer(_PluginBase):
             self.HDHIVE_STATUS_FAILED,
         )
         return False, result
+
+    def _claim_hdhive_subscription(self, subscribe_id: str, tmdb_id: str,
+                                    media_type: str, season: int,
+                                    slug: str, name: str) -> bool:
+        """Atomically claim an MP-subscription resource."""
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=10)
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT status FROM hdhive_subscription_records
+                   WHERE subscribe_id = ? AND resource_slug = ?""",
+                (subscribe_id, slug),
+            ).fetchone()
+            if row and not (
+                self._dedup_mode == "reprocess"
+                and row[0] == self.HDHIVE_STATUS_FAILED
+            ):
+                conn.rollback()
+                conn.close()
+                return False
+            conn.execute(
+                """INSERT INTO hdhive_subscription_records
+                   (subscribe_id, tmdb_id, media_type, season,
+                    resource_slug, resource_name, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(subscribe_id, resource_slug) DO UPDATE SET
+                     resource_name=excluded.resource_name,
+                     status=excluded.status,
+                     result='', updated_at=CURRENT_TIMESTAMP""",
+                (subscribe_id, tmdb_id, media_type, season, slug, name,
+                 self.HDHIVE_STATUS_WAITING),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"【115转存助手】占用MP影巢订阅任务失败: {e}")
+            return False
+
+    def _finish_hdhive_subscription(self, subscribe_id: str, slug: str,
+                                     status: str, result: str,
+                                     share_url: str = ""):
+        try:
+            conn = sqlite3.connect(self._db_path)
+            conn.execute(
+                """UPDATE hdhive_subscription_records
+                   SET status=?, result=?, share_url=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE subscribe_id=? AND resource_slug=?""",
+                (status, result, share_url, subscribe_id, slug),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"【115转存助手】更新MP影巢订阅记录失败: {e}")
 
     def _gen_msg_id(self, data_post: str, share_url: str) -> str:
         """
@@ -2066,6 +2351,169 @@ class Tg115Transfer(_PluginBase):
 
         return filtered
 
+    @staticmethod
+    def _subscribe_value(subscribe: Any, *names: str, default: Any = None) -> Any:
+        for name in names:
+            value = getattr(subscribe, name, None)
+            if value is not None and value != "":
+                return value
+        return default
+
+    @staticmethod
+    def _hdhive_resource_identity(item: Dict[str, Any]) -> Tuple[str, str, int]:
+        media = item.get("media") if isinstance(item.get("media"), dict) else {}
+        slug = str(item.get("slug") or item.get("resource_slug") or "").strip()
+        name = str(
+            item.get("title") or item.get("name")
+            or media.get("title") or media.get("name") or slug
+        ).strip()
+        try:
+            points = int(
+                item.get("actual_unlock_points")
+                if item.get("actual_unlock_points") is not None
+                else item.get("unlock_points") or 0
+            )
+        except (TypeError, ValueError):
+            points = 0
+        if item.get("is_unlocked") or item.get("is_free_for_user"):
+            points = 0
+        return slug, name, max(points, 0)
+
+    @staticmethod
+    def _resource_matches_season(name: str, season: int) -> bool:
+        if not season:
+            return True
+        markers = re.findall(r"\bS(?:eason\s*)?(\d{1,2})\b", name, re.I)
+        markers += re.findall(r"第\s*(\d{1,2})\s*季", name)
+        return bool(markers) and season in {int(value) for value in markers}
+
+    def monitor_hdhive_subscriptions(self):
+        """Actively source HDHive resources for active MoviePilot subscriptions."""
+        if not self._enabled or not self._hdhive_mp_subscribe_enabled:
+            return
+        if not self._cookie_115:
+            logger.warning("【115转存助手】未配置115 Cookie，跳过MP影巢订阅")
+            return
+        gateway = self._build_hdhive_gateway()
+        if not gateway.configured:
+            logger.warning("【115转存助手】未配置影巢OAuth服务，跳过MP影巢订阅")
+            return
+
+        subscribes = self._load_subscribes()
+        total = success = failed = 0
+        for subscribe in subscribes:
+            try:
+                name = str(self._subscribe_value(subscribe, "name", default="未命名订阅"))
+                tmdb_id = self._subscribe_value(
+                    subscribe, "tmdbid", "tmdb_id", "mediaid"
+                )
+                if not tmdb_id or not str(tmdb_id).isdigit():
+                    logger.debug(f"【115转存助手】订阅 [{name}] 缺少TMDB ID，跳过")
+                    continue
+                raw_type = str(self._subscribe_value(subscribe, "type", default=""))
+                media_type = (
+                    "movie" if raw_type == str(MediaType.MOVIE.value)
+                    or raw_type.lower() == "movie" or "电影" in raw_type
+                    else "tv"
+                )
+                lack = int(self._subscribe_value(
+                    subscribe, "lack_episode", default=0
+                ) or 0)
+                if media_type == "tv" and lack <= 0:
+                    continue
+                season = int(self._subscribe_value(
+                    subscribe, "season", default=0
+                ) or 0)
+                subscribe_id = str(self._subscribe_value(
+                    subscribe, "id", default=f"{media_type}-{tmdb_id}-{season}"
+                ))
+                resources = gateway.query_resources(media_type, int(tmdb_id))
+                candidates = []
+                for item in resources:
+                    pan_type = str(
+                        item.get("pan_type") or item.get("website") or ""
+                    ).strip().lower()
+                    if pan_type and pan_type not in ("115", "115.com"):
+                        continue
+                    item_season = item.get("season")
+                    if item_season is None and isinstance(item.get("media"), dict):
+                        item_season = item["media"].get("season")
+                    if media_type == "tv" and season and item_season is not None:
+                        try:
+                            if int(item_season) != season:
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                    slug, resource_name, points = self._hdhive_resource_identity(item)
+                    if (
+                        media_type == "tv" and season
+                        and item_season is None
+                        and not self._resource_matches_season(resource_name, season)
+                    ):
+                        continue
+                    if not slug or points > self._hdhive_max_unlock_points:
+                        continue
+                    candidates.append((
+                        points,
+                        not bool(item.get("is_official")),
+                        slug,
+                        resource_name,
+                    ))
+                candidates.sort(key=lambda value: (value[0], value[1]))
+
+                for _, _, slug, resource_name in candidates[
+                    :self._hdhive_max_resources_per_subscribe
+                ]:
+                    if not self._claim_hdhive_subscription(
+                        subscribe_id, str(tmdb_id), media_type, season,
+                        slug, resource_name,
+                    ):
+                        continue
+                    total += 1
+                    share_url = ""
+                    try:
+                        resource = gateway.resolve_resource(
+                            slug=slug,
+                            max_unlock_points=self._hdhive_max_unlock_points,
+                        )
+                        share_url = str(resource.get("share_url") or "").strip()
+                        password = str(resource.get("password") or "").strip()
+                        query_keys = parse_qs(urlparse(share_url).query)
+                        if password and not any(
+                            key in query_keys for key in ("password", "pwd", "code")
+                        ):
+                            share_url += "?" + urlencode({"password": password})
+                        share_url = self._normalize_share_url(share_url)
+                        if not share_url:
+                            raise HDHiveGatewayError("未返回有效115链接")
+                        ok, result = self.transfer_115(
+                            share_url,
+                            f"{name} S{season:02d}" if season else name,
+                            target_dir=self._hdhive_save_dir,
+                        )
+                    except Exception as e:
+                        ok, result = False, f"影巢订阅处理失败: {e}"
+                    self._finish_hdhive_subscription(
+                        subscribe_id, slug,
+                        self.HDHIVE_STATUS_SUCCESS if ok else self.HDHIVE_STATUS_FAILED,
+                        result, share_url,
+                    )
+                    success += int(ok)
+                    failed += int(not ok)
+                    logger.info(
+                        f"【115转存助手】MP订阅 [{name}] 影巢转存"
+                        f"{'成功' if ok else '失败'}: {result}"
+                    )
+                    time.sleep(3)
+            except HDHiveGatewayError as e:
+                logger.error(f"【115转存助手】MP订阅 [{getattr(subscribe, 'name', '')}] 查询影巢失败: {e}")
+            except Exception:
+                logger.exception("【115转存助手】MP影巢订阅单项处理异常")
+        logger.info(
+            f"【115转存助手】MP影巢订阅检查完成 | "
+            f"处理 {total} 条 | 成功 {success} | 失败 {failed}"
+        )
+
     # ============================================================
     #  通知
     # ============================================================
@@ -2330,12 +2778,38 @@ class Tg115Transfer(_PluginBase):
                 trigger="date",
                 run_date=datetime.now() + timedelta(seconds=2)
             )
+        if self._hdhive_mp_subscribe_enabled:
+            scheduler.add_job(
+                func=self.monitor_hdhive_subscriptions,
+                trigger="date",
+                run_date=datetime.now() + timedelta(seconds=3)
+            )
         scheduler.start()
         return {"code": 0, "data": {"ok": True, "message": "扫描任务已触发"}}
 
     def api_test_hdhive(self, **kwargs) -> Dict:
         """测试影巢应用认证与用户OAuth认证。"""
         try:
+            gateway = self._build_hdhive_gateway()
+            if gateway.configured:
+                data = gateway.status()
+                if not data.get("authorized"):
+                    return {
+                        "code": 1,
+                        "data": {
+                            "ok": False,
+                            "message": "OAuth服务可访问，但影巢账号尚未授权",
+                            "authorize_url": gateway.build_authorize_url(),
+                        },
+                    }
+                user = data.get("user") or {}
+                return {
+                    "code": 0,
+                    "data": {
+                        "ok": True,
+                        "message": f"影巢OAuth服务已授权：{user.get('nickname') or '当前用户'}",
+                    },
+                }
             client = self._build_hdhive_client()
             client.ping()
             user = client.get_me()
@@ -2362,6 +2836,28 @@ class Tg115Transfer(_PluginBase):
             return {
                 "code": 1,
                 "data": {"ok": False, "message": f"测试异常: {e}"},
+            }
+
+    def api_hdhive_oauth_status(self, **kwargs) -> Dict:
+        gateway = self._build_hdhive_gateway()
+        if not gateway.configured:
+            return {
+                "code": 1,
+                "data": {"authorized": False, "message": "影巢OAuth服务未配置"},
+            }
+        authorize_url = gateway.build_authorize_url()
+        try:
+            data = gateway.status()
+            data["authorize_url"] = authorize_url
+            return {"code": 0, "data": data}
+        except HDHiveGatewayError as e:
+            return {
+                "code": 1,
+                "data": {
+                    "authorized": False,
+                    "authorize_url": authorize_url,
+                    "message": str(e),
+                },
             }
 
     def api_stats(self, **kwargs) -> Dict:

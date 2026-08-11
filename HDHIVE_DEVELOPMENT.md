@@ -2,7 +2,7 @@
 
 ## 完成内容
 
-版本 `1.4.0` 已实现：
+版本 `1.5.0` 已实现两条入口：
 
 ```text
 Telegram公开频道
@@ -14,6 +14,14 @@ Telegram公开频道
 → 保存去重记录和处理结果
 ```
 
+```text
+MoviePilot活跃订阅
+→ 读取媒体类型、TMDB ID、季和缺集状态
+→ 阿里云OAuth服务查询影巢OpenAPI
+→ 筛选115资源、季和积分预算
+→ 解锁并复用现有115转存
+```
+
 普通115分享、磁力/ED2K和MoviePilot订阅过滤逻辑继续保留。
 
 ## 文件说明
@@ -22,6 +30,9 @@ Telegram公开频道
 | --- | --- |
 | `plugins.v2/tg115transfer/__init__.py` | MoviePilot入口、配置、TG解析、定时任务、数据库和转存分流 |
 | `plugins.v2/tg115transfer/hdhive.py` | 独立的影巢链接校验和OpenAPI客户端 |
+| `plugins.v2/tg115transfer/hdhive_gateway.py` | MoviePilot访问自建OAuth服务的客户端 |
+| `services/hdhive-oauth/` | OAuth回调、Token加密、资源查询/解锁和Docker部署 |
+| `.github/workflows/hdhive-oauth-image.yml` | 自动构建amd64/arm64 GHCR镜像 |
 | `tests/test_hdhive.py` | 链接白名单、资源解析、Token刷新和错误处理测试 |
 | `package.v2.json`、`package.json` | 插件市场版本和说明 |
 | `README.md`、`README_EN.md` | 中英文用户说明 |
@@ -76,9 +87,12 @@ Telegram公开频道
 
 ## 部署步骤
 
+OAuth服务完整操作见 `services/hdhive-oauth/README.md`。推荐部署在具有
+固定公网IP的阿里云服务器，并将该IP填入影巢OpenAPI白名单。
+
 1. 备份MoviePilot插件配置和 `tg115transfer.db`。
 2. 在MoviePilot刷新插件市场。
-3. 确认市场显示 `1.4.0`，再更新插件。
+3. 确认市场显示 `1.5.0`，再更新插件。
 4. 打开配置，确认原有115 Cookie和频道仍在。
 5. 填入影巢App Secret、Access Token和Refresh Token。
 6. 确认OAuth授权范围包含 `meta query unlock`。
