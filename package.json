@@ -1,8 +1,8 @@
 {
   "Tg115Transfer": {
     "name": "115网盘转存助手",
-    "description": "自动监控TG频道中的115与影巢资源，并转存到指定115目录",
-    "version": "1.4.0",
+    "description": "监控TG频道并主动查询MoviePilot订阅，通过影巢OpenAPI自动转存115",
+    "version": "1.5.0",
     "icon": "https://raw.githubusercontent.com/mrtian2016/MoviePilot-Plugins/main/icons/default.png",
     "author": "xhui999w",
     "level": 1,

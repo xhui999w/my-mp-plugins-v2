@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MoviePilot-V2-673AB7" alt="MoviePilot V2">
-  <img src="https://img.shields.io/badge/Version-1.4.0-00AEEF" alt="Version 1.4.0">
+  <img src="https://img.shields.io/badge/Version-1.5.0-00AEEF" alt="Version 1.5.0">
   <img src="https://img.shields.io/badge/Language-Python-3776AB" alt="Python">
 </p>
 
@@ -47,6 +47,9 @@ Save history, deduplicate, count, and notify
 - Shows status, daily statistics, and recent records on the plugin details page.
 - Resolves `hdhive.com/resource/...` through the official HDHive OpenAPI and reuses the existing 115 transfer flow.
 - Refreshes expired HDHive access tokens and stores separate pending, successful, and failed records.
+- Actively reads MoviePilot subscriptions and queries HDHive by media type and TMDB ID.
+- Supports a self-hosted OAuth gateway so App Secret and tokens stay outside MoviePilot.
+- Automatically builds linux/amd64 and linux/arm64 Docker images.
 
 ## Safe redirect policy
 
@@ -90,7 +93,7 @@ https://github.com/xhui999w/my-mp-plugins-v2
 
 ### 2. Refresh the market
 
-Search for **115 Cloud Transfer Assistant** (`115网盘转存助手`) and confirm that version `1.4.0` or later is displayed.
+Search for **115 Cloud Transfer Assistant** (`115网盘转存助手`) and confirm that version `1.5.0` or later is displayed.
 
 ### 3. Install
 
@@ -216,6 +219,7 @@ No. The plugin reads the public Telegram page at `t.me/s/...` and does not sign 
 
 ## Changelog
 
+- `1.5.0`: added a self-hosted OAuth gateway, Docker image, and active MP-subscription HDHive transfers.
 - `1.4.0`: added HDHive OpenAPI unlock, automatic token refresh, a separate destination, and deduplication records.
 - `1.3.1`: added a safe redirect allowlist; ads, short links, and unknown redirects are not visited.
 - `1.3.0`: added magnet/ED2K detection and 115 offline-download submission.

@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MoviePilot-V2-673AB7" alt="MoviePilot V2">
-  <img src="https://img.shields.io/badge/Version-1.4.0-00AEEF" alt="Version 1.4.0">
+  <img src="https://img.shields.io/badge/Version-1.5.0-00AEEF" alt="Version 1.5.0">
   <img src="https://img.shields.io/badge/Language-Python-3776AB" alt="Python">
 </p>
 
@@ -47,6 +47,9 @@ Telegram 公开频道
 - 插件详情页显示运行状态、今日统计和最近处理记录。
 - 识别 `hdhive.com/resource/...`，通过影巢官方 OpenAPI 解锁后复用原有115转存流程。
 - 自动刷新过期的影巢 Access Token，并单独记录等待、成功和失败状态。
+- 主动读取MoviePilot订阅，按媒体类型和TMDB ID查询影巢资源。
+- 可自建轻量OAuth服务，App Secret和Token不再保存于MoviePilot。
+- 提供linux/amd64和linux/arm64 Docker镜像自动构建。
 
 ## 安全跳转策略
 
@@ -90,7 +93,7 @@ https://github.com/xhui999w/my-mp-plugins-v2
 
 ### 2. 刷新插件市场
 
-刷新后搜索 **115 网盘转存助手**，确认显示的版本为 `1.4.0` 或更高版本。
+刷新后搜索 **115 网盘转存助手**，确认显示的版本为 `1.5.0` 或更高版本。
 
 ### 3. 安装插件
 
@@ -216,6 +219,7 @@ Cookie 相当于账号登录凭证：
 
 ## 版本记录
 
+- `1.5.0`：新增自建OAuth服务、Docker镜像和MP订阅主动查询影巢转存。
 - `1.4.0`：新增影巢OpenAPI资源解锁、Token自动刷新、独立目录和去重记录。
 - `1.3.1`：新增安全跳转白名单，不访问广告、短链及未知跳转页。
 - `1.3.0`：新增磁力和 ED2K 识别及 115 离线下载。
