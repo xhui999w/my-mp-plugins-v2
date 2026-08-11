@@ -1,6 +1,10 @@
 name: Build HDHive OAuth image
 
 on:
+  pull_request:
+    paths:
+      - "services/hdhive-oauth/**"
+      - ".github/workflows/hdhive-oauth-image.yml"
   push:
     branches: [main]
     paths:
@@ -48,7 +52,7 @@ jobs:
         with:
           context: services/hdhive-oauth
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
