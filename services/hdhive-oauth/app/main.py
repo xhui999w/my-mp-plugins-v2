@@ -39,6 +39,7 @@ CLIENT_ID = required_env("HDHIVE_CLIENT_ID")
 APP_SECRET = required_env("HDHIVE_APP_SECRET")
 REDIRECT_URI = required_env("HDHIVE_REDIRECT_URI")
 INSTALLATION_KEY = required_env("INSTALLATION_KEY")
+WEB_INSTALLATION_ID = os.getenv("WEB_INSTALLATION_ID", "personal-web")
 TOKEN_ENCRYPTION_KEY = required_env("TOKEN_ENCRYPTION_KEY")
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/hdhive-oauth.db"))
 OAUTH_SCOPE = os.getenv("HDHIVE_OAUTH_SCOPE", "meta query unlock").strip()
@@ -276,6 +277,34 @@ async def authorized_request(
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "service": "hdhive-oauth"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> HTMLResponse:
+    """Small personal dashboard; the full MoviePilot UI remains separate."""
+    try:
+        row = load_installation(WEB_INSTALLATION_ID)
+        user = json.loads(row["user_json"] or "{}")
+        account = html.escape(str(user.get("nickname") or user.get("username") or "已授权"))
+        points = html.escape(str(user.get("points") or "未知"))
+        state = f"<div class='ok'>已授权：{account}　积分：{points}</div>"
+    except HTTPException:
+        state = "<div class='warn'>尚未授权影巢账号</div>"
+    expires = int(time.time()) + 600
+    signature = sign_start(WEB_INSTALLATION_ID, expires)
+    login_url = f"/oauth/start?installation_id={quote(WEB_INSTALLATION_ID)}&expires={expires}&signature={quote(signature)}"
+    return HTMLResponse(f"""<!doctype html><meta charset='utf-8'><title>115 网盘转存助手</title>
+<style>body{{margin:0;background:#111;color:#eee;font:16px system-ui}}main{{max-width:760px;margin:8vh auto;padding:36px;background:#1b1b1b;border:1px solid #55401b;border-radius:18px}}h1{{color:#d8b56a}}.ok,.warn{{padding:16px;border-radius:10px;margin:20px 0}}.ok{{background:#18351f;color:#8ee6a0}}.warn{{background:#3b2a13;color:#ffd27a}}a{{display:inline-block;background:#b99245;color:#fff;padding:12px 18px;border-radius:8px;text-decoration:none;margin:8px 8px 8px 0}}small{{color:#aaa}}</style>
+<main><h1>115 网盘转存助手</h1><p>个人版影巢授权中心</p>{state}<a href='{login_url}'>授权影巢账号</a><a href='/health'>检查服务</a><p><small>当前仅供个人使用；授权 Token 保存在服务器，不会显示或提交到 GitHub。</small></p></main>""")
+
+
+@app.get("/oauth/login")
+def oauth_login() -> RedirectResponse:
+    expires = int(time.time()) + 600
+    signature = sign_start(WEB_INSTALLATION_ID, expires)
+    return RedirectResponse(
+        f"/oauth/start?installation_id={quote(WEB_INSTALLATION_ID)}&expires={expires}&signature={quote(signature)}"
+    )
 
 
 @app.get("/oauth/start")
