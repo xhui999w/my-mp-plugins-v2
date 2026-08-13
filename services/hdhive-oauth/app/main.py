@@ -333,7 +333,7 @@ def dashboard() -> HTMLResponse:
 
 
 def _web_layout(title: str, content: str) -> HTMLResponse:
-    nav = "<nav><a href='/'>Home</a><a href='/web/rankings'>Rankings</a><a href='/web/discover'>Discover</a><a href='/web/subscriptions'>Subscriptions</a><a href='/web/tasks'>Tasks</a><a href='/web/unlocks'>Unlocks</a><a href='/web/settings'>Settings</a></nav>"
+    nav = "<nav><a href='/'>首页</a><a href='/web/rankings'>榜单</a><a href='/web/discover'>资源发现</a><a href='/web/subscriptions'>订阅列表</a><a href='/web/tasks'>订阅任务</a><a href='/web/unlocks'>解锁记录</a><a href='/web/settings'>设置</a></nav>"
     return HTMLResponse(f"""<!doctype html><meta charset='utf-8'><title>{html.escape(title)}</title><style>
 body{{margin:0;background:#0d0b08;color:#eee;font:15px system-ui}}nav{{padding:18px 28px;background:#17120b;border-bottom:1px solid #654b20}}nav a{{color:#e2bd73;margin-right:22px;text-decoration:none}}main{{max-width:1250px;margin:28px auto;padding:28px;background:#17130d;border:1px solid #604821;border-radius:16px}}h1{{color:#e5c47d}}h2{{color:#d5b16b}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}}.card{{padding:20px;background:#211a11;border:1px solid #4a381e;border-radius:12px}}.muted{{color:#aaa}}table{{width:100%;border-collapse:collapse}}td,th{{padding:12px;border-bottom:1px solid #3e301d;text-align:left}}input,select,button{{padding:10px;margin:5px;background:#0f0d0a;color:#eee;border:1px solid #896b36;border-radius:6px}}button{{color:#f1cd80;cursor:pointer}}a.btn{{display:inline-block;padding:10px 14px;background:#76531f;color:#fff;border-radius:6px;text-decoration:none}}</style>{nav}<main><h1>{html.escape(title)}</h1>{content}</main>""")
 
@@ -348,15 +348,25 @@ def _web_account_card() -> str:
 
 
 @app.get("/web/rankings", response_class=HTMLResponse)
-def web_rankings() -> HTMLResponse:
-    content = _web_account_card() + "<div class='grid'><div class='card'><h2>Search by name</h2><p class='muted'>Enter a movie or series name. No TMDB ID is required.</p><form method='post' action='/web/search'><input name='keyword' placeholder='e.g. The Last of Us' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><button>Search HDHive</button></form></div><div class='card'><h2>Advanced TMDB query</h2><form method='post' action='/web/query'><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Query resources</button></form></div><div class='card'><h2>Quick unlock</h2><p class='muted'>Paste an HDHive resource slug or URL.</p><form method='post' action='/web/resolve'><input name='slug' placeholder='resource slug' required><input name='max_unlock_points' type='number' value='0' min='0'><button>Unlock</button></form></div></div>"
-    return _web_layout("Rankings and resource query", content)
+async def web_rankings() -> HTMLResponse:
+    ranking_html = "<p class='muted'>正在读取影巢榜单……</p>"
+    try:
+        data = await fetch_rankings(WEB_INSTALLATION_ID)
+        items = data.get("items") or data.get("rankings") or data.get("list") or []
+        if items:
+            ranking_html = "<table><tr><th>排名</th><th>名称</th><th>类型</th><th>评分</th><th>操作</th></tr>" + "".join(f"<tr><td>{i+1}</td><td>{html.escape(str(x.get('title') or x.get('name') or '未命名'))}</td><td>{html.escape(str(x.get('media_type') or x.get('type') or ''))}</td><td>{html.escape(str(x.get('score') or x.get('rating') or '-'))}</td><td><a class='btn' href='/web/search?keyword={quote(str(x.get('title') or x.get('name') or ''))}'>查看资源</a></td></tr>" for i,x in enumerate(items[:50])) + "</table>"
+        else:
+            ranking_html = "<p class='muted'>影巢当前没有返回榜单数据，请使用下面的名称搜索。</p>"
+    except HTTPException as exc:
+        ranking_html = f"<p class='muted'>榜单接口暂不可用（{exc.status_code}）。名称搜索仍可使用。</p>"
+    content = _web_account_card() + f"<div class='card'><h2>影巢热门榜单</h2>{ranking_html}</div><div class='grid'><div class='card'><h2>按名称搜索</h2><p class='muted'>不需要 TMDB ID，直接输入电影或电视剧名称。</p><form method='post' action='/web/search'><input name='keyword' placeholder='例如：庆余年' required><select name='media_type'><option value='movie'>电影</option><option value='tv'>电视剧</option></select><button>搜索影巢资源</button></form></div><div class='card'><h2>精确查询</h2><form method='post' action='/web/query'><select name='media_type'><option value='movie'>电影</option><option value='tv'>电视剧</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>精确查询</button></form></div></div>"
+    return _web_layout("榜单与资源搜索", content)
 
 
 @app.get("/web/discover", response_class=HTMLResponse)
 def web_discover() -> HTMLResponse:
     content = _web_account_card() + "<div class='card'><h2>Resource discovery</h2><p>Search directly by title; the API returns matching HDHive resources.</p><form method='post' action='/web/search'><input name='keyword' placeholder='Resource name' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><button>Search HDHive</button></form><hr><p class='muted'>Advanced: use a TMDB ID when you need an exact match.</p><form method='post' action='/web/query'><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Exact query</button></form></div>"
-    return _web_layout("Resource discovery", content)
+    return _web_layout("资源发现", content)
 
 
 @app.get("/web/subscriptions", response_class=HTMLResponse)
@@ -365,7 +375,7 @@ def web_subscriptions() -> HTMLResponse:
         rows = conn.execute("SELECT title, media_type, tmdb_id, status, created_at FROM web_subscriptions WHERE installation_id = ? ORDER BY id DESC", (WEB_INSTALLATION_ID,)).fetchall()
     table = "".join(f"<tr><td>{html.escape(str(r['title']))}</td><td>{r['media_type']}</td><td>{r['tmdb_id']}</td><td>{r['status']}</td><td>{r['created_at']}</td></tr>" for r in rows) or "<tr><td colspan='5'>No subscriptions yet</td></tr>"
     content = _web_account_card() + "<div class='card'><h2>Add subscription</h2><form method='post' action='/web/subscribe'><input name='title' placeholder='Title' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Add</button></form></div><div class='card'><h2>Current subscriptions</h2><table><tr><th>Title</th><th>Type</th><th>TMDB</th><th>Status</th><th>Created</th></tr>" + table + "</table></div>"
-    return _web_layout("Subscriptions", content)
+    return _web_layout("订阅列表", content)
 
 
 @app.get("/web/unlocks", response_class=HTMLResponse)
@@ -373,7 +383,7 @@ def web_unlocks() -> HTMLResponse:
     with database() as conn:
         rows = conn.execute("SELECT name, slug, share_url, status, error, created_at FROM transfer_records WHERE installation_id = ? ORDER BY id DESC LIMIT 100", (WEB_INSTALLATION_ID,)).fetchall()
     table = "".join(f"<tr><td>{html.escape(str(r['name']))}</td><td>{html.escape(str(r['slug']))}</td><td>{html.escape(str(r['status']))}</td><td>{html.escape(str(r['share_url'] or r['error']))}</td><td>{r['created_at']}</td></tr>" for r in rows) or "<tr><td colspan='5'>No unlock records yet</td></tr>"
-    return _web_layout("Unlock and transfer records", _web_account_card() + "<div class='card'><table><tr><th>Name</th><th>Slug</th><th>Status</th><th>115 URL / Error</th><th>Time</th></tr>" + table + "</table></div>")
+    return _web_layout("解锁与转存记录", _web_account_card() + "<div class='card'><table><tr><th>名称</th><th>资源标识</th><th>状态</th><th>115链接/错误</th><th>时间</th></tr>" + table + "</table></div>")
 
 
 @app.get("/web/tasks", response_class=HTMLResponse)
@@ -382,7 +392,7 @@ def web_tasks() -> HTMLResponse:
         transfers = conn.execute("SELECT COUNT(*), SUM(status='resolved'), SUM(status='failed') FROM transfer_records WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
         subs = conn.execute("SELECT COUNT(*) FROM web_subscriptions WHERE installation_id = ? AND status = 'active'", (WEB_INSTALLATION_ID,)).fetchone()[0]
     content = _web_account_card() + f"<div class='grid'><div class='card'><h2>Subscription tasks</h2><p>Active subscriptions: <b>{subs}</b></p><p class='muted'>MoviePilot performs scheduled subscription matching and 115 saving.</p></div><div class='card'><h2>Transfer execution</h2><p>Total: {transfers[0] or 0}</p><p>Success: {transfers[1] or 0}　Failed: {transfers[2] or 0}</p><a class='btn' href='/web/unlocks'>View execution details</a></div></div>"
-    return _web_layout("Subscription tasks", content)
+    return _web_layout("订阅任务", content)
 
 
 @app.get("/web/settings", response_class=HTMLResponse)
@@ -391,7 +401,7 @@ def web_settings() -> HTMLResponse:
         row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
     settings = dict(row) if row else {"moviepilot_url": "", "save_directory": "", "offline_enabled": 1}
     content = _web_account_card() + f"<div class='card'><h2>Transfer settings</h2><form method='post' action='/web/settings'><label>MoviePilot URL</label><br><input name='moviepilot_url' value='{html.escape(str(settings['moviepilot_url']))}' size='60'><br><label>115 save directory</label><br><input name='save_directory' value='{html.escape(str(settings['save_directory']))}' size='60'><br><label><input type='checkbox' name='offline_enabled' {'checked' if settings['offline_enabled'] else ''}> Enable magnet/ed2k offline transfer</label><br><button>Save settings</button></form></div><div class='card'><p>HDHive API: {html.escape(BASE_URL)}</p><p>OAuth callback: {html.escape(REDIRECT_URI)}</p></div>"
-    return _web_layout("Settings", content)
+    return _web_layout("设置", content)
 
 
 @app.post("/web/settings", response_class=HTMLResponse)
@@ -662,6 +672,25 @@ class SubscriptionRequest(BaseModel):
 class SearchRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=200)
     media_type: str = Field(pattern="^(movie|tv)$")
+
+
+async def fetch_rankings(installation_id: str) -> dict[str, Any]:
+    last: HDHiveAPIError | None = None
+    for path in ("/api/open/rankings", "/api/open/resources/rankings", "/api/open/ranking"):
+        try:
+            return await authorized_request(installation_id, "GET", path)
+        except HDHiveAPIError as exc:
+            last = exc
+            if exc.status not in (404, 405):
+                raise
+    if last:
+        raise HTTPException(last.status, f"{last.code}: {last.message}")
+    return {"items": []}
+
+
+@app.get("/v1/rankings")
+async def rankings(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    return await fetch_rankings(installation_id)
 
 
 @app.post("/v1/resources/search")
