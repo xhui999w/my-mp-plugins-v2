@@ -349,13 +349,13 @@ def _web_account_card() -> str:
 
 @app.get("/web/rankings", response_class=HTMLResponse)
 def web_rankings() -> HTMLResponse:
-    content = _web_account_card() + "<div class='grid'><div class='card'><h2>TMDB popular</h2><p class='muted'>Enter a TMDB id to query HDHive resources.</p><form method='post' action='/web/query'><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Query resources</button></form></div><div class='card'><h2>Quick unlock</h2><p class='muted'>Paste an HDHive resource slug or URL.</p><form method='post' action='/web/resolve'><input name='slug' placeholder='resource slug' required><input name='max_unlock_points' type='number' value='0' min='0'><button>Unlock</button></form></div></div>"
+    content = _web_account_card() + "<div class='grid'><div class='card'><h2>Search by name</h2><p class='muted'>Enter a movie or series name. No TMDB ID is required.</p><form method='post' action='/web/search'><input name='keyword' placeholder='e.g. The Last of Us' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><button>Search HDHive</button></form></div><div class='card'><h2>Advanced TMDB query</h2><form method='post' action='/web/query'><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Query resources</button></form></div><div class='card'><h2>Quick unlock</h2><p class='muted'>Paste an HDHive resource slug or URL.</p><form method='post' action='/web/resolve'><input name='slug' placeholder='resource slug' required><input name='max_unlock_points' type='number' value='0' min='0'><button>Unlock</button></form></div></div>"
     return _web_layout("Rankings and resource query", content)
 
 
 @app.get("/web/discover", response_class=HTMLResponse)
 def web_discover() -> HTMLResponse:
-    content = _web_account_card() + "<div class='card'><h2>Resource discovery</h2><p>Use TMDB id, media type and filters to locate matching HDHive resources.</p><form method='post' action='/web/query'><label>Type </label><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><label> TMDB ID </label><input name='tmdb_id' type='number' required><button>Search HDHive</button></form></div>"
+    content = _web_account_card() + "<div class='card'><h2>Resource discovery</h2><p>Search directly by title; the API returns matching HDHive resources.</p><form method='post' action='/web/search'><input name='keyword' placeholder='Resource name' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><button>Search HDHive</button></form><hr><p class='muted'>Advanced: use a TMDB ID when you need an exact match.</p><form method='post' action='/web/query'><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Exact query</button></form></div>"
     return _web_layout("Resource discovery", content)
 
 
@@ -437,6 +437,15 @@ async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...)) -> HT
         return _result_page("影巢资源查询结果", data)
     except HTTPException as exc:
         return _result_page("查询失败", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
+
+
+@app.post("/web/search", response_class=HTMLResponse)
+async def web_search(keyword: str = Form(...), media_type: str = Form("movie")) -> HTMLResponse:
+    try:
+        data = await search_resources(SearchRequest(keyword=keyword, media_type=media_type), WEB_INSTALLATION_ID)
+        return _result_page("HDHive name search", data)
+    except HTTPException as exc:
+        return _result_page("Search failed", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
 
 
 @app.post("/web/subscribe", response_class=HTMLResponse)
@@ -648,6 +657,28 @@ class SubscriptionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     media_type: str = Field(pattern="^(movie|tv)$")
     tmdb_id: int = Field(gt=0)
+
+
+class SearchRequest(BaseModel):
+    keyword: str = Field(min_length=1, max_length=200)
+    media_type: str = Field(pattern="^(movie|tv)$")
+
+
+@app.post("/v1/resources/search")
+async def search_resources(
+    request: SearchRequest,
+    installation_id: str = Depends(require_installation),
+) -> dict[str, Any]:
+    """Fuzzy resource search by title; HDHive owns the matching/indexing logic."""
+    try:
+        return await authorized_request(
+            installation_id,
+            "POST",
+            "/api/open/resources/search",
+            body={"keyword": request.keyword.strip(), "media_type": request.media_type},
+        )
+    except HDHiveAPIError as exc:
+        raise HTTPException(exc.status, f"{exc.code}: {exc.message}") from exc
 
 
 @app.post("/v1/subscriptions")
