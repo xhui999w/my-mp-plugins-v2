@@ -57,6 +57,7 @@ class OAuthServiceTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.get("/v1/settings", headers=self.headers).json()["save_directory"], "/media")
+        self.assertNotIn("tmdb_api_key", self.client.get("/v1/settings", headers=self.headers).json())
         response = self.client.post(
             "/v1/subscriptions",
             headers=self.headers,

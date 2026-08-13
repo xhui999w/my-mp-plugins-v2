@@ -118,8 +118,19 @@ def init_database() -> None:
             moviepilot_url TEXT DEFAULT '',
             save_directory TEXT DEFAULT '',
             offline_enabled INTEGER DEFAULT 1,
+            tmdb_api_key TEXT DEFAULT '',
+            tmdb_language TEXT DEFAULT 'zh-CN',
+            tmdb_region TEXT DEFAULT 'CN',
             updated_at INTEGER NOT NULL
         )""")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(web_settings)")}
+        for name, definition in (
+            ("tmdb_api_key", "TEXT DEFAULT ''"),
+            ("tmdb_language", "TEXT DEFAULT 'zh-CN'"),
+            ("tmdb_region", "TEXT DEFAULT 'CN'"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE web_settings ADD COLUMN {name} {definition}")
 
 
 @app.on_event("startup")
@@ -349,18 +360,17 @@ def _web_account_card() -> str:
 
 @app.get("/web/rankings", response_class=HTMLResponse)
 async def web_rankings() -> HTMLResponse:
-    ranking_html = "<p class='muted'>正在读取影巢榜单……</p>"
     try:
-        data = await fetch_rankings(WEB_INSTALLATION_ID)
-        items = data.get("items") or data.get("rankings") or data.get("list") or []
-        if items:
-            ranking_html = "<table><tr><th>排名</th><th>名称</th><th>类型</th><th>评分</th><th>操作</th></tr>" + "".join(f"<tr><td>{i+1}</td><td>{html.escape(str(x.get('title') or x.get('name') or '未命名'))}</td><td>{html.escape(str(x.get('media_type') or x.get('type') or ''))}</td><td>{html.escape(str(x.get('score') or x.get('rating') or '-'))}</td><td><a class='btn' href='/web/search?keyword={quote(str(x.get('title') or x.get('name') or ''))}'>查看资源</a></td></tr>" for i,x in enumerate(items[:50])) + "</table>"
-        else:
-            ranking_html = "<p class='muted'>影巢当前没有返回榜单数据，请使用下面的名称搜索。</p>"
+        data = await fetch_tmdb_rankings(WEB_INSTALLATION_ID)
+        items = data.get("items") or []
+        ranking_html = "<div class='grid'>" + "".join(
+            f"<div class='card'><img src='{html.escape(str(item.get('poster') or ''))}' style='width:100%;max-height:330px;object-fit:cover;border-radius:8px' loading='lazy'><h2>{index + 1}. {html.escape(str(item.get('title') or '未命名'))}</h2><p>评分：{html.escape(str(item.get('rating') or '-'))}　年份：{html.escape(str(item.get('year') or '-'))}</p><form method='post' action='/web/query'><input type='hidden' name='media_type' value='{item.get('media_type')}'><input type='hidden' name='tmdb_id' value='{item.get('tmdb_id')}'><button>查看影巢资源</button></form></div>"
+            for index, item in enumerate(items[:20])
+        ) + "</div>"
     except HTTPException as exc:
-        ranking_html = f"<p class='muted'>榜单接口暂不可用（{exc.status_code}）。名称搜索仍可使用。</p>"
-    content = _web_account_card() + f"<div class='card'><h2>影巢热门榜单</h2>{ranking_html}</div><div class='grid'><div class='card'><h2>按名称搜索</h2><p class='muted'>不需要 TMDB ID，直接输入电影或电视剧名称。</p><form method='post' action='/web/search'><input name='keyword' placeholder='例如：庆余年' required><select name='media_type'><option value='movie'>电影</option><option value='tv'>电视剧</option></select><button>搜索影巢资源</button></form></div><div class='card'><h2>精确查询</h2><form method='post' action='/web/query'><select name='media_type'><option value='movie'>电影</option><option value='tv'>电视剧</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>精确查询</button></form></div></div>"
-    return _web_layout("榜单与资源搜索", content)
+        ranking_html = f"<p class='muted'>无法读取 TMDB 榜单：{html.escape(str(exc.detail))}</p><a class='btn' href='/web/settings'>前往设置 TMDB API Key</a>"
+    content = _web_account_card() + f"<div class='card'><h2>TMDB 热门影视榜单</h2>{ranking_html}</div><div class='card'><h2>按名称搜索影巢资源</h2><form method='post' action='/web/search'><input name='keyword' placeholder='例如：庆余年' required><select name='media_type'><option value='movie'>电影</option><option value='tv'>电视剧</option></select><button>搜索</button></form></div>"
+    return _web_layout("热门榜单与资源搜索", content)
 
 
 @app.get("/web/discover", response_class=HTMLResponse)
@@ -398,15 +408,16 @@ def web_tasks() -> HTMLResponse:
 @app.get("/web/settings", response_class=HTMLResponse)
 def web_settings() -> HTMLResponse:
     with database() as conn:
-        row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
-    settings = dict(row) if row else {"moviepilot_url": "", "save_directory": "", "offline_enabled": 1}
-    content = _web_account_card() + f"<div class='card'><h2>Transfer settings</h2><form method='post' action='/web/settings'><label>MoviePilot URL</label><br><input name='moviepilot_url' value='{html.escape(str(settings['moviepilot_url']))}' size='60'><br><label>115 save directory</label><br><input name='save_directory' value='{html.escape(str(settings['save_directory']))}' size='60'><br><label><input type='checkbox' name='offline_enabled' {'checked' if settings['offline_enabled'] else ''}> Enable magnet/ed2k offline transfer</label><br><button>Save settings</button></form></div><div class='card'><p>HDHive API: {html.escape(BASE_URL)}</p><p>OAuth callback: {html.escape(REDIRECT_URI)}</p></div>"
+        row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled, tmdb_api_key, tmdb_language, tmdb_region FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
+    settings = dict(row) if row else {"moviepilot_url": "", "save_directory": "", "offline_enabled": 1, "tmdb_api_key": "", "tmdb_language": "zh-CN", "tmdb_region": "CN"}
+    key_hint = "已配置，留空表示不修改" if settings.get("tmdb_api_key") else "填写 TMDB API Read Access Token 或 API Key"
+    content = _web_account_card() + f"<div class='card'><h2>TMDB 榜单配置</h2><form method='post' action='/web/settings'><label>TMDB API Key</label><br><input type='password' name='tmdb_api_key' value='' size='60' placeholder='{key_hint}'><br><label>语言</label><input name='tmdb_language' value='{html.escape(str(settings['tmdb_language']))}'><label>地区</label><input name='tmdb_region' value='{html.escape(str(settings['tmdb_region']))}'><hr><h2>转存配置</h2><label>MoviePilot 地址</label><br><input name='moviepilot_url' value='{html.escape(str(settings['moviepilot_url']))}' size='60'><br><label>115 保存目录</label><br><input name='save_directory' value='{html.escape(str(settings['save_directory']))}' size='60'><br><label><input type='checkbox' name='offline_enabled' {'checked' if settings['offline_enabled'] else ''}> 启用磁力和 ed2k 离线下载</label><br><button>保存全部设置</button></form></div>"
     return _web_layout("设置", content)
 
 
 @app.post("/web/settings", response_class=HTMLResponse)
-def web_settings_save(moviepilot_url: str = Form(""), save_directory: str = Form(""), offline_enabled: str = Form("")) -> HTMLResponse:
-    put_settings(WebSettings(moviepilot_url=moviepilot_url, save_directory=save_directory, offline_enabled=bool(offline_enabled)), WEB_INSTALLATION_ID)
+def web_settings_save(moviepilot_url: str = Form(""), save_directory: str = Form(""), offline_enabled: str = Form(""), tmdb_api_key: str = Form(""), tmdb_language: str = Form("zh-CN"), tmdb_region: str = Form("CN")) -> HTMLResponse:
+    put_settings(WebSettings(moviepilot_url=moviepilot_url, save_directory=save_directory, offline_enabled=bool(offline_enabled), tmdb_api_key=tmdb_api_key, tmdb_language=tmdb_language, tmdb_region=tmdb_region), WEB_INSTALLATION_ID)
     return RedirectResponse("/web/settings", status_code=303)
 
 
@@ -688,6 +699,36 @@ async def fetch_rankings(installation_id: str) -> dict[str, Any]:
     return {"items": []}
 
 
+async def fetch_tmdb_rankings(installation_id: str) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT tmdb_api_key, tmdb_language, tmdb_region FROM web_settings WHERE installation_id = ?", (installation_id,)).fetchone()
+    if not row or not row["tmdb_api_key"]:
+        raise HTTPException(409, "请先在设置页面填写 TMDB API Key")
+    api_key = decrypt(row["tmdb_api_key"])
+    language = row["tmdb_language"] or "zh-CN"
+    region = row["tmdb_region"] or "CN"
+    headers = {"Accept": "application/json"}
+    params: dict[str, Any] = {"language": language, "region": region}
+    if api_key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        params["api_key"] = api_key
+    items: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        for media_type, path in (("movie", "/3/trending/movie/week"), ("tv", "/3/trending/tv/week")):
+            try:
+                response = await client.get(f"https://api.themoviedb.org{path}", headers=headers, params=params)
+                response.raise_for_status()
+                payload = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                raise HTTPException(502, f"TMDB 请求失败：{exc}") from exc
+            for item in payload.get("results", [])[:10]:
+                date = str(item.get("release_date") or item.get("first_air_date") or "")
+                items.append({"tmdb_id": item.get("id"), "media_type": media_type, "title": item.get("title") or item.get("name"), "rating": item.get("vote_average"), "year": date[:4], "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get("poster_path") else ""})
+    items.sort(key=lambda item: float(item.get("rating") or 0), reverse=True)
+    return {"items": items}
+
+
 @app.get("/v1/rankings")
 async def rankings(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
     return await fetch_rankings(installation_id)
@@ -737,25 +778,33 @@ class WebSettings(BaseModel):
     moviepilot_url: str = Field(default="", max_length=500)
     save_directory: str = Field(default="", max_length=500)
     offline_enabled: bool = True
+    tmdb_api_key: str = Field(default="", max_length=1000)
+    tmdb_language: str = Field(default="zh-CN", max_length=16)
+    tmdb_region: str = Field(default="CN", max_length=8)
 
 
 @app.get("/v1/settings")
 def get_settings(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
     with database() as conn:
-        row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled, updated_at FROM web_settings WHERE installation_id = ?", (installation_id,)).fetchone()
+        row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled, tmdb_api_key, tmdb_language, tmdb_region, updated_at FROM web_settings WHERE installation_id = ?", (installation_id,)).fetchone()
     if not row:
-        return {"moviepilot_url": "", "save_directory": "", "offline_enabled": True}
-    return dict(row)
+        return {"moviepilot_url": "", "save_directory": "", "offline_enabled": True, "tmdb_api_key_configured": False, "tmdb_language": "zh-CN", "tmdb_region": "CN"}
+    result = dict(row)
+    result["tmdb_api_key_configured"] = bool(result.pop("tmdb_api_key", ""))
+    return result
 
 
 @app.put("/v1/settings")
 def put_settings(request: WebSettings, installation_id: str = Depends(require_installation)) -> dict[str, Any]:
     with database() as conn:
-        conn.execute("""INSERT INTO web_settings (installation_id, moviepilot_url, save_directory, offline_enabled, updated_at)
-            VALUES (?, ?, ?, ?, ?) ON CONFLICT(installation_id) DO UPDATE SET moviepilot_url=excluded.moviepilot_url,
-            save_directory=excluded.save_directory, offline_enabled=excluded.offline_enabled, updated_at=excluded.updated_at""",
-            (installation_id, request.moviepilot_url.strip().rstrip("/"), request.save_directory.strip(), int(request.offline_enabled), int(time.time())))
-    return {"ok": True, **request.model_dump()}
+        current = conn.execute("SELECT tmdb_api_key FROM web_settings WHERE installation_id = ?", (installation_id,)).fetchone()
+        stored_tmdb_key = encrypt(request.tmdb_api_key.strip()) if request.tmdb_api_key.strip() else (current["tmdb_api_key"] if current else "")
+        conn.execute("""INSERT INTO web_settings (installation_id, moviepilot_url, save_directory, offline_enabled, tmdb_api_key, tmdb_language, tmdb_region, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(installation_id) DO UPDATE SET moviepilot_url=excluded.moviepilot_url,
+            save_directory=excluded.save_directory, offline_enabled=excluded.offline_enabled, tmdb_api_key=excluded.tmdb_api_key,
+            tmdb_language=excluded.tmdb_language, tmdb_region=excluded.tmdb_region, updated_at=excluded.updated_at""",
+            (installation_id, request.moviepilot_url.strip().rstrip("/"), request.save_directory.strip(), int(request.offline_enabled), stored_tmdb_key, request.tmdb_language.strip() or "zh-CN", request.tmdb_region.strip().upper() or "CN", int(time.time())))
+    return {"ok": True, "tmdb_api_key_configured": bool(stored_tmdb_key), "moviepilot_url": request.moviepilot_url, "save_directory": request.save_directory, "offline_enabled": request.offline_enabled}
 
 
 @app.get("/v1/transfers")
