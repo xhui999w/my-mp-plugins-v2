@@ -113,6 +113,13 @@ def init_database() -> None:
             status TEXT NOT NULL DEFAULT 'active',
             created_at INTEGER NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS web_settings (
+            installation_id TEXT PRIMARY KEY,
+            moviepilot_url TEXT DEFAULT '',
+            save_directory TEXT DEFAULT '',
+            offline_enabled INTEGER DEFAULT 1,
+            updated_at INTEGER NOT NULL
+        )""")
 
 
 @app.on_event("startup")
@@ -274,6 +281,11 @@ async def refresh_for(installation_id: str, refresh_token: str = "") -> str:
         await save_tokens(installation_id, token_data)
         return str(token_data.get("access_token") or "")
     except HDHiveAPIError as exc:
+        with database() as conn:
+            conn.execute(
+                "INSERT INTO transfer_records (installation_id, slug, name, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (installation_id, slug, slug, "failed", f"{exc.code}: {exc.message}", int(time.time())),
+            )
         raise HTTPException(exc.status, f"{exc.code}: {exc.message}") from exc
 
 
@@ -590,6 +602,38 @@ def list_subscriptions(installation_id: str = Depends(require_installation)) -> 
             "SELECT id, title, media_type, tmdb_id, status, created_at FROM web_subscriptions WHERE installation_id = ? ORDER BY id DESC",
             (installation_id,),
         ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
+class WebSettings(BaseModel):
+    moviepilot_url: str = Field(default="", max_length=500)
+    save_directory: str = Field(default="", max_length=500)
+    offline_enabled: bool = True
+
+
+@app.get("/v1/settings")
+def get_settings(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled, updated_at FROM web_settings WHERE installation_id = ?", (installation_id,)).fetchone()
+    if not row:
+        return {"moviepilot_url": "", "save_directory": "", "offline_enabled": True}
+    return dict(row)
+
+
+@app.put("/v1/settings")
+def put_settings(request: WebSettings, installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    with database() as conn:
+        conn.execute("""INSERT INTO web_settings (installation_id, moviepilot_url, save_directory, offline_enabled, updated_at)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT(installation_id) DO UPDATE SET moviepilot_url=excluded.moviepilot_url,
+            save_directory=excluded.save_directory, offline_enabled=excluded.offline_enabled, updated_at=excluded.updated_at""",
+            (installation_id, request.moviepilot_url.strip().rstrip("/"), request.save_directory.strip(), int(request.offline_enabled), int(time.time())))
+    return {"ok": True, **request.model_dump()}
+
+
+@app.get("/v1/transfers")
+def list_transfers(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    with database() as conn:
+        rows = conn.execute("SELECT id, slug, name, share_url, status, error, created_at FROM transfer_records WHERE installation_id = ? ORDER BY id DESC LIMIT 100", (installation_id,)).fetchall()
     return {"items": [dict(row) for row in rows]}
 
 

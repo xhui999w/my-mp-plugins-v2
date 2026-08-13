@@ -49,6 +49,22 @@ class OAuthServiceTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 401)
 
+    def test_settings_and_subscriptions(self):
+        response = self.client.put(
+            "/v1/settings",
+            headers=self.headers,
+            json={"moviepilot_url": "http://moviepilot.local", "save_directory": "/media", "offline_enabled": True},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.get("/v1/settings", headers=self.headers).json()["save_directory"], "/media")
+        response = self.client.post(
+            "/v1/subscriptions",
+            headers=self.headers,
+            json={"title": "Example", "media_type": "movie", "tmdb_id": 123},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.client.get("/v1/subscriptions", headers=self.headers).json()["items"]), 1)
+
     def test_oauth_callback_stores_only_encrypted_tokens(self):
         expires = int(main.time.time()) + 300
         signature = main.sign_start(self.installation_id, expires)
