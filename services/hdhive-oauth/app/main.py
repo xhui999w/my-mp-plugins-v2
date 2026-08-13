@@ -26,6 +26,9 @@ from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
+from .explore import RANKINGS, TMDBProvider, filter_metadata, registry
+from .explore_ui import explore_html
+
 
 def required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -147,6 +150,14 @@ def decrypt(value: str) -> str:
         return CIPHER.decrypt(value.encode("ascii")).decode("utf-8")
     except InvalidToken as exc:
         raise HTTPException(500, "Stored OAuth token cannot be decrypted") from exc
+
+
+def explore_tmdb_provider() -> TMDBProvider:
+    init_database()
+    with database() as conn:
+        row = conn.execute("SELECT tmdb_api_key, tmdb_language, tmdb_region FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
+    token = decrypt(row["tmdb_api_key"]) if row and row["tmdb_api_key"] else os.getenv("TMDB_API_KEY", "").strip()
+    return TMDBProvider(token, row["tmdb_language"] if row else "zh-CN", row["tmdb_region"] if row else "CN", REQUEST_TIMEOUT)
 
 
 def valid_installation_id(value: str) -> str:
@@ -319,6 +330,70 @@ async def authorized_request(
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "service": "hdhive-oauth"}
+
+
+@app.get("/explore", response_class=HTMLResponse)
+def explore_page() -> HTMLResponse:
+    return HTMLResponse(explore_html())
+
+
+@app.get("/api/explore/status")
+def explore_status() -> dict[str, Any]:
+    tmdb = explore_tmdb_provider()
+    return {"ok": True, "configured": tmdb.configured, "providers": registry(tmdb.configured)}
+
+
+@app.get("/api/explore/providers")
+def explore_providers() -> dict[str, Any]:
+    tmdb = explore_tmdb_provider()
+    return {"items": registry(tmdb.configured)}
+
+
+@app.get("/api/explore/filters")
+async def explore_filters(media_type: str = Query("movie", pattern="^(movie|tv)$")) -> dict[str, Any]:
+    tmdb = explore_tmdb_provider()
+    genres: list[dict[str, Any]] = []
+    if tmdb.configured:
+        try:
+            genres = await tmdb.genres(media_type)
+        except Exception:
+            genres = []
+    return {"data": filter_metadata(genres), "configured": tmdb.configured}
+
+
+@app.get("/api/explore/discover")
+async def explore_discover(
+    provider: str = Query("tmdb"), media_type: str = Query("movie", pattern="^(movie|tv)$"),
+    region: str = Query(""), language: str = Query(""), genre: str = Query(""), year: int | None = Query(None),
+    sort: str = Query("popularity.desc"), rating: float = Query(0, ge=0, le=10), page: int = Query(1, ge=1),
+) -> dict[str, Any]:
+    tmdb = explore_tmdb_provider()
+    if not tmdb.configured:
+        return {"items": [], "page": page, "total_pages": 0, "has_more": False, "provider": provider, "configured": False, "error": "该数据源尚未配置，请在设置页面填写 TMDB API Key。"}
+    if provider not in {"tmdb", "netflix", "max", "prime", "disney", "apple"}:
+        return {"items": [], "page": page, "total_pages": 0, "has_more": False, "provider": provider, "configured": False, "error": "该数据源暂不可用。"}
+    try:
+        return await tmdb.discover({"platform": "" if provider == "tmdb" else provider, "media_type": media_type, "region": region, "language": language, "genre": genre, "year": year, "sort": sort, "rating": rating, "page": page})
+    except Exception as exc:
+        return {"items": [], "page": page, "total_pages": 0, "has_more": False, "provider": provider, "configured": True, "error": "影视数据加载失败，请稍后重试。", "detail": type(exc).__name__}
+
+
+@app.get("/api/explore/rankings")
+async def explore_rankings() -> dict[str, Any]:
+    return {"items": [{"id": key, "name": name} for key, name in RANKINGS.items()]}
+
+
+@app.get("/api/explore/ranking/{provider}/{ranking}")
+async def explore_ranking(provider: str, ranking: str, page: int = Query(1, ge=1)) -> dict[str, Any]:
+    tmdb = explore_tmdb_provider()
+    if not tmdb.configured:
+        return {"items": [], "configured": False, "error": "TMDB 尚未配置。"}
+    if provider != "tmdb" or ranking not in RANKINGS:
+        raise HTTPException(404, "榜单不存在")
+    try:
+        return await tmdb.ranking(ranking, page)
+    except Exception as exc:
+        return {"items": [], "configured": True, "error": "榜单加载失败，请稍后重试。", "detail": type(exc).__name__}
 
 
 @app.get("/", response_class=HTMLResponse)

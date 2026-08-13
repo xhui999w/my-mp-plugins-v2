@@ -1,0 +1,61 @@
+import asyncio
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from app.explore import TMDBProvider, TTLCache, filter_metadata, registry
+
+
+class ExploreTests(unittest.TestCase):
+    def test_registry_reports_missing_token(self):
+        providers = registry(False)
+        self.assertEqual(providers[0]["id"], "tmdb")
+        self.assertFalse(providers[0]["configured"])
+        self.assertTrue(any(item["id"] == "netflix" for item in providers))
+
+    def test_media_normalization(self):
+        item = TMDBProvider.normalize({"id": 7, "title": "示例", "release_date": "2026-08-14", "vote_average": 8.26, "poster_path": "/a.jpg"}, "movie")
+        self.assertEqual(item["tmdb_id"], 7)
+        self.assertEqual(item["year"], "2026")
+        self.assertEqual(item["rating"], 8.3)
+        self.assertIn("w342", item["poster"])
+
+    def test_filters_use_codes_and_dynamic_years(self):
+        filters = filter_metadata([{"id": 28, "name": "动作"}])
+        self.assertIn({"code": "KR", "name": "韩国"}, filters["regions"])
+        self.assertIn({"code": "ko", "name": "韩语"}, filters["languages"])
+        self.assertEqual(filters["genres"][0]["id"], 28)
+        self.assertGreaterEqual(len(filters["years"]), 10)
+
+    def test_cache_expiration(self):
+        async def scenario():
+            cache = TTLCache()
+            await cache.set("x", {"ok": True}, 10)
+            self.assertEqual((await cache.get("x"))["ok"], True)
+        asyncio.run(scenario())
+
+    def test_discover_parameter_mapping_and_pagination(self):
+        async def scenario():
+            provider = TMDBProvider("key")
+            payload = {"page": 2, "total_pages": 3, "total_results": 50, "results": [{"id": 1, "title": "A", "release_date": "2025-01-01"}]}
+            with patch.object(provider, "request", new=AsyncMock(return_value=(payload, False))) as request:
+                result = await provider.discover({"media_type": "movie", "region": "KR", "language": "ko", "genre": "28", "year": 2025, "rating": 7, "sort": "vote_average.desc", "page": 2})
+            params = request.await_args.args[1]
+            self.assertEqual(params["region"], "KR")
+            self.assertEqual(params["with_original_language"], "ko")
+            self.assertEqual(params["with_genres"], "28")
+            self.assertEqual(params["primary_release_year"], 2025)
+            self.assertTrue(result["has_more"])
+        asyncio.run(scenario())
+
+    def test_missing_token_does_not_break_explore_page(self):
+        from test_service import main
+        client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(main.app)
+        page = client.get("/explore")
+        self.assertEqual(page.status_code, 200)
+        result = client.get("/api/explore/discover").json()
+        self.assertFalse(result["configured"])
+        self.assertIn("尚未配置", result["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
