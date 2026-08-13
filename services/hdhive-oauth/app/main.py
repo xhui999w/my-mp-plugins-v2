@@ -364,7 +364,7 @@ async def explore_filters(media_type: str = Query("movie", pattern="^(movie|tv)$
 @app.get("/api/explore/discover")
 async def explore_discover(
     provider: str = Query("tmdb"), media_type: str = Query("movie", pattern="^(movie|tv)$"),
-    region: str = Query(""), language: str = Query(""), genre: str = Query(""), year: int | None = Query(None),
+    region: str = Query(""), language: str = Query(""), genre: str = Query(""), year: str = Query(""),
     sort: str = Query("popularity.desc"), rating: float = Query(0, ge=0, le=10), page: int = Query(1, ge=1),
 ) -> dict[str, Any]:
     tmdb = explore_tmdb_provider()
@@ -373,7 +373,8 @@ async def explore_discover(
     if provider not in {"tmdb", "netflix", "max", "prime", "disney", "apple"}:
         return {"items": [], "page": page, "total_pages": 0, "has_more": False, "provider": provider, "configured": False, "error": "该数据源暂不可用。"}
     try:
-        return await tmdb.discover({"platform": "" if provider == "tmdb" else provider, "media_type": media_type, "region": region, "language": language, "genre": genre, "year": year, "sort": sort, "rating": rating, "page": page})
+        normalized_year = int(year) if year.isdigit() and 1900 <= int(year) <= 2100 else None
+        return await tmdb.discover({"platform": "" if provider == "tmdb" else provider, "media_type": media_type, "region": region, "language": language, "genre": genre, "year": normalized_year, "sort": sort, "rating": rating, "page": page})
     except Exception as exc:
         return {"items": [], "page": page, "total_pages": 0, "has_more": False, "provider": provider, "configured": True, "error": "影视数据加载失败，请稍后重试。", "detail": type(exc).__name__}
 
