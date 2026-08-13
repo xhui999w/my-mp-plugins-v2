@@ -94,6 +94,25 @@ def init_database() -> None:
             user_json TEXT DEFAULT '{}',
             updated_at INTEGER NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS transfer_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            share_url TEXT DEFAULT '',
+            status TEXT NOT NULL,
+            error TEXT DEFAULT '',
+            created_at INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS web_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            tmdb_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at INTEGER NOT NULL
+        )""")
 
 
 @app.on_event("startup")
@@ -340,6 +359,15 @@ async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...)) -> HT
         return _result_page("查询失败", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
 
 
+@app.post("/web/subscribe", response_class=HTMLResponse)
+def web_subscribe(title: str = Form(...), media_type: str = Form(...), tmdb_id: int = Form(...)) -> HTMLResponse:
+    try:
+        result = create_subscription(SubscriptionRequest(title=title, media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
+        return _result_page("Subscription added", result)
+    except HTTPException as exc:
+        return _result_page("Subscription failed", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
+
+
 @app.post("/web/resolve", response_class=HTMLResponse)
 async def web_resolve(slug: str = Form(...), max_unlock_points: int = Form(0)) -> HTMLResponse:
     try:
@@ -434,6 +462,32 @@ def status(installation_id: str = Depends(require_installation)) -> dict[str, An
     }
 
 
+@app.get("/v1/dashboard")
+def dashboard_status(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    """Return the small set of data needed by a personal web dashboard."""
+    try:
+        row = load_installation(installation_id)
+    except HTTPException:
+        return {"authorized": False, "installation_id": installation_id}
+    user = json.loads(row["user_json"] or "{}")
+    with database() as conn:
+        transfers = conn.execute(
+            "SELECT COUNT(*) FROM transfer_records WHERE installation_id = ?", (installation_id,)
+        ).fetchone()[0]
+        subscriptions = conn.execute(
+            "SELECT COUNT(*) FROM web_subscriptions WHERE installation_id = ? AND status = 'active'",
+            (installation_id,),
+        ).fetchone()[0]
+    return {
+        "authorized": True,
+        "installation_id": installation_id,
+        "user": {"id": user.get("id"), "nickname": user.get("nickname") or user.get("username"), "points": user.get("points")},
+        "updated_at": row["updated_at"],
+        "transfer_count": transfers,
+        "subscription_count": subscriptions,
+    }
+
+
 class ResourceQuery(BaseModel):
     media_type: str = Field(pattern="^(movie|tv)$")
     tmdb_id: int = Field(gt=0)
@@ -494,14 +548,49 @@ async def resolve_resource(
     except HDHiveAPIError as exc:
         raise HTTPException(exc.status, f"{exc.code}: {exc.message}") from exc
     url = str(data.get("full_url") or data.get("url") or "").strip()
+    name = str(data.get("title") or data.get("name") or slug)
+    with database() as conn:
+        conn.execute(
+            "INSERT INTO transfer_records (installation_id, slug, name, share_url, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (installation_id, slug, name, url, "resolved", int(time.time())),
+        )
     return {
-        "name": str(data.get("title") or data.get("name") or slug),
+        "name": name,
         "share_url": url,
         "password": str(data.get("access_code") or ""),
         "files": data.get("files") if isinstance(data.get("files"), list) else [],
         "slug": slug,
         "already_owned": bool(data.get("already_owned")),
     }
+
+
+class SubscriptionRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    media_type: str = Field(pattern="^(movie|tv)$")
+    tmdb_id: int = Field(gt=0)
+
+
+@app.post("/v1/subscriptions")
+def create_subscription(
+    request: SubscriptionRequest,
+    installation_id: str = Depends(require_installation),
+) -> dict[str, Any]:
+    with database() as conn:
+        cur = conn.execute(
+            "INSERT INTO web_subscriptions (installation_id, title, media_type, tmdb_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            (installation_id, request.title.strip(), request.media_type, request.tmdb_id, int(time.time())),
+        )
+        return {"id": cur.lastrowid, "status": "active", **request.model_dump()}
+
+
+@app.get("/v1/subscriptions")
+def list_subscriptions(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    with database() as conn:
+        rows = conn.execute(
+            "SELECT id, title, media_type, tmdb_id, status, created_at FROM web_subscriptions WHERE installation_id = ? ORDER BY id DESC",
+            (installation_id,),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
 
 
 @app.delete("/v1/authorization")
