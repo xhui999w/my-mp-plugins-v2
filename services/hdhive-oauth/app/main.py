@@ -332,6 +332,74 @@ def dashboard() -> HTMLResponse:
 <p><small>当前仅供个人使用；授权 Token 保存在服务器，不会显示或提交到 GitHub。解锁后请在 MoviePilot 中执行现有 115 转存。</small></p></main>""")
 
 
+def _web_layout(title: str, content: str) -> HTMLResponse:
+    nav = "<nav><a href='/'>Home</a><a href='/web/rankings'>Rankings</a><a href='/web/discover'>Discover</a><a href='/web/subscriptions'>Subscriptions</a><a href='/web/tasks'>Tasks</a><a href='/web/unlocks'>Unlocks</a><a href='/web/settings'>Settings</a></nav>"
+    return HTMLResponse(f"""<!doctype html><meta charset='utf-8'><title>{html.escape(title)}</title><style>
+body{{margin:0;background:#0d0b08;color:#eee;font:15px system-ui}}nav{{padding:18px 28px;background:#17120b;border-bottom:1px solid #654b20}}nav a{{color:#e2bd73;margin-right:22px;text-decoration:none}}main{{max-width:1250px;margin:28px auto;padding:28px;background:#17130d;border:1px solid #604821;border-radius:16px}}h1{{color:#e5c47d}}h2{{color:#d5b16b}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}}.card{{padding:20px;background:#211a11;border:1px solid #4a381e;border-radius:12px}}.muted{{color:#aaa}}table{{width:100%;border-collapse:collapse}}td,th{{padding:12px;border-bottom:1px solid #3e301d;text-align:left}}input,select,button{{padding:10px;margin:5px;background:#0f0d0a;color:#eee;border:1px solid #896b36;border-radius:6px}}button{{color:#f1cd80;cursor:pointer}}a.btn{{display:inline-block;padding:10px 14px;background:#76531f;color:#fff;border-radius:6px;text-decoration:none}}</style>{nav}<main><h1>{html.escape(title)}</h1>{content}</main>""")
+
+
+def _web_account_card() -> str:
+    try:
+        row = load_installation(WEB_INSTALLATION_ID)
+        user = json.loads(row["user_json"] or "{}")
+        return f"<div class='card'>Authorized: <b>{html.escape(str(user.get('nickname') or user.get('username') or 'account'))}</b>　Points: <b>{html.escape(str(user.get('points') or 'unknown'))}</b></div>"
+    except HTTPException:
+        return "<div class='card'>Not authorized. <a class='btn' href='/oauth/login'>Authorize HDHive</a></div>"
+
+
+@app.get("/web/rankings", response_class=HTMLResponse)
+def web_rankings() -> HTMLResponse:
+    content = _web_account_card() + "<div class='grid'><div class='card'><h2>TMDB popular</h2><p class='muted'>Enter a TMDB id to query HDHive resources.</p><form method='post' action='/web/query'><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Query resources</button></form></div><div class='card'><h2>Quick unlock</h2><p class='muted'>Paste an HDHive resource slug or URL.</p><form method='post' action='/web/resolve'><input name='slug' placeholder='resource slug' required><input name='max_unlock_points' type='number' value='0' min='0'><button>Unlock</button></form></div></div>"
+    return _web_layout("Rankings and resource query", content)
+
+
+@app.get("/web/discover", response_class=HTMLResponse)
+def web_discover() -> HTMLResponse:
+    content = _web_account_card() + "<div class='card'><h2>Resource discovery</h2><p>Use TMDB id, media type and filters to locate matching HDHive resources.</p><form method='post' action='/web/query'><label>Type </label><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><label> TMDB ID </label><input name='tmdb_id' type='number' required><button>Search HDHive</button></form></div>"
+    return _web_layout("Resource discovery", content)
+
+
+@app.get("/web/subscriptions", response_class=HTMLResponse)
+def web_subscriptions() -> HTMLResponse:
+    with database() as conn:
+        rows = conn.execute("SELECT title, media_type, tmdb_id, status, created_at FROM web_subscriptions WHERE installation_id = ? ORDER BY id DESC", (WEB_INSTALLATION_ID,)).fetchall()
+    table = "".join(f"<tr><td>{html.escape(str(r['title']))}</td><td>{r['media_type']}</td><td>{r['tmdb_id']}</td><td>{r['status']}</td><td>{r['created_at']}</td></tr>" for r in rows) or "<tr><td colspan='5'>No subscriptions yet</td></tr>"
+    content = _web_account_card() + "<div class='card'><h2>Add subscription</h2><form method='post' action='/web/subscribe'><input name='title' placeholder='Title' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Add</button></form></div><div class='card'><h2>Current subscriptions</h2><table><tr><th>Title</th><th>Type</th><th>TMDB</th><th>Status</th><th>Created</th></tr>" + table + "</table></div>"
+    return _web_layout("Subscriptions", content)
+
+
+@app.get("/web/unlocks", response_class=HTMLResponse)
+def web_unlocks() -> HTMLResponse:
+    with database() as conn:
+        rows = conn.execute("SELECT name, slug, share_url, status, error, created_at FROM transfer_records WHERE installation_id = ? ORDER BY id DESC LIMIT 100", (WEB_INSTALLATION_ID,)).fetchall()
+    table = "".join(f"<tr><td>{html.escape(str(r['name']))}</td><td>{html.escape(str(r['slug']))}</td><td>{html.escape(str(r['status']))}</td><td>{html.escape(str(r['share_url'] or r['error']))}</td><td>{r['created_at']}</td></tr>" for r in rows) or "<tr><td colspan='5'>No unlock records yet</td></tr>"
+    return _web_layout("Unlock and transfer records", _web_account_card() + "<div class='card'><table><tr><th>Name</th><th>Slug</th><th>Status</th><th>115 URL / Error</th><th>Time</th></tr>" + table + "</table></div>")
+
+
+@app.get("/web/tasks", response_class=HTMLResponse)
+def web_tasks() -> HTMLResponse:
+    with database() as conn:
+        transfers = conn.execute("SELECT COUNT(*), SUM(status='resolved'), SUM(status='failed') FROM transfer_records WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
+        subs = conn.execute("SELECT COUNT(*) FROM web_subscriptions WHERE installation_id = ? AND status = 'active'", (WEB_INSTALLATION_ID,)).fetchone()[0]
+    content = _web_account_card() + f"<div class='grid'><div class='card'><h2>Subscription tasks</h2><p>Active subscriptions: <b>{subs}</b></p><p class='muted'>MoviePilot performs scheduled subscription matching and 115 saving.</p></div><div class='card'><h2>Transfer execution</h2><p>Total: {transfers[0] or 0}</p><p>Success: {transfers[1] or 0}　Failed: {transfers[2] or 0}</p><a class='btn' href='/web/unlocks'>View execution details</a></div></div>"
+    return _web_layout("Subscription tasks", content)
+
+
+@app.get("/web/settings", response_class=HTMLResponse)
+def web_settings() -> HTMLResponse:
+    with database() as conn:
+        row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
+    settings = dict(row) if row else {"moviepilot_url": "", "save_directory": "", "offline_enabled": 1}
+    content = _web_account_card() + f"<div class='card'><h2>Transfer settings</h2><form method='post' action='/web/settings'><label>MoviePilot URL</label><br><input name='moviepilot_url' value='{html.escape(str(settings['moviepilot_url']))}' size='60'><br><label>115 save directory</label><br><input name='save_directory' value='{html.escape(str(settings['save_directory']))}' size='60'><br><label><input type='checkbox' name='offline_enabled' {'checked' if settings['offline_enabled'] else ''}> Enable magnet/ed2k offline transfer</label><br><button>Save settings</button></form></div><div class='card'><p>HDHive API: {html.escape(BASE_URL)}</p><p>OAuth callback: {html.escape(REDIRECT_URI)}</p></div>"
+    return _web_layout("Settings", content)
+
+
+@app.post("/web/settings", response_class=HTMLResponse)
+def web_settings_save(moviepilot_url: str = Form(""), save_directory: str = Form(""), offline_enabled: str = Form("")) -> HTMLResponse:
+    put_settings(WebSettings(moviepilot_url=moviepilot_url, save_directory=save_directory, offline_enabled=bool(offline_enabled)), WEB_INSTALLATION_ID)
+    return RedirectResponse("/web/settings", status_code=303)
+
+
 @app.get("/web/{section}", response_class=HTMLResponse)
 def web_section(section: str) -> HTMLResponse:
     labels = {
