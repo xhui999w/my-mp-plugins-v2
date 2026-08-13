@@ -1,6 +1,11 @@
 import asyncio
+import pathlib
+import sys
 import unittest
 from unittest.mock import AsyncMock, patch
+
+SERVICE_ROOT = pathlib.Path(__file__).parents[1]
+sys.path.insert(0, str(SERVICE_ROOT))
 
 from app.explore import TMDBProvider, TTLCache, filter_metadata, registry
 
