@@ -397,6 +397,27 @@ async def explore_ranking(provider: str, ranking: str, page: int = Query(1, ge=1
         return {"items": [], "configured": True, "error": "榜单加载失败，请稍后重试。", "detail": type(exc).__name__}
 
 
+@app.get("/api/explore/media/{media_type}/{tmdb_id}")
+async def explore_media(media_type: str, tmdb_id: int) -> dict[str, Any]:
+    if media_type not in ("movie", "tv") or tmdb_id <= 0:
+        raise HTTPException(400, "无效的媒体参数")
+    tmdb = explore_tmdb_provider()
+    if not tmdb.configured:
+        return {"configured": False, "error": "TMDB 尚未配置。", "data": None}
+    try:
+        payload, cached = await tmdb.request(f"/{media_type}/{tmdb_id}", {"append_to_response": "credits,watch/providers"}, ttl=3600)
+        item = tmdb.normalize(payload, media_type)
+        item["genres"] = payload.get("genres", [])
+        item["countries"] = payload.get("production_countries", [])
+        item["actors"] = [{"id": actor.get("id"), "name": actor.get("name"), "character": actor.get("character")} for actor in payload.get("credits", {}).get("cast", [])[:12]]
+        directors = [person.get("name") for person in payload.get("credits", {}).get("crew", []) if person.get("job") == "Director"]
+        item["director"] = directors[0] if directors else None
+        item["watch_providers"] = payload.get("watch/providers", {}).get("results", {}).get(tmdb.region, {})
+        return {"configured": True, "cached": cached, "data": item, "error": None}
+    except Exception as exc:
+        return {"configured": True, "data": None, "error": "详情加载失败，请稍后重试。", "detail": type(exc).__name__}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
     """Small personal dashboard; the full MoviePilot UI remains separate."""

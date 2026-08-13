@@ -1,5 +1,18 @@
 # HDHive OAuth Gateway
 
+## 遨游页面
+
+- 页面：`/explore`
+- Provider 状态：`/api/explore/providers`
+- 筛选元数据：`/api/explore/filters`
+- 发现：`/api/explore/discover`
+- 榜单：`/api/explore/ranking/tmdb/trending-week`
+- 详情：`/api/explore/media/movie/{tmdb_id}`
+
+可以在网页设置页填写 TMDB API Key，也可以通过环境变量
+`TMDB_API_KEY` 配置。没有配置时服务仍会正常启动，遨游页面会明确显示
+“数据源尚未配置”，不会使用模拟数据冒充真实数据。
+
 为 `Tg115Transfer` 提供影巢OAuth授权、Token加密保存、资源查询和解锁。
 App Secret与用户Token只保存在服务器，不返回MoviePilot。
 
