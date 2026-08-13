@@ -22,7 +22,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -295,7 +295,10 @@ def dashboard() -> HTMLResponse:
     login_url = f"/oauth/start?installation_id={quote(WEB_INSTALLATION_ID)}&expires={expires}&signature={quote(signature)}"
     return HTMLResponse(f"""<!doctype html><meta charset='utf-8'><title>115 网盘转存助手</title>
 <style>body{{margin:0;background:#111;color:#eee;font:16px system-ui}}main{{max-width:760px;margin:8vh auto;padding:36px;background:#1b1b1b;border:1px solid #55401b;border-radius:18px}}h1{{color:#d8b56a}}.ok,.warn{{padding:16px;border-radius:10px;margin:20px 0}}.ok{{background:#18351f;color:#8ee6a0}}.warn{{background:#3b2a13;color:#ffd27a}}a{{display:inline-block;background:#b99245;color:#fff;padding:12px 18px;border-radius:8px;text-decoration:none;margin:8px 8px 8px 0}}small{{color:#aaa}}</style>
-<main><h1>115 网盘转存助手</h1><p>个人版影巢授权中心</p>{state}<a href='{login_url}'>授权影巢账号</a><a href='/health'>检查服务</a><p><small>当前仅供个人使用；授权 Token 保存在服务器，不会显示或提交到 GitHub。</small></p></main>""")
+<main><h1>115 网盘转存助手</h1><p>个人版影巢授权中心</p>{state}<a href='{login_url}'>授权影巢账号</a><a href='/health'>检查服务</a>
+<h2>资源查询</h2><form method='post' action='/web/query'><input name='media_type' value='movie' placeholder='movie 或 tv'><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>查询影巢资源</button></form>
+<h2>资源解锁</h2><form method='post' action='/web/resolve'><input name='slug' placeholder='影巢资源 slug' required><input name='max_unlock_points' type='number' value='0' min='0'><button>解锁并获取 115 链接</button></form>
+<p><small>当前仅供个人使用；授权 Token 保存在服务器，不会显示或提交到 GitHub。解锁后请在 MoviePilot 中执行现有 115 转存。</small></p></main>""")
 
 
 @app.get("/oauth/login")
@@ -305,6 +308,31 @@ def oauth_login() -> RedirectResponse:
     return RedirectResponse(
         f"/oauth/start?installation_id={quote(WEB_INSTALLATION_ID)}&expires={expires}&signature={quote(signature)}"
     )
+
+
+def _result_page(title: str, payload: Any, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        f"<meta charset='utf-8'><style>body{{background:#111;color:#eee;font:16px system-ui;padding:30px}}pre{{white-space:pre-wrap;background:#222;padding:18px;border-radius:10px}}a{{color:#e0bd70}}</style><h2>{html.escape(title)}</h2><pre>{html.escape(json.dumps(payload, ensure_ascii=False, indent=2, default=str))}</pre><a href='/'>返回首页</a>",
+        status_code=status_code,
+    )
+
+
+@app.post("/web/query", response_class=HTMLResponse)
+async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...)) -> HTMLResponse:
+    try:
+        data = await query_resources(ResourceQuery(media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
+        return _result_page("影巢资源查询结果", data)
+    except HTTPException as exc:
+        return _result_page("查询失败", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
+
+
+@app.post("/web/resolve", response_class=HTMLResponse)
+async def web_resolve(slug: str = Form(...), max_unlock_points: int = Form(0)) -> HTMLResponse:
+    try:
+        data = await resolve_resource(ResolveRequest(slug=slug, max_unlock_points=max_unlock_points), WEB_INSTALLATION_ID)
+        return _result_page("解锁结果（请回到 MoviePilot 转存）", data)
+    except HTTPException as exc:
+        return _result_page("解锁失败", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
 
 
 @app.get("/oauth/start")
