@@ -41,6 +41,7 @@ from .authorizations_ui import authorizations_html
 from .telegram_ui import telegram_html
 from .notifications import ChannelMonitor, NotificationError, NotificationService, TelegramProvider
 from .p115 import P115Client, P115Error
+from .credentials import AUTHORIZATION_PROVIDERS
 
 
 def required_env(name: str) -> str:
@@ -1571,7 +1572,7 @@ def get_authorizations() -> dict[str, Any]:
             user = json.loads(installation["user_json"] or "{}")
         except ValueError:
             user = {}
-    return {"providers": {
+    return {"definitions": AUTHORIZATION_PROVIDERS.infos(), "providers": {
         "hdhive": {"configured": True, "authorized": bool(installation),
                     "summary": str(user.get("nickname") or user.get("name") or user.get("username") or "等待授权")},
         "p115": {"configured": bool(settings and settings["p115_cookie"]), "authorized": bool(settings and settings["p115_cookie"]),
@@ -1586,6 +1587,8 @@ def get_authorizations() -> dict[str, Any]:
 
 @app.put("/api/web/authorizations/{provider}")
 def put_authorization(provider: str, request: AuthorizationUpdate) -> dict[str, Any]:
+    if not AUTHORIZATION_PROVIDERS.get(provider):
+        raise HTTPException(404, "Provider 不存在")
     if provider not in {"p115", "emby", "tmdb"}:
         raise HTTPException(400, "该 Provider 使用独立 OAuth 授权")
     init_database()
