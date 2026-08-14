@@ -256,6 +256,12 @@ def init_database() -> None:
             ("tmdb_api_key", "TEXT DEFAULT ''"),
             ("tmdb_language", "TEXT DEFAULT 'zh-CN'"),
             ("tmdb_region", "TEXT DEFAULT 'CN'"),
+            ("douban_cookie", "TEXT DEFAULT ''"),
+            ("netflix_token", "TEXT DEFAULT ''"),
+            ("max_token", "TEXT DEFAULT ''"),
+            ("prime_token", "TEXT DEFAULT ''"),
+            ("disney_token", "TEXT DEFAULT ''"),
+            ("apple_token", "TEXT DEFAULT ''"),
             ("root_directory", "TEXT DEFAULT ''"),
             ("scrape_directory", "TEXT DEFAULT ''"),
             ("save_wait_seconds", "INTEGER DEFAULT 30"),
@@ -560,8 +566,37 @@ async def explore_rankings() -> dict[str, Any]:
     return {"items": [{"id": key, "name": name} for key, name in RANKINGS.items()]}
 
 
+RANKING_PROVIDERS: tuple[dict[str, Any], ...] = (
+    {"id": "tmdb", "name": "TheMovieDB", "logo": "🎬", "enabled": True, "config_key": "tmdb_api_key"},
+    {"id": "douban", "name": "豆瓣", "logo": "豆", "enabled": True, "config_key": "douban_cookie"},
+    {"id": "netflix", "name": "Netflix", "logo": "N", "enabled": True, "config_key": "netflix_token"},
+    {"id": "max", "name": "HBO Max", "logo": "▣", "enabled": True, "config_key": "max_token"},
+    {"id": "prime", "name": "Prime Video", "logo": "▶", "enabled": True, "config_key": "prime_token"},
+    {"id": "disney", "name": "Disney+", "logo": "D", "enabled": True, "config_key": "disney_token"},
+    {"id": "apple", "name": "Apple TV+", "logo": "", "enabled": True, "config_key": "apple_token"},
+)
+
+
+@app.get("/api/explore/ranking-providers")
+async def explore_ranking_providers() -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT * FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
+    result = []
+    for provider in RANKING_PROVIDERS:
+        configured = bool(row and row[provider["config_key"]]) if row and provider["config_key"] in row.keys() else False
+        if provider["id"] == "tmdb":
+            configured = bool(row and row["tmdb_api_key"]) or bool(os.getenv("TMDB_API_KEY", "").strip())
+        result.append({**provider, "configured": configured, "status": "connected" if configured else "unconfigured"})
+    return {"items": result}
+
+
 @app.get("/api/explore/ranking/{provider}/{ranking}")
 async def explore_ranking(provider: str, ranking: str, page: int = Query(1, ge=1)) -> dict[str, Any]:
+    if provider != "tmdb":
+        info = next((item for item in RANKING_PROVIDERS if item["id"] == provider), None)
+        if not info:
+            raise HTTPException(404, "数据源不存在")
+        return {"items": [], "configured": False, "provider": provider, "error": f"{info['name']} 尚未配置，前往授权中心添加凭据后即可启用。"}
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:
         return {"items": [], "configured": False, "error": "TMDB 尚未配置。"}
