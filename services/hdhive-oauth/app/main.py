@@ -1570,6 +1570,7 @@ async def test_authorization(provider: str) -> dict[str, Any]:
 DEFAULT_TELEGRAM_EVENTS = {"transfer_success": True, "transfer_failed": True, "subscription": True, "manual_review": True}
 CHANNEL_MONITOR = ChannelMonitor(REQUEST_TIMEOUT)
 _CHANNEL_WORKER_STARTED = False
+P115_QR_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 class TelegramSettings(BaseModel):
@@ -1697,6 +1698,47 @@ def start_channel_worker() -> None:
         return
     _CHANNEL_WORKER_STARTED = True
     threading.Thread(target=_channel_worker, name="moon-channel-monitor", daemon=True).start()
+
+
+@app.post("/api/web/authorizations/p115/qr/start")
+async def p115_qr_start() -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.get("https://qrcodeapi.115.com/api/1.0/web/1.0/token/", params={"app": "web"})
+    payload = response.json()
+    data = payload.get("data") or {}
+    uid = str(data.get("uid") or "")
+    if not uid:
+        raise HTTPException(502, "115 暂时无法生成二维码")
+    P115_QR_SESSIONS[uid] = {"time": data.get("time"), "sign": data.get("sign"), "created": int(time.time())}
+    return {"ok": True, "session_id": uid, "qrcode": data.get("qrcode") or f"https://115.com/scan/dg-{uid}"}
+
+
+@app.get("/api/web/authorizations/p115/qr/{session_id}")
+async def p115_qr_status(session_id: str) -> dict[str, Any]:
+    session = P115_QR_SESSIONS.get(session_id)
+    if not session or int(time.time()) - int(session["created"]) > 600:
+        raise HTTPException(410, "二维码已过期，请重新扫码")
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.get("https://qrcodeapi.115.com/get/status/", params={"uid": session_id, "time": session["time"], "sign": session["sign"]})
+        payload = response.json()
+        status = int((payload.get("data") or {}).get("status", 0))
+        if status != 2:
+            labels = {-2: "二维码已过期", -1: "已取消", 0: "等待扫码", 1: "已扫码，请在手机确认"}
+            return {"ok": True, "completed": False, "status": status, "message": labels.get(status, "等待确认")}
+        login = await client.post("https://passportapi.115.com/app/1.0/web/1.0/login/qrcode/", data={"account": session_id, "app": "web"})
+    result = login.json()
+    data = result.get("data") or {}
+    cookie_data = data.get("cookie") or {}
+    if isinstance(cookie_data, dict):
+        cookie = "; ".join(f"{key}={value}" for key, value in cookie_data.items())
+    else:
+        cookie = str(cookie_data or "")
+    if not cookie:
+        raise HTTPException(502, str(result.get("message") or "115 登录成功但未返回 Cookie"))
+    with database() as conn:
+        conn.execute("UPDATE web_settings SET p115_cookie=?,updated_at=? WHERE installation_id=?", (encrypt(cookie), int(time.time()), WEB_INSTALLATION_ID))
+    P115_QR_SESSIONS.pop(session_id, None)
+    return {"ok": True, "completed": True, "message": "115 扫码授权成功"}
 
 
 @app.get("/v1/settings")
