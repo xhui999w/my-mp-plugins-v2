@@ -44,6 +44,21 @@ class OAuthServiceTests(unittest.TestCase):
     def test_health(self):
         self.assertEqual(self.client.get("/health").json()["ok"], True)
 
+    def test_optional_admin_login_protects_dashboard(self):
+        old_user, old_password = main.WEB_ADMIN_USER, main.WEB_ADMIN_PASSWORD
+        main.WEB_ADMIN_USER, main.WEB_ADMIN_PASSWORD = "owner", "strong-password"
+        try:
+            with TestClient(main.app, base_url="https://testserver") as client:
+                self.assertEqual(client.get("/rankings", follow_redirects=False).status_code, 303)
+                self.assertEqual(client.get("/api/web/authorizations").status_code, 401)
+                response = client.post("/admin/login", data={"username": "owner", "password": "strong-password", "next": "/rankings"}, follow_redirects=False)
+                self.assertEqual(response.status_code, 303)
+                self.assertIn("moon_admin", response.cookies)
+                self.assertEqual(client.get("/rankings").status_code, 200)
+                self.assertEqual(client.get("/health").status_code, 200)
+        finally:
+            main.WEB_ADMIN_USER, main.WEB_ADMIN_PASSWORD = old_user, old_password
+
     def test_rejects_invalid_installation_key(self):
         response = self.client.get(
             "/v1/status",
@@ -225,7 +240,7 @@ class OAuthServiceTests(unittest.TestCase):
         self.assertEqual(response.json()["items"][0]["slug"], "resource-one")
 
     def test_new_business_pages_and_settings(self):
-        for path in ("/settings", "/web/settings", "/authorizations", "/telegram", "/unlocks"):
+        for path in ("/rankings", "/settings", "/web/settings", "/authorizations", "/telegram", "/unlocks"):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200, path)
             self.assertIn("text/html", response.headers["content-type"])
@@ -246,6 +261,19 @@ class OAuthServiceTests(unittest.TestCase):
         loaded = self.client.get("/api/web/telegram/settings").json()
         self.assertTrue(loaded["bot_token_configured"])
         self.assertNotIn("secret-bot", str(loaded))
+
+    def test_trusted_notification_event_respects_disabled_event(self):
+        self.client.put(
+            "/api/web/telegram/settings",
+            json={"enabled": False, "events": {"manual_review": False}, "channel_enabled": False, "channel_interval": 600},
+        )
+        response = self.client.post(
+            "/v1/notifications/event",
+            headers=self.headers,
+            json={"event": "manual_review", "title": "需要人工确认", "status": "等待"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["skipped"])
 
     def test_telegram_commands_create_real_subscription(self):
         import asyncio

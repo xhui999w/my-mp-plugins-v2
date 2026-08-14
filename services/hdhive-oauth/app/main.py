@@ -25,7 +25,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -39,6 +39,7 @@ from .unlocks_ui import unlocks_html
 from .settings_ui import settings_html
 from .authorizations_ui import authorizations_html
 from .telegram_ui import telegram_html
+from .rankings_ui import rankings_html
 from .notifications import ChannelMonitor, NotificationError, NotificationService, TelegramProvider
 from .p115 import P115Client, P115Error
 from .credentials import AUTHORIZATION_PROVIDERS
@@ -53,6 +54,9 @@ def required_env(name: str) -> str:
 
 BASE_URL = os.getenv("HDHIVE_BASE_URL", "https://hdhive.com").rstrip("/")
 CLIENT_ID = required_env("HDHIVE_CLIENT_ID")
+WEB_ADMIN_USER = os.getenv("WEB_ADMIN_USER", "").strip()
+WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "").strip()
+ADMIN_COOKIE = "moon_admin"
 APP_SECRET = required_env("HDHIVE_APP_SECRET")
 REDIRECT_URI = required_env("HDHIVE_REDIRECT_URI")
 INSTALLATION_KEY = required_env("INSTALLATION_KEY")
@@ -90,6 +94,60 @@ app = FastAPI(
     lifespan=lifespan,
 )
 logger = logging.getLogger("hdhive-oauth")
+
+
+def _admin_token(expires: int) -> str:
+    payload = f"{WEB_ADMIN_USER}:{expires}"
+    signature = hmac.new(INSTALLATION_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{expires}.{signature}"
+
+
+def _admin_token_valid(value: str | None) -> bool:
+    if not value or "." not in value:
+        return False
+    expires_text, signature = value.split(".", 1)
+    if not expires_text.isdigit() or int(expires_text) < int(time.time()):
+        return False
+    return hmac.compare_digest(_admin_token(int(expires_text)), value)
+
+
+@app.middleware("http")
+async def protect_personal_dashboard(request: Request, call_next):
+    """Protect the public personal dashboard when admin credentials are configured."""
+    if not (WEB_ADMIN_USER and WEB_ADMIN_PASSWORD):
+        return await call_next(request)
+    path = request.url.path
+    public = path == "/health" or path.startswith("/v1/") or path.startswith("/oauth/callback") or path in {"/admin/login", "/admin/logout"}
+    if public or _admin_token_valid(request.cookies.get(ADMIN_COOKIE)):
+        if path == "/" and _admin_token_valid(request.cookies.get(ADMIN_COOKIE)):
+            return RedirectResponse("/rankings", status_code=303)
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return HTMLResponse('{"detail":"管理会话已失效，请重新登录"}', status_code=401, media_type="application/json")
+    return RedirectResponse(f"/admin/login?next={quote(path)}", status_code=303)
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page(next: str = Query("/rankings")) -> HTMLResponse:
+    safe_next = next if next.startswith("/") and not next.startswith("//") else "/rankings"
+    return HTMLResponse(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · Moon Dream</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 70% 10%,#2b2114,#070705 50%);color:#eee4d1;font:15px system-ui,"Microsoft YaHei"}}form{{width:min(390px,calc(100vw - 36px));padding:34px;background:#15110c;border:1px solid #825f29;border-radius:18px;box-shadow:0 22px 60px #000}}h1{{color:#d8b76e}}p{{color:#9d927e}}input,button{{display:block;width:100%;margin:12px 0;padding:12px;border-radius:9px;border:1px solid #3a7780;background:#090907;color:#fff}}button{{background:#123b41;color:#57d9eb;cursor:pointer;font-weight:800}}</style><form method="post" action="/admin/login"><h1>◉ Moon Dream</h1><p>个人管理中心登录</p><input name="username" autocomplete="username" placeholder="用户名" required autofocus><input name="password" type="password" autocomplete="current-password" placeholder="密码" required><input type="hidden" name="next" value="{html.escape(safe_next)}"><button>登录</button></form></html>''')
+
+
+@app.post("/admin/login")
+def admin_login(username: str = Form(...), password: str = Form(...), next: str = Form("/rankings")) -> RedirectResponse:
+    if not WEB_ADMIN_USER or not WEB_ADMIN_PASSWORD or not (hmac.compare_digest(username, WEB_ADMIN_USER) and hmac.compare_digest(password, WEB_ADMIN_PASSWORD)):
+        raise HTTPException(401, "用户名或密码错误")
+    safe_next = next if next.startswith("/") and not next.startswith("//") else "/rankings"
+    response = RedirectResponse(safe_next, status_code=303)
+    response.set_cookie(ADMIN_COOKIE, _admin_token(int(time.time()) + 86400 * 30), max_age=86400 * 30, secure=True, httponly=True, samesite="strict")
+    return response
+
+
+@app.get("/admin/logout")
+def admin_logout() -> RedirectResponse:
+    response = RedirectResponse("/admin/login", status_code=303)
+    response.delete_cookie(ADMIN_COOKIE)
+    return response
 
 
 @contextmanager
@@ -566,6 +624,11 @@ def _web_account_card() -> str:
         return f"<div class='card'>Authorized: <b>{html.escape(str(user.get('nickname') or user.get('username') or 'account'))}</b>　Points: <b>{html.escape(str(user.get('points') or 'unknown'))}</b></div>"
     except HTTPException:
         return "<div class='card'>Not authorized. <a class='btn' href='/oauth/login'>Authorize HDHive</a></div>"
+
+
+@app.get("/rankings", response_class=HTMLResponse)
+def rankings_page() -> HTMLResponse:
+    return HTMLResponse(rankings_html())
 
 
 @app.get("/web/rankings", response_class=HTMLResponse)
@@ -1691,6 +1754,17 @@ class TelegramSettings(BaseModel):
     channel_interval: int = Field(default=600, ge=60, le=86400)
 
 
+class NotificationEventRequest(BaseModel):
+    event: str = Field(pattern="^(transfer_success|transfer_failed|subscription|manual_review)$")
+    title: str = Field(default="", max_length=500)
+    status: str = Field(default="", max_length=200)
+    resource: str = Field(default="", max_length=1000)
+    resolution: str = Field(default="", max_length=100)
+    size: str = Field(default="", max_length=100)
+    save_path: str = Field(default="", max_length=1000)
+    error: str = Field(default="", max_length=2000)
+
+
 def _telegram_settings(include_secret: bool = False) -> dict[str, Any]:
     init_database()
     with database() as conn:
@@ -1739,6 +1813,17 @@ async def test_telegram() -> dict[str, Any]:
     except NotificationError as exc:
         raise HTTPException(502, str(exc)) from exc
     return {"ok": True, "message": "测试消息已发送"}
+
+
+@app.post("/v1/notifications/event")
+async def send_business_notification(request: NotificationEventRequest, _: str = Depends(require_installation)) -> dict[str, Any]:
+    """Allow trusted MoviePilot installations to emit Telegram business events."""
+    try:
+        result = await notification_service().notify(request.event, request.model_dump(exclude={"event"}))
+    except NotificationError as exc:
+        logger.warning("notification provider=telegram operation=%s error=%s", request.event, type(exc).__name__)
+        raise HTTPException(502, str(exc)) from exc
+    return {"ok": True, **result}
 
 
 def _channel_status() -> dict[str, Any]:
