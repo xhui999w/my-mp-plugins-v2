@@ -39,7 +39,7 @@ STREAMING_NAMES = {
     "max": ("HBO Max", ("Max", "HBO Max")),
     "prime": ("Prime Video", ("Amazon Prime Video", "Prime Video")),
     "disney": ("Disney+", ("Disney Plus", "Disney+")),
-    "apple": ("Apple TV+", ("Apple TV Plus", "Apple TV+")),
+    "apple": ("Apple TV+", ("Apple TV", "Apple TV Plus", "Apple TV+", "Apple TV App")),
 }
 
 
