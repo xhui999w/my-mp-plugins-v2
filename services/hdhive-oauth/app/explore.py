@@ -140,7 +140,8 @@ class TMDBProvider:
 
     async def watch_provider_id(self, key: str, media_type: str, region: str) -> int | None:
         names = STREAMING_NAMES.get(key, ("", ()))[1]
-        data, _ = await self.request(f"/watch/providers/{media_type}", {"watch_region": region}, ttl=86400)
+        params = {"watch_region": region} if region else {}
+        data, _ = await self.request(f"/watch/providers/{media_type}", params, ttl=86400)
         for provider in data.get("results", []):
             if str(provider.get("provider_name")) in names:
                 return int(provider["provider_id"])
@@ -156,10 +157,14 @@ class TMDBProvider:
                 params[target] = query[source]
         platform = query.get("platform")
         if platform in STREAMING_NAMES:
-            watch_id = await self.watch_provider_id(platform, media_type, query.get("region") or self.region)
+            # Empty region means ?all regions?: do not force the account default.
+            watch_region = query.get("region") or ""
+            watch_id = await self.watch_provider_id(platform, media_type, watch_region)
             if watch_id is None:
                 return {"items": [], "page": page, "total_pages": 0, "total": 0, "has_more": False, "cached": False}
-            params.update({"with_watch_providers": watch_id, "watch_region": query.get("region") or self.region})
+            params["with_watch_providers"] = watch_id
+            if watch_region:
+                params["watch_region"] = watch_region
         payload, cached = await self.request(f"/discover/{media_type}", params, ttl=600)
         items = [self.normalize(item, media_type, platform or "tmdb") for item in payload.get("results", [])]
         return {"items": items, "page": payload.get("page", page), "page_size": len(items), "total": payload.get("total_results", 0), "total_pages": payload.get("total_pages", 0), "has_more": page < int(payload.get("total_pages", 0)), "provider": platform or "tmdb", "source": "tmdb-discover", "cached": cached, "configured": True, "error": None}
