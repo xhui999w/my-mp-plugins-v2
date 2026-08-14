@@ -166,6 +166,18 @@ def init_database() -> None:
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (installation_id, provider)
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS offline_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            task_url TEXT NOT NULL,
+            provider_task_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'submitted',
+            save_path TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            retry_count INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(web_settings)")}
         for name, definition in (
             ("tmdb_api_key", "TEXT DEFAULT ''"),
@@ -176,6 +188,8 @@ def init_database() -> None:
             ("save_wait_seconds", "INTEGER DEFAULT 30"),
             ("retry_count", "INTEGER DEFAULT 3"),
             ("duplicate_policy", "TEXT DEFAULT 'skip'"),
+            ("subscription_auto_transfer", "INTEGER DEFAULT 1"),
+            ("subscription_interval", "INTEGER DEFAULT 1800"),
             ("ed2k_directory", "TEXT DEFAULT ''"),
             ("ed2k_poll_interval", "INTEGER DEFAULT 60"),
             ("ed2k_retry_count", "INTEGER DEFAULT 3"),
@@ -1235,16 +1249,30 @@ async def execute_subscription(installation_id: str, subscription_id: int) -> di
         conn.execute("UPDATE web_subscriptions SET status='running', error='', updated_at=?, last_run_at=? WHERE id=?", (int(time.time()), int(time.time()), subscription_id))
     try:
         payload = await query_resources(ResourceQuery(media_type=row["media_type"], tmdb_id=row["tmdb_id"]), installation_id)
-        count = len(_resource_items(payload))
-        new_status = "resource_found" if count else "waiting_output"
+        resources = _resource_items(payload)
+        count = len(resources)
+        transfer_count = 0
+        settings = get_business_settings()
+        with database() as conn:
+            transfer_ready = installation_id == WEB_INSTALLATION_ID and bool(conn.execute("SELECT 1 FROM installations WHERE installation_id=?", (installation_id,)).fetchone()) and bool(conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=? AND COALESCE(p115_cookie,'')<>''", (installation_id,)).fetchone())
+        if resources and settings["subscription_auto_transfer"] and transfer_ready:
+            first = resources[0]
+            slug = str(first.get("slug") or first.get("resource_slug") or first.get("id") or "")
+            if slug:
+                await web_resource_transfer(WebResourceTransfer(provider="hdhive", resource_id=slug))
+                transfer_count = 1
+        new_status = "completed" if transfer_count else ("resource_found" if count else "waiting_output")
         error = ""
     except HTTPException as exc:
-        count = 0; new_status = "failed"; error = str(exc.detail)
+        count = locals().get("count", 0); transfer_count = 0; new_status = "failed"; error = str(exc.detail)
+    except Exception as exc:
+        logger.exception("module=subscriptions operation=execute subscription=%s", subscription_id)
+        count = locals().get("count", 0); transfer_count = 0; new_status = "failed"; error = str(exc)
     now = int(time.time())
     with database() as conn:
-        cur = conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,error,created_at) VALUES (?,?,?,?,?,?)", (installation_id, subscription_id, new_status, count, error, now))
+        cur = conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,transfer_count,error,created_at) VALUES (?,?,?,?,?,?,?)", (installation_id, subscription_id, new_status, count, transfer_count, error, now))
         conn.execute("UPDATE web_subscriptions SET status=?, error=?, updated_at=? WHERE id=?", (new_status, error, now, subscription_id))
-    return {"ok": new_status != "failed", "run_id": cur.lastrowid, "status": new_status, "resource_count": count, "error": error}
+    return {"ok": new_status != "failed", "run_id": cur.lastrowid, "status": new_status, "resource_count": count, "transfer_count": transfer_count, "error": error}
 
 
 @app.post("/v1/subscriptions/{subscription_id}/run")
@@ -1389,6 +1417,8 @@ class BusinessSettings(BaseModel):
     save_wait_seconds: int = Field(default=30, ge=0, le=3600)
     retry_count: int = Field(default=3, ge=0, le=20)
     duplicate_policy: str = Field(default="skip", pattern="^(skip|rename|overwrite)$")
+    subscription_auto_transfer: bool = True
+    subscription_interval: int = Field(default=1800, ge=300, le=86400)
     offline_enabled: bool = True
     ed2k_directory: str = Field(default="", max_length=500)
     ed2k_poll_interval: int = Field(default=60, ge=10, le=3600)
@@ -1398,7 +1428,7 @@ class BusinessSettings(BaseModel):
 
 BUSINESS_SETTING_COLUMNS = (
     "root_directory,save_directory,scrape_directory,save_wait_seconds,retry_count,"
-    "duplicate_policy,offline_enabled,ed2k_directory,ed2k_poll_interval,"
+    "duplicate_policy,subscription_auto_transfer,subscription_interval,offline_enabled,ed2k_directory,ed2k_poll_interval,"
     "ed2k_retry_count,ed2k_auto_archive"
 )
 
@@ -1416,6 +1446,7 @@ def get_business_settings() -> dict[str, Any]:
     result = dict(row)
     result["offline_enabled"] = bool(result["offline_enabled"])
     result["ed2k_auto_archive"] = bool(result["ed2k_auto_archive"])
+    result["subscription_auto_transfer"] = bool(result["subscription_auto_transfer"])
     return result
 
 
@@ -1426,20 +1457,21 @@ def put_business_settings(request: BusinessSettings) -> dict[str, Any]:
         conn.execute(
             """INSERT INTO web_settings
             (installation_id,root_directory,save_directory,scrape_directory,save_wait_seconds,
-             retry_count,duplicate_policy,offline_enabled,ed2k_directory,ed2k_poll_interval,
+             retry_count,duplicate_policy,subscription_auto_transfer,subscription_interval,offline_enabled,ed2k_directory,ed2k_poll_interval,
              ed2k_retry_count,ed2k_auto_archive,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(installation_id) DO UPDATE SET
              root_directory=excluded.root_directory,save_directory=excluded.save_directory,
              scrape_directory=excluded.scrape_directory,save_wait_seconds=excluded.save_wait_seconds,
              retry_count=excluded.retry_count,duplicate_policy=excluded.duplicate_policy,
+             subscription_auto_transfer=excluded.subscription_auto_transfer,subscription_interval=excluded.subscription_interval,
              offline_enabled=excluded.offline_enabled,ed2k_directory=excluded.ed2k_directory,
              ed2k_poll_interval=excluded.ed2k_poll_interval,
              ed2k_retry_count=excluded.ed2k_retry_count,
              ed2k_auto_archive=excluded.ed2k_auto_archive,updated_at=excluded.updated_at""",
             (WEB_INSTALLATION_ID, values["root_directory"].strip(), values["save_directory"].strip(),
              values["scrape_directory"].strip(), values["save_wait_seconds"], values["retry_count"],
-             values["duplicate_policy"], int(values["offline_enabled"]), values["ed2k_directory"].strip(),
+             values["duplicate_policy"], int(values["subscription_auto_transfer"]), values["subscription_interval"], int(values["offline_enabled"]), values["ed2k_directory"].strip(),
              values["ed2k_poll_interval"], values["ed2k_retry_count"],
              int(values["ed2k_auto_archive"]), int(time.time())),
         )
@@ -1470,10 +1502,24 @@ async def add_offline_task(request: OfflineTaskRequest) -> dict[str, Any]:
     if not row or not row["p115_cookie"]:
         raise HTTPException(409, "请先在授权中心配置115 Cookie")
     try:
-        return await P115Client(decrypt(row["p115_cookie"]), REQUEST_TIMEOUT).offline(request.url, settings["ed2k_directory"])
+        result = await P115Client(decrypt(row["p115_cookie"]), REQUEST_TIMEOUT).offline(request.url, settings["ed2k_directory"])
+        now = int(time.time())
+        with database() as conn:
+            cur = conn.execute("INSERT INTO offline_tasks (installation_id,task_url,provider_task_id,status,save_path,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (WEB_INSTALLATION_ID, request.url, result.get("task_id", ""), result.get("status", "submitted"), settings["ed2k_directory"], now, now))
+        return {**result, "id": cur.lastrowid, "save_path": settings["ed2k_directory"]}
     except P115Error as exc:
         logger.error("module=offline provider=115 operation=add_task error_type=P115Error reason=%s", exc)
         raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/web/offline")
+def list_offline_tasks(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)) -> dict[str, Any]:
+    offset = (page - 1) * page_size
+    with database() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM offline_tasks WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()[0]
+        rows = conn.execute("SELECT id,task_url,provider_task_id,status,save_path,error,retry_count,created_at,updated_at FROM offline_tasks WHERE installation_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (WEB_INSTALLATION_ID, page_size, offset)).fetchall()
+    pages = max(1, (total + page_size - 1) // page_size)
+    return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size, "total": total, "total_pages": pages, "has_more": page < pages}
 
 
 class AuthorizationUpdate(BaseModel):
@@ -1621,6 +1667,8 @@ DEFAULT_TELEGRAM_EVENTS = {"transfer_success": True, "transfer_failed": True, "s
 CHANNEL_MONITOR = ChannelMonitor(REQUEST_TIMEOUT)
 _CHANNEL_WORKER_STARTED = False
 _TELEGRAM_BOT_WORKER_STARTED = False
+_NEXT_SUBSCRIPTION_CHECK = 0
+_NEXT_OFFLINE_CHECK = 0
 P115_QR_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
@@ -1747,12 +1795,43 @@ async def channel_check() -> dict[str, Any]:
 
 
 def _channel_worker() -> None:
+    global _NEXT_SUBSCRIPTION_CHECK, _NEXT_OFFLINE_CHECK
     while True:
         try:
             config = _telegram_settings(False)
             state = _channel_status()
             if config["channel_enabled"] and int(state.get("next_check") or 0) <= int(time.time()):
                 asyncio.run(run_channel_check())
+            business = get_business_settings()
+            if business["subscription_auto_transfer"] and int(time.time()) >= _NEXT_SUBSCRIPTION_CHECK:
+                with database() as conn:
+                    auth = conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+                    subscriptions = conn.execute("SELECT id FROM web_subscriptions WHERE installation_id=? AND status IN ('active','waiting_output','resource_found','failed') ORDER BY COALESCE(last_run_at,0) ASC LIMIT 25", (WEB_INSTALLATION_ID,)).fetchall() if auth and auth["p115_cookie"] else []
+                for subscription in subscriptions:
+                    try:
+                        asyncio.run(execute_subscription(WEB_INSTALLATION_ID, int(subscription["id"])))
+                    except Exception:
+                        logger.exception("module=subscriptions operation=scheduled_run subscription=%s", subscription["id"])
+                _NEXT_SUBSCRIPTION_CHECK = int(time.time()) + int(business["subscription_interval"])
+            if int(time.time()) >= _NEXT_OFFLINE_CHECK:
+                with database() as conn:
+                    auth = conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+                if auth and auth["p115_cookie"] and business["offline_enabled"]:
+                    try:
+                        remote = asyncio.run(P115Client(decrypt(auth["p115_cookie"]), REQUEST_TIMEOUT).offline_tasks())
+                        now = int(time.time())
+                        for task in remote:
+                            remote_id = str(task.get("info_hash") or task.get("task_id") or task.get("id") or "")
+                            if not remote_id:
+                                continue
+                            raw_status = task.get("status")
+                            percent = float(task.get("percentDone") or task.get("percent") or 0)
+                            status = "completed" if percent >= 100 or raw_status in (2, "completed", "success") else ("failed" if raw_status in (-1, "failed", "error") else "downloading")
+                            with database() as conn:
+                                conn.execute("UPDATE offline_tasks SET status=?,error=?,updated_at=? WHERE installation_id=? AND provider_task_id=?", (status, str(task.get("error") or ""), now, WEB_INSTALLATION_ID, remote_id))
+                    except Exception:
+                        logger.exception("module=offline provider=115 operation=poll")
+                _NEXT_OFFLINE_CHECK = int(time.time()) + int(business["ed2k_poll_interval"])
             time.sleep(min(30, max(5, int(config["channel_interval"]) // 10)))
         except Exception:
             logger.exception("channel worker loop failed")

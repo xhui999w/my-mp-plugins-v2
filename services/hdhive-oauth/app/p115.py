@@ -79,5 +79,18 @@ class P115Client:
             response = await client.post("https://115.com/web/lixian/?ct=lixian&ac=add_task_url", data={"url": task_url, "savepath": "", "wp_path_id": target_cid if str(target_cid).isdigit() else "", "uid": uid, "sign": sign, "time": sign_time}, headers={**self.headers, "Origin": "https://115.com", "Referer": "https://115.com/?tab=offline&mode=wangpan"})
             payload = response.json()
         if payload.get("state") is True:
-            return {"ok": True, "message": "115离线下载任务已提交"}
+            data = payload.get("data") or {}
+            return {"ok": True, "task_id": str(data.get("info_hash") or data.get("task_id") or data.get("id") or ""), "status": "submitted", "message": "115离线下载任务已提交"}
         raise P115Error(str(payload.get("error_msg") or payload.get("error") or "离线任务提交失败"))
+
+    async def offline_tasks(self) -> list[dict[str, Any]]:
+        """Read current 115 offline tasks for progress polling."""
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            await self.user_id(client)
+            response = await client.get("https://115.com/web/lixian/", params={"ct": "lixian", "ac": "task_lists", "page": 1}, headers={**self.headers, "Referer": "https://115.com/?tab=offline&mode=wangpan"})
+        payload = response.json()
+        if payload.get("state") is False:
+            raise P115Error(str(payload.get("error_msg") or payload.get("error") or "离线任务状态读取失败"))
+        data = payload.get("data") or payload
+        items = data.get("tasks") or data.get("list") or data.get("items") or []
+        return items if isinstance(items, list) else []

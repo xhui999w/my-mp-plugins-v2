@@ -257,6 +257,17 @@ class OAuthServiceTests(unittest.TestCase):
             row = conn.execute("SELECT title FROM web_subscriptions WHERE installation_id=? AND tmdb_id=998877", (main.WEB_INSTALLATION_ID,)).fetchone()
         self.assertEqual(row["title"], "Telegram测试影片")
 
+    def test_web_subscription_reuses_real_transfer_pipeline(self):
+        now = int(main.time.time())
+        with main.database() as conn:
+            conn.execute("INSERT OR REPLACE INTO installations (installation_id,access_token,refresh_token,expires_at,user_json,updated_at) VALUES (?,?,?,?,?,?)", (main.WEB_INSTALLATION_ID, main.encrypt("access"), main.encrypt("refresh"), now + 3600, "{}", now))
+            conn.execute("INSERT INTO web_settings (installation_id,p115_cookie,updated_at) VALUES (?,?,?) ON CONFLICT(installation_id) DO UPDATE SET p115_cookie=excluded.p115_cookie", (main.WEB_INSTALLATION_ID, main.encrypt("UID=1"), now))
+        created = main.create_subscription(main.SubscriptionRequest(title="自动转存", media_type="movie", tmdb_id=7654321), main.WEB_INSTALLATION_ID)
+        with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": [{"slug": "resource-hit"}]})), patch.object(main, "web_resource_transfer", new=AsyncMock(return_value={"ok": True})), patch.object(main, "get_business_settings", return_value={"subscription_auto_transfer": True}):
+            result = self.client.post(f"/api/web/subscriptions/{created['id']}/run").json()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["transfer_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
