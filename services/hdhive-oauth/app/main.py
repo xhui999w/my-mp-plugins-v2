@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from .explore import RANKINGS, TMDBProvider, filter_metadata, registry
 from .explore_ui import explore_html
 from .subscriptions_ui import subscriptions_html
+from .tasks_ui import tasks_html
 
 
 def required_env(name: str) -> str:
@@ -516,13 +517,10 @@ def web_unlocks() -> HTMLResponse:
     return _web_layout("解锁与转存记录", _web_account_card() + "<div class='card'><table><tr><th>名称</th><th>资源标识</th><th>状态</th><th>115链接/错误</th><th>时间</th></tr>" + table + "</table></div>")
 
 
+@app.get("/tasks", response_class=HTMLResponse)
 @app.get("/web/tasks", response_class=HTMLResponse)
 def web_tasks() -> HTMLResponse:
-    with database() as conn:
-        transfers = conn.execute("SELECT COUNT(*), SUM(status='resolved'), SUM(status='failed') FROM transfer_records WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
-        subs = conn.execute("SELECT COUNT(*) FROM web_subscriptions WHERE installation_id = ? AND status = 'active'", (WEB_INSTALLATION_ID,)).fetchone()[0]
-    content = _web_account_card() + f"<div class='grid'><div class='card'><h2>Subscription tasks</h2><p>Active subscriptions: <b>{subs}</b></p><p class='muted'>MoviePilot performs scheduled subscription matching and 115 saving.</p></div><div class='card'><h2>Transfer execution</h2><p>Total: {transfers[0] or 0}</p><p>Success: {transfers[1] or 0}　Failed: {transfers[2] or 0}</p><a class='btn' href='/web/unlocks'>View execution details</a></div></div>"
-    return _web_layout("订阅任务", content)
+    return HTMLResponse(tasks_html())
 
 
 @app.get("/web/settings", response_class=HTMLResponse)
@@ -1086,6 +1084,36 @@ async def web_subscription_run(subscription_id: int) -> dict[str, Any]:
 @app.delete("/api/web/subscriptions/{subscription_id}")
 def web_subscription_delete(subscription_id: int) -> dict[str, Any]:
     return delete_subscription(subscription_id, WEB_INSTALLATION_ID)
+
+
+def task_page(installation_id: str, page: int = 1, page_size: int = 10) -> dict[str, Any]:
+    with database() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM subscription_runs WHERE installation_id=?", (installation_id,)).fetchone()[0]
+        rows = conn.execute("""SELECT r.id,r.subscription_id,r.status,r.resource_count,r.transfer_count,r.error,r.created_at,
+            s.title,s.media_type,s.tmdb_id FROM subscription_runs r
+            LEFT JOIN web_subscriptions s ON s.id=r.subscription_id
+            WHERE r.installation_id=? ORDER BY r.id DESC LIMIT ? OFFSET ?""",
+            (installation_id, page_size, (page - 1) * page_size),
+        ).fetchall()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size, "total": total, "total_pages": total_pages, "has_more": page < total_pages}
+
+
+@app.get("/api/web/tasks")
+def web_task_list(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
+    return task_page(WEB_INSTALLATION_ID, page, page_size)
+
+
+@app.get("/api/web/tasks/{task_id}")
+def web_task_detail(task_id: int) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("""SELECT r.id,r.subscription_id,r.status,r.resource_count,r.transfer_count,r.error,r.created_at,
+            s.title,s.media_type,s.tmdb_id,s.save_path FROM subscription_runs r
+            LEFT JOIN web_subscriptions s ON s.id=r.subscription_id
+            WHERE r.id=? AND r.installation_id=?""", (task_id, WEB_INSTALLATION_ID)).fetchone()
+    if not row:
+        raise HTTPException(404, "任务记录不存在")
+    return {"task": dict(row)}
 
 
 class WebSettings(BaseModel):

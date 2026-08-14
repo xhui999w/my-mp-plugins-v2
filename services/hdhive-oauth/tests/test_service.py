@@ -97,11 +97,21 @@ class OAuthServiceTests(unittest.TestCase):
         detail = self.client.get(f"/v1/subscriptions/{sub_id}", headers=self.headers).json()
         self.assertEqual(len(detail["runs"]), 1)
         self.assertEqual(len(detail["transfers"]), 1)
+        tasks = main.task_page(self.installation_id)
+        self.assertEqual(tasks["total"], 1)
+        self.assertEqual(tasks["items"][0]["title"], "聚合测试")
         self.assertEqual(self.client.get("/v1/subscriptions", headers=self.headers).json()["items"][0]["saved_count"], 1)
         deleted = self.client.delete(f"/v1/subscriptions/{sub_id}", headers=self.headers).json()
         self.assertFalse(deleted["deleted_files"])
         self.assertEqual(self.client.get("/v1/subscriptions", headers=self.headers, params={"tab": "current"}).json()["total"], 0)
         self.assertEqual(self.client.get("/v1/subscriptions", headers=self.headers, params={"tab": "history"}).json()["total"], 1)
+
+    def test_tasks_page_uses_shared_console_layout(self):
+        page = self.client.get("/tasks")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("115 娱乐中心", page.text)
+        self.assertIn("订阅任务已启用", page.text)
+        self.assertNotIn("Subscription tasks", page.text)
 
     def test_subscription_manual_run_and_error(self):
         created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": "执行测试", "media_type": "movie", "tmdb_id": 8899}).json()
