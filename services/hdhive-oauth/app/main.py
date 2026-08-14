@@ -1677,14 +1677,7 @@ def get_authorizations() -> dict[str, Any]:
             user = json.loads(installation["user_json"] or "{}")
         except ValueError:
             user = {}
-    ranking_states = {}
-    for provider in ("douban", "netflix", "max", "prime", "disney", "apple"):
-        column = {"douban": "douban_cookie", "netflix": "netflix_token", "max": "max_token", "prime": "prime_token", "disney": "disney_token", "apple": "apple_token"}[provider]
-        configured = bool(settings and settings[column])
-        ranking_states[provider] = {"configured": configured, "authorized": configured, "summary": "???" if configured else "???", "status": "connected" if configured else "unconfigured"}
-
     return {"definitions": AUTHORIZATION_PROVIDERS.infos(), "providers": {
-        **ranking_states,
         "hdhive": {"configured": True, "authorized": bool(installation),
                     "summary": str(user.get("nickname") or user.get("name") or user.get("username") or "等待授权")},
         "p115": {"configured": bool(settings and settings["p115_cookie"]), "authorized": bool(settings and settings["p115_cookie"]),
@@ -1701,7 +1694,7 @@ def get_authorizations() -> dict[str, Any]:
 def put_authorization(provider: str, request: AuthorizationUpdate) -> dict[str, Any]:
     if not AUTHORIZATION_PROVIDERS.get(provider):
         raise HTTPException(404, "Provider 不存在")
-    if provider not in {"p115", "emby", "tmdb", "douban", "netflix", "max", "prime", "disney", "apple"}:
+    if provider not in {"p115", "emby", "tmdb"}:
         raise HTTPException(400, "该 Provider 使用独立 OAuth 授权")
     init_database()
     with database() as conn:
@@ -1716,14 +1709,10 @@ def put_authorization(provider: str, request: AuthorizationUpdate) -> dict[str, 
             secret = encrypt(request.api_key.strip()) if request.api_key.strip() else current["emby_api_key"]
             conn.execute("UPDATE web_settings SET emby_url=?,emby_api_key=?,emby_user_id=?,updated_at=? WHERE installation_id=?",
                          (request.url.strip().rstrip("/"), secret, request.user_id.strip(), int(time.time()), WEB_INSTALLATION_ID))
-        elif provider == "tmdb":
+        else:
             secret = encrypt(request.api_key.strip()) if request.api_key.strip() else current["tmdb_api_key"]
             conn.execute("UPDATE web_settings SET tmdb_api_key=?,tmdb_language=?,updated_at=? WHERE installation_id=?",
                          (secret, request.language.strip() or "zh-CN", int(time.time()), WEB_INSTALLATION_ID))
-        else:
-            column = {"douban": "douban_cookie", "netflix": "netflix_token", "max": "max_token", "prime": "prime_token", "disney": "disney_token", "apple": "apple_token"}[provider]
-            secret = encrypt(request.api_key.strip()) if request.api_key.strip() else current[column]
-            conn.execute(f"UPDATE web_settings SET {column}=?,updated_at=? WHERE installation_id=?", (secret, int(time.time()), WEB_INSTALLATION_ID))
     return {"ok": True, "configured": bool(secret)}
 
 

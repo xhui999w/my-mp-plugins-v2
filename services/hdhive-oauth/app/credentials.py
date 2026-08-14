@@ -38,10 +38,4 @@ AUTHORIZATION_PROVIDERS = AuthorizationProviderRegistry([
     AuthorizationProvider("p115", "115 网盘", "转存与离线下载", "cookie_or_qr", ("transfer", "offline")),
     AuthorizationProvider("emby", "Emby", "媒体库匹配", "api_key", ("library", "users")),
     AuthorizationProvider("tmdb", "TMDB", "影视元数据、榜单和海报", "token", ("metadata", "discover", "rankings")),
-    AuthorizationProvider("douban", "??", "???????", "optional_cookie", ("rankings",)),
-    AuthorizationProvider("netflix", "Netflix", "Netflix?????", "token", ("rankings",)),
-    AuthorizationProvider("max", "HBO Max", "HBO Max?????", "token", ("rankings",)),
-    AuthorizationProvider("prime", "Prime Video", "Prime Video?????", "token", ("rankings",)),
-    AuthorizationProvider("disney", "Disney+", "Disney+?????", "token", ("rankings",)),
-    AuthorizationProvider("apple", "Apple TV+", "Apple TV+?????", "token", ("rankings",)),
 ])
