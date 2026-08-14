@@ -567,13 +567,13 @@ async def explore_rankings() -> dict[str, Any]:
 
 
 RANKING_PROVIDERS: tuple[dict[str, Any], ...] = (
-    {"id": "tmdb", "name": "TheMovieDB", "logo": "🎬", "enabled": True, "config_key": "tmdb_api_key"},
-    {"id": "douban", "name": "豆瓣", "logo": "豆", "enabled": True, "config_key": "douban_cookie"},
-    {"id": "netflix", "name": "Netflix", "logo": "N", "enabled": True, "config_key": "netflix_token"},
-    {"id": "max", "name": "HBO Max", "logo": "▣", "enabled": True, "config_key": "max_token"},
-    {"id": "prime", "name": "Prime Video", "logo": "▶", "enabled": True, "config_key": "prime_token"},
-    {"id": "disney", "name": "Disney+", "logo": "D", "enabled": True, "config_key": "disney_token"},
-    {"id": "apple", "name": "Apple TV+", "logo": "", "enabled": True, "config_key": "apple_token"},
+    {"id": "tmdb", "name": "TheMovieDB", "logo": "🎬", "enabled": True, "kind": "tmdb"},
+    {"id": "douban", "name": "豆瓣", "logo": "豆", "enabled": False, "kind": "unavailable"},
+    {"id": "netflix", "name": "Netflix", "logo": "N", "enabled": True, "kind": "watch_provider"},
+    {"id": "max", "name": "HBO Max", "logo": "▣", "enabled": True, "kind": "watch_provider"},
+    {"id": "prime", "name": "Prime Video", "logo": "▶", "enabled": True, "kind": "watch_provider"},
+    {"id": "disney", "name": "Disney+", "logo": "D", "enabled": True, "kind": "watch_provider"},
+    {"id": "apple", "name": "Apple TV+", "logo": "", "enabled": True, "kind": "watch_provider"},
 )
 
 
@@ -583,10 +583,10 @@ async def explore_ranking_providers() -> dict[str, Any]:
         row = conn.execute("SELECT * FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
     result = []
     for provider in RANKING_PROVIDERS:
-        configured = bool(row and row[provider["config_key"]]) if row and provider["config_key"] in row.keys() else False
-        if provider["id"] == "tmdb":
+        configured = False
+        if provider["kind"] in {"tmdb", "watch_provider"}:
             configured = bool(row and row["tmdb_api_key"]) or bool(os.getenv("TMDB_API_KEY", "").strip())
-        result.append({**provider, "configured": configured, "status": "connected" if configured else "unconfigured"})
+        result.append({**provider, "configured": configured, "status": "connected" if configured else ("unavailable" if provider["kind"] == "unavailable" else "unconfigured")})
     return {"items": result}
 
 
