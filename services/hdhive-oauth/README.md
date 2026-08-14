@@ -1,4 +1,4 @@
-# Moon Dream / HDHive OAuth 服务
+# 影舟 MovieArk / HDHive OAuth 服务
 
 这是一个可独立部署的个人影视资源中心。服务把影巢 OAuth、TMDB 发现、订阅、115 转存、ED2K/磁力离线下载、Telegram 通知与频道监控集中在同一个网页中；敏感凭据只保存在服务端数据库。
 

@@ -135,7 +135,7 @@ async def protect_personal_dashboard(request: Request, call_next):
 @app.get("/admin/login", response_class=HTMLResponse)
 def admin_login_page(next: str = Query("/rankings")) -> HTMLResponse:
     safe_next = next if next.startswith("/") and not next.startswith("//") else "/rankings"
-    return HTMLResponse(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · Moon Dream</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 70% 10%,#2b2114,#070705 50%);color:#eee4d1;font:15px system-ui,"Microsoft YaHei"}}form{{width:min(390px,calc(100vw - 36px));padding:34px;background:#15110c;border:1px solid #825f29;border-radius:18px;box-shadow:0 22px 60px #000}}h1{{color:#d8b76e}}p{{color:#9d927e}}input,button{{display:block;width:100%;margin:12px 0;padding:12px;border-radius:9px;border:1px solid #3a7780;background:#090907;color:#fff}}button{{background:#123b41;color:#57d9eb;cursor:pointer;font-weight:800}}</style><form method="post" action="/admin/login"><h1>◉ Moon Dream</h1><p>个人管理中心登录</p><input name="username" autocomplete="username" placeholder="用户名" required autofocus><input name="password" type="password" autocomplete="current-password" placeholder="密码" required><input type="hidden" name="next" value="{html.escape(safe_next)}"><button>登录</button></form></html>''')
+    return HTMLResponse(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 影舟 MovieArk</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 70% 10%,#2b2114,#070705 50%);color:#eee4d1;font:15px system-ui,"Microsoft YaHei"}}form{{width:min(390px,calc(100vw - 36px));padding:34px;background:#15110c;border:1px solid #825f29;border-radius:18px;box-shadow:0 22px 60px #000}}h1{{color:#d8b76e}}p{{color:#9d927e}}input,button{{display:block;width:100%;margin:12px 0;padding:12px;border-radius:9px;border:1px solid #3a7780;background:#090907;color:#fff}}button{{background:#123b41;color:#57d9eb;cursor:pointer;font-weight:800}}</style><form method="post" action="/admin/login"><h1>◉ 影舟 MovieArk</h1><p>个人管理中心登录</p><input name="username" autocomplete="username" placeholder="用户名" required autofocus><input name="password" type="password" autocomplete="current-password" placeholder="密码" required><input type="hidden" name="next" value="{html.escape(safe_next)}"><button>登录</button></form></html>''')
 
 
 @app.post("/admin/login")
@@ -1837,7 +1837,7 @@ async def test_telegram() -> dict[str, Any]:
     if not config["bot_token"] or not config["chat_id"]:
         raise HTTPException(409, "请先配置 Bot Token 和 Chat ID")
     try:
-        await TelegramProvider(config["bot_token"], config["chat_id"], REQUEST_TIMEOUT).send("Moon Dream Telegram 通知测试成功")
+        await TelegramProvider(config["bot_token"], config["chat_id"], REQUEST_TIMEOUT).send("影舟 MovieArk Telegram 通知测试成功")
     except NotificationError as exc:
         raise HTTPException(502, str(exc)) from exc
     return {"ok": True, "message": "测试消息已发送"}
@@ -1970,7 +1970,7 @@ def start_channel_worker() -> None:
 async def _telegram_command(text: str) -> str:
     command, _, argument = text.strip().partition(" ")
     if command in {"/start", "/help"}:
-        return "Moon Dream 命令：\n/search 片名 - 搜索影视\n/subscribe movie|tv TMDB_ID 标题 - 建立订阅\n/status - 查看授权状态"
+        return "影舟 MovieArk 命令：\n/search 片名 - 搜索影视\n/subscribe movie|tv TMDB_ID 标题 - 建立订阅\n/status - 查看授权状态"
     if command == "/status":
         providers = get_authorizations()["providers"]
         return "\n".join(f"{key}: {'可用' if value.get('configured') or value.get('authorized') else '未配置'}" for key, value in providers.items())

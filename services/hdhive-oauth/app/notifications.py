@@ -38,7 +38,7 @@ class TelegramProvider:
 
 
 class NotificationService:
-    DEFAULT_TEMPLATE = "【Moon Dream】{title}\n状态：{status}\n资源：{resource}\n清晰度：{resolution}\n大小：{size}\n保存路径：{save_path}\n{error}"
+    DEFAULT_TEMPLATE = "【影舟 MovieArk】{title}\n状态：{status}\n资源：{resource}\n清晰度：{resolution}\n大小：{size}\n保存路径：{save_path}\n{error}"
 
     def __init__(self, provider: TelegramProvider, events: dict[str, bool], template: str = ""):
         self.provider, self.events = provider, events

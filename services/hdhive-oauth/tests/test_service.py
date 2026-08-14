@@ -128,7 +128,7 @@ class OAuthServiceTests(unittest.TestCase):
     def test_tasks_page_uses_shared_console_layout(self):
         page = self.client.get("/tasks")
         self.assertEqual(page.status_code, 200)
-        self.assertIn("Moon Dream", page.text)
+        self.assertIn("影舟 MovieArk", page.text)
         self.assertIn("订阅任务已启用", page.text)
         self.assertNotIn("Subscription tasks", page.text)
 
