@@ -1801,7 +1801,8 @@ def put_telegram_settings(request: TelegramSettings) -> dict[str, Any]:
 
 def notification_service() -> NotificationService:
     config = _telegram_settings(True)
-    return NotificationService(TelegramProvider(config["bot_token"], config["chat_id"], REQUEST_TIMEOUT), config["events"], config["template"])
+    events = config["events"] if config["enabled"] else {name: False for name in DEFAULT_TELEGRAM_EVENTS}
+    return NotificationService(TelegramProvider(config["bot_token"], config["chat_id"], REQUEST_TIMEOUT), events, config["template"])
 
 
 @app.post("/api/web/telegram/test")

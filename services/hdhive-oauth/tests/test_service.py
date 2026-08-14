@@ -265,7 +265,7 @@ class OAuthServiceTests(unittest.TestCase):
     def test_trusted_notification_event_respects_disabled_event(self):
         self.client.put(
             "/api/web/telegram/settings",
-            json={"enabled": False, "events": {"manual_review": False}, "channel_enabled": False, "channel_interval": 600},
+            json={"enabled": False, "events": {"manual_review": True}, "channel_enabled": False, "channel_interval": 600},
         )
         response = self.client.post(
             "/v1/notifications/event",
