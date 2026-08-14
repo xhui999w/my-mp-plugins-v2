@@ -100,6 +100,9 @@ class OAuthServiceTests(unittest.TestCase):
         tasks = main.task_page(self.installation_id)
         self.assertEqual(tasks["total"], 1)
         self.assertEqual(tasks["items"][0]["title"], "聚合测试")
+        unlocks = main.unlock_page(self.installation_id, search="聚合", status="resolved")
+        self.assertEqual(unlocks["total"], 1)
+        self.assertEqual(unlocks["items"][0]["source_type"], "115网盘")
         self.assertEqual(self.client.get("/v1/subscriptions", headers=self.headers).json()["items"][0]["saved_count"], 1)
         deleted = self.client.delete(f"/v1/subscriptions/{sub_id}", headers=self.headers).json()
         self.assertFalse(deleted["deleted_files"])
@@ -112,6 +115,12 @@ class OAuthServiceTests(unittest.TestCase):
         self.assertIn("115 娱乐中心", page.text)
         self.assertIn("订阅任务已启用", page.text)
         self.assertNotIn("Subscription tasks", page.text)
+
+    def test_unlocks_page_uses_dense_console_layout(self):
+        page = self.client.get("/unlocks")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("批量删除", page.text)
+        self.assertIn("全部处理状态", page.text)
 
     def test_subscription_manual_run_and_error(self):
         created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": "执行测试", "media_type": "movie", "tmdb_id": 8899}).json()
@@ -213,6 +222,29 @@ class OAuthServiceTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["items"][0]["slug"], "resource-one")
+
+    def test_new_business_pages_and_settings(self):
+        for path in ("/settings", "/web/settings", "/authorizations", "/telegram", "/unlocks"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, path)
+            self.assertIn("text/html", response.headers["content-type"])
+        payload = {"root_directory": "/影视", "save_directory": "123456", "scrape_directory": "/已整理", "save_wait_seconds": 20, "retry_count": 2, "duplicate_policy": "skip", "offline_enabled": True, "ed2k_directory": "654321", "ed2k_poll_interval": 60, "ed2k_retry_count": 3, "ed2k_auto_archive": True}
+        response = self.client.put("/api/web/settings/business", json=payload)
+        self.assertEqual(response.status_code, 200)
+        loaded = self.client.get("/api/web/settings/business").json()
+        self.assertEqual(loaded["save_directory"], "123456")
+
+    def test_authorization_and_telegram_secrets_are_not_returned(self):
+        response = self.client.put("/api/web/authorizations/tmdb", json={"api_key": "secret-tmdb", "language": "zh-CN"})
+        self.assertEqual(response.status_code, 200)
+        providers = self.client.get("/api/web/authorizations").json()["providers"]
+        self.assertTrue(providers["tmdb"]["configured"])
+        self.assertNotIn("secret-tmdb", str(providers))
+        response = self.client.put("/api/web/telegram/settings", json={"bot_token": "secret-bot", "chat_id": "123", "enabled": True, "events": {"transfer_success": True}, "template": "{title}", "channel_enabled": False, "channel_name": "oneonefivewpfx", "channel_interval": 600})
+        self.assertEqual(response.status_code, 200)
+        loaded = self.client.get("/api/web/telegram/settings").json()
+        self.assertTrue(loaded["bot_token_configured"])
+        self.assertNotIn("secret-bot", str(loaded))
 
 
 if __name__ == "__main__":

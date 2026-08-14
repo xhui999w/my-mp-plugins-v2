@@ -15,7 +15,9 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
+import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,12 @@ from .subscriptions_ui import subscriptions_html
 from .tasks_ui import tasks_html
 from .resource_ui import resource_detail_html
 from .resources import HDHiveResourceProvider, ResourceProviderRegistry, filter_options
+from .unlocks_ui import unlocks_html
+from .settings_ui import settings_html
+from .authorizations_ui import authorizations_html
+from .telegram_ui import telegram_html
+from .notifications import ChannelMonitor, NotificationError, NotificationService, TelegramProvider
+from .p115 import P115Client, P115Error
 
 
 def required_env(name: str) -> str:
@@ -142,11 +150,41 @@ def init_database() -> None:
             tmdb_region TEXT DEFAULT 'CN',
             updated_at INTEGER NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS channel_state (
+            installation_id TEXT PRIMARY KEY,
+            last_message_id INTEGER DEFAULT 0,
+            last_check INTEGER DEFAULT 0,
+            next_check INTEGER DEFAULT 0,
+            last_status TEXT DEFAULT '',
+            last_error TEXT DEFAULT '',
+            processed INTEGER DEFAULT 0
+        )""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(web_settings)")}
         for name, definition in (
             ("tmdb_api_key", "TEXT DEFAULT ''"),
             ("tmdb_language", "TEXT DEFAULT 'zh-CN'"),
             ("tmdb_region", "TEXT DEFAULT 'CN'"),
+            ("root_directory", "TEXT DEFAULT ''"),
+            ("scrape_directory", "TEXT DEFAULT ''"),
+            ("save_wait_seconds", "INTEGER DEFAULT 30"),
+            ("retry_count", "INTEGER DEFAULT 3"),
+            ("duplicate_policy", "TEXT DEFAULT 'skip'"),
+            ("ed2k_directory", "TEXT DEFAULT ''"),
+            ("ed2k_poll_interval", "INTEGER DEFAULT 60"),
+            ("ed2k_retry_count", "INTEGER DEFAULT 3"),
+            ("ed2k_auto_archive", "INTEGER DEFAULT 1"),
+            ("emby_url", "TEXT DEFAULT ''"),
+            ("emby_api_key", "TEXT DEFAULT ''"),
+            ("emby_user_id", "TEXT DEFAULT ''"),
+            ("p115_cookie", "TEXT DEFAULT ''"),
+            ("telegram_bot_token", "TEXT DEFAULT ''"),
+            ("telegram_chat_id", "TEXT DEFAULT ''"),
+            ("telegram_enabled", "INTEGER DEFAULT 0"),
+            ("telegram_events", "TEXT DEFAULT '{}'"),
+            ("telegram_template", "TEXT DEFAULT ''"),
+            ("channel_enabled", "INTEGER DEFAULT 0"),
+            ("channel_name", "TEXT DEFAULT 'oneonefivewpfx'"),
+            ("channel_interval", "INTEGER DEFAULT 600"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE web_settings ADD COLUMN {name} {definition}")
@@ -163,13 +201,23 @@ def init_database() -> None:
             if name not in subscription_columns:
                 conn.execute(f"ALTER TABLE web_subscriptions ADD COLUMN {name} {definition}")
         transfer_columns = {row[1] for row in conn.execute("PRAGMA table_info(transfer_records)")}
-        if "subscription_id" not in transfer_columns:
-            conn.execute("ALTER TABLE transfer_records ADD COLUMN subscription_id INTEGER")
+        for name, definition in (
+            ("subscription_id", "INTEGER"), ("media_type", "TEXT DEFAULT ''"),
+            ("tmdb_id", "INTEGER DEFAULT 0"), ("resolution", "TEXT DEFAULT ''"),
+            ("quality", "TEXT DEFAULT ''"), ("size", "TEXT DEFAULT ''"),
+            ("uploader", "TEXT DEFAULT ''"), ("points", "INTEGER DEFAULT 0"),
+            ("action", "TEXT DEFAULT '资源解锁'"), ("save_path", "TEXT DEFAULT ''"),
+            ("processing_status", "TEXT DEFAULT 'pending'"),
+            ("source_type", "TEXT DEFAULT '115网盘'"), ("updated_at", "INTEGER DEFAULT 0"),
+        ):
+            if name not in transfer_columns:
+                conn.execute(f"ALTER TABLE transfer_records ADD COLUMN {name} {definition}")
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_database()
+    start_channel_worker()
 
 
 def encrypt(value: str) -> str:
@@ -518,12 +566,10 @@ def web_subscriptions() -> HTMLResponse:
     return HTMLResponse(subscriptions_html())
 
 
+@app.get("/unlocks", response_class=HTMLResponse)
 @app.get("/web/unlocks", response_class=HTMLResponse)
 def web_unlocks() -> HTMLResponse:
-    with database() as conn:
-        rows = conn.execute("SELECT name, slug, share_url, status, error, created_at FROM transfer_records WHERE installation_id = ? ORDER BY id DESC LIMIT 100", (WEB_INSTALLATION_ID,)).fetchall()
-    table = "".join(f"<tr><td>{html.escape(str(r['name']))}</td><td>{html.escape(str(r['slug']))}</td><td>{html.escape(str(r['status']))}</td><td>{html.escape(str(r['share_url'] or r['error']))}</td><td>{r['created_at']}</td></tr>" for r in rows) or "<tr><td colspan='5'>No unlock records yet</td></tr>"
-    return _web_layout("解锁与转存记录", _web_account_card() + "<div class='card'><table><tr><th>名称</th><th>资源标识</th><th>状态</th><th>115链接/错误</th><th>时间</th></tr>" + table + "</table></div>")
+    return HTMLResponse(unlocks_html())
 
 
 @app.get("/tasks", response_class=HTMLResponse)
@@ -532,7 +578,7 @@ def web_tasks() -> HTMLResponse:
     return HTMLResponse(tasks_html())
 
 
-@app.get("/web/settings", response_class=HTMLResponse)
+@app.get("/web/settings-legacy", response_class=HTMLResponse)
 def web_settings() -> HTMLResponse:
     with database() as conn:
         row = conn.execute("SELECT moviepilot_url, save_directory, offline_enabled, tmdb_api_key, tmdb_language, tmdb_region FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
@@ -540,6 +586,22 @@ def web_settings() -> HTMLResponse:
     key_hint = "已配置，留空表示不修改" if settings.get("tmdb_api_key") else "填写 TMDB API Read Access Token 或 API Key"
     content = _web_account_card() + f"<div class='card'><h2>TMDB 榜单配置</h2><form method='post' action='/web/settings'><label>TMDB API Key</label><br><input type='password' name='tmdb_api_key' value='' size='60' placeholder='{key_hint}'><br><label>语言</label><input name='tmdb_language' value='{html.escape(str(settings['tmdb_language']))}'><label>地区</label><input name='tmdb_region' value='{html.escape(str(settings['tmdb_region']))}'><hr><h2>转存配置</h2><label>MoviePilot 地址</label><br><input name='moviepilot_url' value='{html.escape(str(settings['moviepilot_url']))}' size='60'><br><label>115 保存目录</label><br><input name='save_directory' value='{html.escape(str(settings['save_directory']))}' size='60'><br><label><input type='checkbox' name='offline_enabled' {'checked' if settings['offline_enabled'] else ''}> 启用磁力和 ed2k 离线下载</label><br><button>保存全部设置</button></form></div>"
     return _web_layout("设置", content)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+@app.get("/web/settings", response_class=HTMLResponse)
+def business_settings_page() -> HTMLResponse:
+    return HTMLResponse(settings_html())
+
+
+@app.get("/authorizations", response_class=HTMLResponse)
+def authorizations_page() -> HTMLResponse:
+    return HTMLResponse(authorizations_html())
+
+
+@app.get("/telegram", response_class=HTMLResponse)
+def telegram_page() -> HTMLResponse:
+    return HTMLResponse(telegram_html())
 
 
 @app.post("/web/settings", response_class=HTMLResponse)
@@ -846,10 +908,16 @@ async def resolve_resource(
         raise HTTPException(exc.status, f"{exc.code}: {exc.message}") from exc
     url = str(data.get("full_url") or data.get("url") or "").strip()
     name = str(data.get("title") or data.get("name") or slug)
+    now = int(time.time())
     with database() as conn:
         conn.execute(
-            "INSERT INTO transfer_records (installation_id, slug, name, share_url, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (installation_id, slug, name, url, "resolved", int(time.time())),
+            """INSERT INTO transfer_records
+               (installation_id,slug,name,share_url,status,resolution,quality,size,uploader,points,action,processing_status,source_type,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (installation_id, slug, name, url, "resolved", str(data.get("resolution") or ""),
+             str(data.get("quality") or ""), str(data.get("size") or data.get("file_size") or ""),
+             str(data.get("uploader") or data.get("author") or ""), int(data.get("unlock_points") or 0),
+             "资源解锁", "resolved", "115网盘", now, now),
         )
     return {
         "name": name,
@@ -984,7 +1052,28 @@ async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
         raise HTTPException(400, "该资源来源暂不支持转存")
     try:
         result = await resolve_resource(ResolveRequest(slug=request.resource_id, max_unlock_points=None), WEB_INSTALLATION_ID)
-        return {**result, "provider": request.provider, "transfer_status": "resolved"}
+        with database() as conn:
+            settings = conn.execute("SELECT p115_cookie,save_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        if not settings or not settings["p115_cookie"]:
+            raise HTTPException(409, "影巢资源已解锁，但115尚未授权；请到授权中心配置 Cookie 后重试")
+        client = P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT)
+        transferred = await client.transfer(result["share_url"], settings["save_directory"] or "")
+        with database() as conn:
+            conn.execute("UPDATE transfer_records SET status='completed',processing_status='completed',save_path=?,updated_at=? WHERE installation_id=? AND slug=? AND id=(SELECT MAX(id) FROM transfer_records WHERE installation_id=? AND slug=?)",
+                         (settings["save_directory"] or "", int(time.time()), WEB_INSTALLATION_ID, request.resource_id, WEB_INSTALLATION_ID, request.resource_id))
+        try:
+            service = notification_service()
+            config = _telegram_settings(False)
+            if config["enabled"]:
+                await service.notify("transfer_success", {"title": result["name"], "status": "转存成功", "resource": request.resource_id, "resolution": "", "size": "", "save_path": settings["save_directory"] or "115根目录", "error": ""})
+        except Exception:
+            logger.exception("module=notifications provider=telegram operation=transfer_success")
+        return {**result, **transferred, "provider": request.provider, "transfer_status": "completed"}
+    except P115Error as exc:
+        logger.error("module=resources provider=115 operation=transfer error_type=P115Error reason=%s", exc)
+        with database() as conn:
+            conn.execute("UPDATE transfer_records SET status='failed',processing_status='failed',error=?,updated_at=? WHERE installation_id=? AND slug=?", (str(exc), int(time.time()), WEB_INSTALLATION_ID, request.resource_id))
+        raise HTTPException(502, str(exc)) from exc
     except HTTPException as exc:
         logger.error("module=resources provider=%s operation=transfer error_type=%s reason=%s", request.provider, type(exc).__name__, exc.detail)
         raise
@@ -1195,6 +1284,72 @@ def web_task_detail(task_id: int) -> dict[str, Any]:
     return {"task": dict(row)}
 
 
+def unlock_page(installation_id: str, page: int = 1, page_size: int = 15, search: str = "", action: str = "", status: str = "", processing_status: str = "") -> dict[str, Any]:
+    conditions = ["installation_id=?"]
+    params: list[Any] = [installation_id]
+    if search.strip():
+        conditions.append("name LIKE ?"); params.append(f"%{search.strip()}%")
+    if action:
+        conditions.append("action=?"); params.append(action)
+    if status:
+        conditions.append("status=?"); params.append(status)
+    if processing_status:
+        conditions.append("processing_status=?"); params.append(processing_status)
+    where = " AND ".join(conditions)
+    with database() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM transfer_records WHERE {where}", params).fetchone()[0]
+        rows = conn.execute(f"""SELECT id,subscription_id,slug,name,share_url,status,error,media_type,tmdb_id,resolution,quality,size,uploader,points,action,save_path,processing_status,source_type,created_at,updated_at
+            FROM transfer_records WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?""", [*params, page_size, (page - 1) * page_size]).fetchall()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return {"items": [dict(x) for x in rows], "page": page, "page_size": page_size, "total": total, "total_pages": total_pages, "has_more": page < total_pages}
+
+
+@app.get("/api/web/unlocks")
+def web_unlock_list(page: int = Query(1, ge=1), page_size: int = Query(15, ge=1, le=100), search: str = Query("", max_length=100), action: str = Query("", max_length=50), status: str = Query("", max_length=40), processing_status: str = Query("", max_length=40)) -> dict[str, Any]:
+    return unlock_page(WEB_INSTALLATION_ID, page, page_size, search, action, status, processing_status)
+
+
+@app.get("/api/web/unlocks/{record_id}")
+def web_unlock_detail(record_id: int) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT * FROM transfer_records WHERE id=? AND installation_id=?", (record_id, WEB_INSTALLATION_ID)).fetchone()
+    if not row:
+        raise HTTPException(404, "解锁记录不存在")
+    return {"item": dict(row)}
+
+
+@app.post("/api/web/unlocks/{record_id}/retry")
+async def web_unlock_retry(record_id: int) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT slug FROM transfer_records WHERE id=? AND installation_id=?", (record_id, WEB_INSTALLATION_ID)).fetchone()
+    if not row:
+        raise HTTPException(404, "解锁记录不存在")
+    try:
+        result = await resolve_resource(ResolveRequest(slug=row["slug"], max_unlock_points=None), WEB_INSTALLATION_ID)
+        with database() as conn:
+            conn.execute("UPDATE transfer_records SET status='resolved',processing_status='resolved',share_url=?,error='',updated_at=? WHERE id=?", (result.get("share_url", ""), int(time.time()), record_id))
+        return {"ok": True, "share_url": result.get("share_url", "")}
+    except HTTPException as exc:
+        with database() as conn:
+            conn.execute("UPDATE transfer_records SET status='failed',processing_status='failed',error=?,updated_at=? WHERE id=?", (str(exc.detail), int(time.time()), record_id))
+        raise
+
+
+class UnlockBatchDelete(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=100)
+
+
+@app.delete("/api/web/unlocks")
+def web_unlock_delete(request: UnlockBatchDelete) -> dict[str, Any]:
+    ids = sorted({value for value in request.ids if value > 0})
+    if not ids:
+        raise HTTPException(400, "未选择有效记录")
+    marks = ",".join("?" for _ in ids)
+    with database() as conn:
+        cur = conn.execute(f"DELETE FROM transfer_records WHERE installation_id=? AND id IN ({marks})", [WEB_INSTALLATION_ID, *ids])
+    return {"ok": True, "deleted": cur.rowcount, "deleted_files": False}
+
+
 class WebSettings(BaseModel):
     moviepilot_url: str = Field(default="", max_length=500)
     save_directory: str = Field(default="", max_length=500)
@@ -1202,6 +1357,346 @@ class WebSettings(BaseModel):
     tmdb_api_key: str = Field(default="", max_length=1000)
     tmdb_language: str = Field(default="zh-CN", max_length=16)
     tmdb_region: str = Field(default="CN", max_length=8)
+
+
+class BusinessSettings(BaseModel):
+    root_directory: str = Field(default="", max_length=500)
+    save_directory: str = Field(default="", max_length=500)
+    scrape_directory: str = Field(default="", max_length=500)
+    save_wait_seconds: int = Field(default=30, ge=0, le=3600)
+    retry_count: int = Field(default=3, ge=0, le=20)
+    duplicate_policy: str = Field(default="skip", pattern="^(skip|rename|overwrite)$")
+    offline_enabled: bool = True
+    ed2k_directory: str = Field(default="", max_length=500)
+    ed2k_poll_interval: int = Field(default=60, ge=10, le=3600)
+    ed2k_retry_count: int = Field(default=3, ge=0, le=20)
+    ed2k_auto_archive: bool = True
+
+
+BUSINESS_SETTING_COLUMNS = (
+    "root_directory,save_directory,scrape_directory,save_wait_seconds,retry_count,"
+    "duplicate_policy,offline_enabled,ed2k_directory,ed2k_poll_interval,"
+    "ed2k_retry_count,ed2k_auto_archive"
+)
+
+
+@app.get("/api/web/settings/business")
+def get_business_settings() -> dict[str, Any]:
+    init_database()
+    with database() as conn:
+        row = conn.execute(
+            f"SELECT {BUSINESS_SETTING_COLUMNS} FROM web_settings WHERE installation_id=?",
+            (WEB_INSTALLATION_ID,),
+        ).fetchone()
+    if not row:
+        return BusinessSettings().model_dump()
+    result = dict(row)
+    result["offline_enabled"] = bool(result["offline_enabled"])
+    result["ed2k_auto_archive"] = bool(result["ed2k_auto_archive"])
+    return result
+
+
+@app.put("/api/web/settings/business")
+def put_business_settings(request: BusinessSettings) -> dict[str, Any]:
+    values = request.model_dump()
+    with database() as conn:
+        conn.execute(
+            """INSERT INTO web_settings
+            (installation_id,root_directory,save_directory,scrape_directory,save_wait_seconds,
+             retry_count,duplicate_policy,offline_enabled,ed2k_directory,ed2k_poll_interval,
+             ed2k_retry_count,ed2k_auto_archive,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(installation_id) DO UPDATE SET
+             root_directory=excluded.root_directory,save_directory=excluded.save_directory,
+             scrape_directory=excluded.scrape_directory,save_wait_seconds=excluded.save_wait_seconds,
+             retry_count=excluded.retry_count,duplicate_policy=excluded.duplicate_policy,
+             offline_enabled=excluded.offline_enabled,ed2k_directory=excluded.ed2k_directory,
+             ed2k_poll_interval=excluded.ed2k_poll_interval,
+             ed2k_retry_count=excluded.ed2k_retry_count,
+             ed2k_auto_archive=excluded.ed2k_auto_archive,updated_at=excluded.updated_at""",
+            (WEB_INSTALLATION_ID, values["root_directory"].strip(), values["save_directory"].strip(),
+             values["scrape_directory"].strip(), values["save_wait_seconds"], values["retry_count"],
+             values["duplicate_policy"], int(values["offline_enabled"]), values["ed2k_directory"].strip(),
+             values["ed2k_poll_interval"], values["ed2k_retry_count"],
+             int(values["ed2k_auto_archive"]), int(time.time())),
+        )
+    return {"ok": True, **request.model_dump()}
+
+
+@app.post("/api/web/settings/ed2k-test")
+def test_ed2k_settings() -> dict[str, Any]:
+    settings = get_business_settings()
+    if not settings["offline_enabled"]:
+        raise HTTPException(409, "请先启用 ED2K / 磁力云下载")
+    if not settings["ed2k_directory"]:
+        raise HTTPException(409, "请先填写 115 云下载保存目录")
+    return {"ok": True, "message": "ED2K 参数有效；实际下载将使用授权中心的 115 凭据"}
+
+
+class OfflineTaskRequest(BaseModel):
+    url: str = Field(min_length=10, max_length=10000)
+
+
+@app.post("/api/web/offline")
+async def add_offline_task(request: OfflineTaskRequest) -> dict[str, Any]:
+    settings = get_business_settings()
+    if not settings["offline_enabled"]:
+        raise HTTPException(409, "ED2K / 磁力云下载未启用")
+    with database() as conn:
+        row = conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if not row or not row["p115_cookie"]:
+        raise HTTPException(409, "请先在授权中心配置115 Cookie")
+    try:
+        return await P115Client(decrypt(row["p115_cookie"]), REQUEST_TIMEOUT).offline(request.url, settings["ed2k_directory"])
+    except P115Error as exc:
+        logger.error("module=offline provider=115 operation=add_task error_type=P115Error reason=%s", exc)
+        raise HTTPException(502, str(exc)) from exc
+
+
+class AuthorizationUpdate(BaseModel):
+    api_key: str = Field(default="", max_length=4000)
+    cookie: str = Field(default="", max_length=16000)
+    url: str = Field(default="", max_length=500)
+    user_id: str = Field(default="", max_length=200)
+    language: str = Field(default="zh-CN", max_length=16)
+
+
+def _decrypt_optional(value: str | None) -> str:
+    return decrypt(value) if value else ""
+
+
+def _authorization_rows() -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+    init_database()
+    with database() as conn:
+        settings = conn.execute("SELECT * FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        installation = conn.execute("SELECT * FROM installations WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    return settings, installation
+
+
+@app.get("/api/web/authorizations")
+def get_authorizations() -> dict[str, Any]:
+    settings, installation = _authorization_rows()
+    user: dict[str, Any] = {}
+    if installation:
+        try:
+            user = json.loads(installation["user_json"] or "{}")
+        except ValueError:
+            user = {}
+    return {"providers": {
+        "hdhive": {"configured": True, "authorized": bool(installation),
+                    "summary": str(user.get("nickname") or user.get("name") or user.get("username") or "等待授权")},
+        "p115": {"configured": bool(settings and settings["p115_cookie"]), "authorized": bool(settings and settings["p115_cookie"]),
+                 "summary": "Cookie 已安全保存" if settings and settings["p115_cookie"] else "未配置 Cookie"},
+        "emby": {"configured": bool(settings and settings["emby_url"] and settings["emby_api_key"]),
+                 "authorized": False, "url": settings["emby_url"] if settings else "", "user_id": settings["emby_user_id"] if settings else "",
+                 "summary": settings["emby_url"] if settings and settings["emby_url"] else "未配置服务器"},
+        "tmdb": {"configured": bool(settings and settings["tmdb_api_key"]), "authorized": False,
+                 "language": settings["tmdb_language"] if settings else "zh-CN", "summary": "密钥已安全保存" if settings and settings["tmdb_api_key"] else "未配置 API Key"},
+    }}
+
+
+@app.put("/api/web/authorizations/{provider}")
+def put_authorization(provider: str, request: AuthorizationUpdate) -> dict[str, Any]:
+    if provider not in {"p115", "emby", "tmdb"}:
+        raise HTTPException(400, "该 Provider 使用独立 OAuth 授权")
+    init_database()
+    with database() as conn:
+        current = conn.execute("SELECT * FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        if not current:
+            conn.execute("INSERT INTO web_settings (installation_id,updated_at) VALUES (?,?)", (WEB_INSTALLATION_ID, int(time.time())))
+            current = conn.execute("SELECT * FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        if provider == "p115":
+            secret = encrypt(request.cookie.strip()) if request.cookie.strip() else current["p115_cookie"]
+            conn.execute("UPDATE web_settings SET p115_cookie=?,updated_at=? WHERE installation_id=?", (secret, int(time.time()), WEB_INSTALLATION_ID))
+        elif provider == "emby":
+            secret = encrypt(request.api_key.strip()) if request.api_key.strip() else current["emby_api_key"]
+            conn.execute("UPDATE web_settings SET emby_url=?,emby_api_key=?,emby_user_id=?,updated_at=? WHERE installation_id=?",
+                         (request.url.strip().rstrip("/"), secret, request.user_id.strip(), int(time.time()), WEB_INSTALLATION_ID))
+        else:
+            secret = encrypt(request.api_key.strip()) if request.api_key.strip() else current["tmdb_api_key"]
+            conn.execute("UPDATE web_settings SET tmdb_api_key=?,tmdb_language=?,updated_at=? WHERE installation_id=?",
+                         (secret, request.language.strip() or "zh-CN", int(time.time()), WEB_INSTALLATION_ID))
+    return {"ok": True, "configured": bool(secret)}
+
+
+@app.post("/api/web/authorizations/{provider}/test")
+async def test_authorization(provider: str) -> dict[str, Any]:
+    settings, installation = _authorization_rows()
+    if provider == "hdhive":
+        if not installation:
+            raise HTTPException(409, "影巢尚未授权，请先打开授权页面")
+        token = await access_for(WEB_INSTALLATION_ID)
+        user = await hdhive_request("GET", "/api/open/me", access_token=token)
+        return {"ok": True, "message": f"影巢连接正常：{user.get('nickname') or user.get('name') or '已授权'}"}
+    if not settings:
+        raise HTTPException(409, "Provider 尚未配置")
+    if provider == "p115":
+        cookie = _decrypt_optional(settings["p115_cookie"])
+        if not cookie:
+            raise HTTPException(409, "请先配置 115 Cookie")
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+            response = await client.get("https://my.115.com/?ct=ajax&ac=get_user_aq", headers={"Cookie": cookie, "User-Agent": "Mozilla/5.0"})
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HTTPException(502, "115 返回了无法识别的数据") from exc
+        if response.status_code >= 400 or payload.get("state") is False:
+            raise HTTPException(401, "115 Cookie 已失效")
+        return {"ok": True, "message": "115 Cookie 有效"}
+    if provider == "emby":
+        url, key = settings["emby_url"], _decrypt_optional(settings["emby_api_key"])
+        if not url or not key:
+            raise HTTPException(409, "请先配置 Emby 地址和 API Key")
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.get(f"{url.rstrip('/')}/System/Info", headers={"X-Emby-Token": key})
+        if response.status_code >= 400:
+            raise HTTPException(502, f"Emby 连接失败（HTTP {response.status_code}）")
+        info = response.json()
+        return {"ok": True, "message": f"Emby 连接正常：{info.get('ServerName','服务器')} {info.get('Version','')}"}
+    if provider == "tmdb":
+        token = _decrypt_optional(settings["tmdb_api_key"])
+        if not token:
+            raise HTTPException(409, "请先配置 TMDB API Key / Token")
+        headers = {"Authorization": f"Bearer {token}"} if len(token) > 40 else {}
+        params = {} if headers else {"api_key": token}
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.get("https://api.themoviedb.org/3/configuration", headers=headers, params=params)
+        if response.status_code >= 400:
+            raise HTTPException(401, "TMDB 凭据无效")
+        return {"ok": True, "message": "TMDB 连接正常"}
+    raise HTTPException(404, "Provider 不存在")
+
+
+DEFAULT_TELEGRAM_EVENTS = {"transfer_success": True, "transfer_failed": True, "subscription": True, "manual_review": True}
+CHANNEL_MONITOR = ChannelMonitor(REQUEST_TIMEOUT)
+_CHANNEL_WORKER_STARTED = False
+
+
+class TelegramSettings(BaseModel):
+    bot_token: str = Field(default="", max_length=4000)
+    chat_id: str = Field(default="", max_length=200)
+    enabled: bool = False
+    events: dict[str, bool] = Field(default_factory=lambda: dict(DEFAULT_TELEGRAM_EVENTS))
+    template: str = Field(default="", max_length=5000)
+    channel_enabled: bool = False
+    channel_name: str = Field(default="oneonefivewpfx", max_length=200)
+    channel_interval: int = Field(default=600, ge=60, le=86400)
+
+
+def _telegram_settings(include_secret: bool = False) -> dict[str, Any]:
+    init_database()
+    with database() as conn:
+        row = conn.execute("SELECT telegram_bot_token,telegram_chat_id,telegram_enabled,telegram_events,telegram_template,channel_enabled,channel_name,channel_interval FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if not row:
+        return {"bot_token": "", "bot_token_configured": False, "chat_id": "", "enabled": False, "events": dict(DEFAULT_TELEGRAM_EVENTS), "template": "", "channel_enabled": False, "channel_name": "oneonefivewpfx", "channel_interval": 600}
+    try:
+        events = {**DEFAULT_TELEGRAM_EVENTS, **json.loads(row["telegram_events"] or "{}")}
+    except ValueError:
+        events = dict(DEFAULT_TELEGRAM_EVENTS)
+    token = _decrypt_optional(row["telegram_bot_token"])
+    return {"bot_token": token if include_secret else "", "bot_token_configured": bool(token), "chat_id": row["telegram_chat_id"], "enabled": bool(row["telegram_enabled"]), "events": events, "template": row["telegram_template"], "channel_enabled": bool(row["channel_enabled"]), "channel_name": row["channel_name"], "channel_interval": row["channel_interval"] or 600}
+
+
+@app.get("/api/web/telegram/settings")
+def get_telegram_settings() -> dict[str, Any]:
+    return _telegram_settings(False)
+
+
+@app.put("/api/web/telegram/settings")
+def put_telegram_settings(request: TelegramSettings) -> dict[str, Any]:
+    init_database()
+    with database() as conn:
+        row = conn.execute("SELECT telegram_bot_token FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        token = encrypt(request.bot_token.strip()) if request.bot_token.strip() else (row["telegram_bot_token"] if row else "")
+        conn.execute("""INSERT INTO web_settings (installation_id,telegram_bot_token,telegram_chat_id,telegram_enabled,telegram_events,telegram_template,channel_enabled,channel_name,channel_interval,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(installation_id) DO UPDATE SET telegram_bot_token=excluded.telegram_bot_token,telegram_chat_id=excluded.telegram_chat_id,telegram_enabled=excluded.telegram_enabled,telegram_events=excluded.telegram_events,telegram_template=excluded.telegram_template,channel_enabled=excluded.channel_enabled,channel_name=excluded.channel_name,channel_interval=excluded.channel_interval,updated_at=excluded.updated_at""",
+            (WEB_INSTALLATION_ID, token, request.chat_id.strip(), int(request.enabled), json.dumps(request.events), request.template, int(request.channel_enabled), request.channel_name.strip(), request.channel_interval, int(time.time())))
+    return {"ok": True, "bot_token_configured": bool(token)}
+
+
+def notification_service() -> NotificationService:
+    config = _telegram_settings(True)
+    return NotificationService(TelegramProvider(config["bot_token"], config["chat_id"], REQUEST_TIMEOUT), config["events"], config["template"])
+
+
+@app.post("/api/web/telegram/test")
+async def test_telegram() -> dict[str, Any]:
+    config = _telegram_settings(True)
+    if not config["bot_token"] or not config["chat_id"]:
+        raise HTTPException(409, "请先配置 Bot Token 和 Chat ID")
+    try:
+        await TelegramProvider(config["bot_token"], config["chat_id"], REQUEST_TIMEOUT).send("Moon Dream Telegram 通知测试成功")
+    except NotificationError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {"ok": True, "message": "测试消息已发送"}
+
+
+def _channel_status() -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT * FROM channel_state WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    return dict(row) if row else {"last_message_id": 0, "last_check": 0, "next_check": 0, "last_status": "等待运行", "last_error": "", "processed": 0}
+
+
+@app.get("/api/web/telegram/channel/status")
+def channel_status() -> dict[str, Any]:
+    return _channel_status()
+
+
+async def run_channel_check() -> dict[str, Any]:
+    config = _telegram_settings(False)
+    state = _channel_status()
+    now = int(time.time())
+    processed, latest, error = 0, int(state.get("last_message_id") or 0), ""
+    try:
+        messages = await CHANNEL_MONITOR.fetch(config["channel_name"], latest)
+        for message in messages:
+            latest = max(latest, message.message_id)
+            for link in message.links:
+                try:
+                    if "hdhive.com/resource/" in link:
+                        slug = link.split("/resource/", 1)[1].split("?", 1)[0]
+                        await resolve_resource(ResolveRequest(slug=slug, max_unlock_points=None), WEB_INSTALLATION_ID)
+                    else:
+                        logger.info("channel direct share detected message=%s", message.message_id)
+                    processed += 1
+                except Exception as exc:  # one bad message must not stop monitoring
+                    logger.exception("channel item failed message=%s", message.message_id)
+                    error = str(exc)
+        status = f"检查完成，发现 {len(messages)} 条新消息，处理 {processed} 个资源"
+    except Exception as exc:
+        logger.exception("channel monitor failed")
+        status, error = "检查失败", str(exc)
+    with database() as conn:
+        conn.execute("""INSERT INTO channel_state (installation_id,last_message_id,last_check,next_check,last_status,last_error,processed)
+            VALUES (?,?,?,?,?,?,?) ON CONFLICT(installation_id) DO UPDATE SET last_message_id=excluded.last_message_id,last_check=excluded.last_check,next_check=excluded.next_check,last_status=excluded.last_status,last_error=excluded.last_error,processed=channel_state.processed+excluded.processed""",
+            (WEB_INSTALLATION_ID, latest, now, now + int(config["channel_interval"]), status, error[:1000], processed))
+    return {"ok": not bool(error), "message": status if not error else f"{status}：{error}", "processed": processed}
+
+
+@app.post("/api/web/telegram/channel/check")
+async def channel_check() -> dict[str, Any]:
+    return await run_channel_check()
+
+
+def _channel_worker() -> None:
+    while True:
+        try:
+            config = _telegram_settings(False)
+            state = _channel_status()
+            if config["channel_enabled"] and int(state.get("next_check") or 0) <= int(time.time()):
+                asyncio.run(run_channel_check())
+            time.sleep(min(30, max(5, int(config["channel_interval"]) // 10)))
+        except Exception:
+            logger.exception("channel worker loop failed")
+            time.sleep(30)
+
+
+def start_channel_worker() -> None:
+    global _CHANNEL_WORKER_STARTED
+    if _CHANNEL_WORKER_STARTED:
+        return
+    _CHANNEL_WORKER_STARTED = True
+    threading.Thread(target=_channel_worker, name="moon-channel-monitor", daemon=True).start()
 
 
 @app.get("/v1/settings")
