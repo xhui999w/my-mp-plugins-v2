@@ -18,7 +18,7 @@ import sqlite3
 import threading
 import time
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -73,12 +73,21 @@ RESOURCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_database()
+    if os.getenv("DISABLE_BACKGROUND_WORKERS", "").strip() != "1":
+        start_channel_worker()
+    yield
+
+
 app = FastAPI(
     title="HDHive OAuth Gateway",
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    lifespan=lifespan,
 )
 logger = logging.getLogger("hdhive-oauth")
 
@@ -238,13 +247,6 @@ def init_database() -> None:
         ):
             if name not in transfer_columns:
                 conn.execute(f"ALTER TABLE transfer_records ADD COLUMN {name} {definition}")
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_database()
-    if os.getenv("DISABLE_BACKGROUND_WORKERS", "").strip() != "1":
-        start_channel_worker()
 
 
 def encrypt(value: str) -> str:
