@@ -41,6 +41,9 @@ STREAMING_NAMES = {
     "disney": ("Disney+", ("Disney Plus", "Disney+")),
     "apple": ("Apple TV+", ("Apple TV", "Apple TV Plus", "Apple TV+", "Apple TV App")),
 }
+# TMDB's stable provider IDs are used only when its provider catalogue omits
+# a name for an unrestricted-region request.
+STREAMING_PROVIDER_FALLBACKS = {"netflix": 8, "max": 1899, "prime": 9, "disney": 337, "apple": 350}
 
 
 @dataclass(frozen=True)
@@ -145,7 +148,7 @@ class TMDBProvider:
         for provider in data.get("results", []):
             if str(provider.get("provider_name")) in names:
                 return int(provider["provider_id"])
-        return None
+        return STREAMING_PROVIDER_FALLBACKS.get(key)
 
     async def discover(self, query: dict[str, Any]) -> dict[str, Any]:
         media_type = query.get("media_type", "movie")
