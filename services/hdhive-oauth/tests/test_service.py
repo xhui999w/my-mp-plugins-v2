@@ -19,6 +19,7 @@ os.environ.update(
         "INSTALLATION_KEY": "installation-secret",
         "TOKEN_ENCRYPTION_KEY": Fernet.generate_key().decode(),
         "DATABASE_PATH": str(pathlib.Path(TEMP_DIR.name) / "test.db"),
+        "DISABLE_BACKGROUND_WORKERS": "1",
     }
 )
 SERVICE_ROOT = pathlib.Path(__file__).parents[1]
@@ -245,6 +246,16 @@ class OAuthServiceTests(unittest.TestCase):
         loaded = self.client.get("/api/web/telegram/settings").json()
         self.assertTrue(loaded["bot_token_configured"])
         self.assertNotIn("secret-bot", str(loaded))
+
+    def test_telegram_commands_create_real_subscription(self):
+        import asyncio
+        help_text = asyncio.run(main._telegram_command("/help"))
+        self.assertIn("/search", help_text)
+        reply = asyncio.run(main._telegram_command("/subscribe movie 998877 Telegram测试影片"))
+        self.assertIn("订阅成功", reply)
+        with main.database() as conn:
+            row = conn.execute("SELECT title FROM web_subscriptions WHERE installation_id=? AND tmdb_id=998877", (main.WEB_INSTALLATION_ID,)).fetchone()
+        self.assertEqual(row["title"], "Telegram测试影片")
 
 
 if __name__ == "__main__":

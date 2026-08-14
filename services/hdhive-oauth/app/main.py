@@ -159,6 +159,13 @@ def init_database() -> None:
             last_error TEXT DEFAULT '',
             processed INTEGER DEFAULT 0
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS provider_state (
+            installation_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            state_json TEXT DEFAULT '{}',
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (installation_id, provider)
+        )""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(web_settings)")}
         for name, definition in (
             ("tmdb_api_key", "TEXT DEFAULT ''"),
@@ -179,6 +186,10 @@ def init_database() -> None:
             ("p115_cookie", "TEXT DEFAULT ''"),
             ("telegram_bot_token", "TEXT DEFAULT ''"),
             ("telegram_chat_id", "TEXT DEFAULT ''"),
+            ("telegram_api_id", "TEXT DEFAULT ''"),
+            ("telegram_api_hash", "TEXT DEFAULT ''"),
+            ("telegram_user_id", "TEXT DEFAULT ''"),
+            ("telegram_update_offset", "INTEGER DEFAULT 0"),
             ("telegram_enabled", "INTEGER DEFAULT 0"),
             ("telegram_events", "TEXT DEFAULT '{}'"),
             ("telegram_template", "TEXT DEFAULT ''"),
@@ -217,7 +228,8 @@ def init_database() -> None:
 @app.on_event("startup")
 def startup() -> None:
     init_database()
-    start_channel_worker()
+    if os.getenv("DISABLE_BACKGROUND_WORKERS", "").strip() != "1":
+        start_channel_worker()
 
 
 def encrypt(value: str) -> str:
@@ -1073,6 +1085,11 @@ async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
         logger.error("module=resources provider=115 operation=transfer error_type=P115Error reason=%s", exc)
         with database() as conn:
             conn.execute("UPDATE transfer_records SET status='failed',processing_status='failed',error=?,updated_at=? WHERE installation_id=? AND slug=?", (str(exc), int(time.time()), WEB_INSTALLATION_ID, request.resource_id))
+        try:
+            if _telegram_settings(False)["enabled"]:
+                await notification_service().notify("transfer_failed", {"title": request.resource_id, "status": "转存失败", "resource": request.provider, "resolution": "", "size": "", "save_path": "", "error": str(exc)})
+        except Exception:
+            logger.exception("module=notifications provider=telegram operation=transfer_failed")
         raise HTTPException(502, str(exc)) from exc
     except HTTPException as exc:
         logger.error("module=resources provider=%s operation=transfer error_type=%s reason=%s", request.provider, type(exc).__name__, exc.detail)
@@ -1126,8 +1143,14 @@ def create_subscription(
 
 
 @app.post("/api/web/subscriptions")
-def web_create_subscription(request: SubscriptionRequest) -> dict[str, Any]:
-    return create_subscription(request, WEB_INSTALLATION_ID)
+async def web_create_subscription(request: SubscriptionRequest) -> dict[str, Any]:
+    result = create_subscription(request, WEB_INSTALLATION_ID)
+    try:
+        if _telegram_settings(False)["enabled"]:
+            await notification_service().notify("subscription", {"title": request.title, "status": "订阅成功" if not result.get("duplicate") else "订阅已存在", "resource": f"TMDB {request.tmdb_id}", "resolution": "", "size": "", "save_path": request.save_path, "error": ""})
+    except Exception:
+        logger.exception("module=notifications provider=telegram operation=subscription")
+    return result
 
 
 @app.get("/v1/subscriptions")
@@ -1473,9 +1496,29 @@ def _authorization_rows() -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
     return settings, installation
 
 
+def _provider_states() -> dict[str, dict[str, Any]]:
+    with database() as conn:
+        rows = conn.execute("SELECT provider,state_json FROM provider_state WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchall()
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            result[row["provider"]] = json.loads(row["state_json"] or "{}")
+        except ValueError:
+            result[row["provider"]] = {}
+    return result
+
+
+def _save_provider_state(provider: str, state: dict[str, Any]) -> None:
+    # Store only public account/server metadata, never credentials.
+    with database() as conn:
+        conn.execute("INSERT INTO provider_state (installation_id,provider,state_json,updated_at) VALUES (?,?,?,?) ON CONFLICT(installation_id,provider) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",
+                     (WEB_INSTALLATION_ID, provider, json.dumps(state, ensure_ascii=False), int(time.time())))
+
+
 @app.get("/api/web/authorizations")
 def get_authorizations() -> dict[str, Any]:
     settings, installation = _authorization_rows()
+    states = _provider_states()
     user: dict[str, Any] = {}
     if installation:
         try:
@@ -1486,12 +1529,12 @@ def get_authorizations() -> dict[str, Any]:
         "hdhive": {"configured": True, "authorized": bool(installation),
                     "summary": str(user.get("nickname") or user.get("name") or user.get("username") or "等待授权")},
         "p115": {"configured": bool(settings and settings["p115_cookie"]), "authorized": bool(settings and settings["p115_cookie"]),
-                 "summary": "Cookie 已安全保存" if settings and settings["p115_cookie"] else "未配置 Cookie"},
+                 "summary": states.get("p115", {}).get("summary") or ("Cookie 已安全保存" if settings and settings["p115_cookie"] else "未配置 Cookie")},
         "emby": {"configured": bool(settings and settings["emby_url"] and settings["emby_api_key"]),
                  "authorized": False, "url": settings["emby_url"] if settings else "", "user_id": settings["emby_user_id"] if settings else "",
-                 "summary": settings["emby_url"] if settings and settings["emby_url"] else "未配置服务器"},
+                 "summary": states.get("emby", {}).get("summary") or (settings["emby_url"] if settings and settings["emby_url"] else "未配置服务器")},
         "tmdb": {"configured": bool(settings and settings["tmdb_api_key"]), "authorized": False,
-                 "language": settings["tmdb_language"] if settings else "zh-CN", "summary": "密钥已安全保存" if settings and settings["tmdb_api_key"] else "未配置 API Key"},
+                 "language": settings["tmdb_language"] if settings else "zh-CN", "summary": states.get("tmdb", {}).get("summary") or ("密钥已安全保存" if settings and settings["tmdb_api_key"] else "未配置 API Key")},
     }}
 
 
@@ -1542,7 +1585,12 @@ async def test_authorization(provider: str) -> dict[str, Any]:
             raise HTTPException(502, "115 返回了无法识别的数据") from exc
         if response.status_code >= 400 or payload.get("state") is False:
             raise HTTPException(401, "115 Cookie 已失效")
-        return {"ok": True, "message": "115 Cookie 有效"}
+        account = payload.get("data") or {}
+        uid = str(account.get("uid") or account.get("user_id") or "")
+        name = str(account.get("user_name") or account.get("nickname") or "")
+        summary = " · ".join(value for value in (name, f"UID {uid}" if uid else "") if value) or "115 Cookie 有效"
+        _save_provider_state("p115", {"summary": summary, "uid": uid, "name": name})
+        return {"ok": True, "message": f"115 连接正常：{summary}"}
     if provider == "emby":
         url, key = settings["emby_url"], _decrypt_optional(settings["emby_api_key"])
         if not url or not key:
@@ -1552,6 +1600,7 @@ async def test_authorization(provider: str) -> dict[str, Any]:
         if response.status_code >= 400:
             raise HTTPException(502, f"Emby 连接失败（HTTP {response.status_code}）")
         info = response.json()
+        _save_provider_state("emby", {"summary": f"{info.get('ServerName','服务器')} {info.get('Version','')}".strip(), "server_name": info.get("ServerName"), "version": info.get("Version")})
         return {"ok": True, "message": f"Emby 连接正常：{info.get('ServerName','服务器')} {info.get('Version','')}"}
     if provider == "tmdb":
         token = _decrypt_optional(settings["tmdb_api_key"])
@@ -1563,6 +1612,7 @@ async def test_authorization(provider: str) -> dict[str, Any]:
             response = await client.get("https://api.themoviedb.org/3/configuration", headers=headers, params=params)
         if response.status_code >= 400:
             raise HTTPException(401, "TMDB 凭据无效")
+        _save_provider_state("tmdb", {"summary": "TMDB 连接正常"})
         return {"ok": True, "message": "TMDB 连接正常"}
     raise HTTPException(404, "Provider 不存在")
 
@@ -1570,12 +1620,16 @@ async def test_authorization(provider: str) -> dict[str, Any]:
 DEFAULT_TELEGRAM_EVENTS = {"transfer_success": True, "transfer_failed": True, "subscription": True, "manual_review": True}
 CHANNEL_MONITOR = ChannelMonitor(REQUEST_TIMEOUT)
 _CHANNEL_WORKER_STARTED = False
+_TELEGRAM_BOT_WORKER_STARTED = False
 P115_QR_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 class TelegramSettings(BaseModel):
     bot_token: str = Field(default="", max_length=4000)
     chat_id: str = Field(default="", max_length=200)
+    api_id: str = Field(default="", max_length=50)
+    api_hash: str = Field(default="", max_length=500)
+    authorized_user_id: str = Field(default="", max_length=100)
     enabled: bool = False
     events: dict[str, bool] = Field(default_factory=lambda: dict(DEFAULT_TELEGRAM_EVENTS))
     template: str = Field(default="", max_length=5000)
@@ -1587,15 +1641,16 @@ class TelegramSettings(BaseModel):
 def _telegram_settings(include_secret: bool = False) -> dict[str, Any]:
     init_database()
     with database() as conn:
-        row = conn.execute("SELECT telegram_bot_token,telegram_chat_id,telegram_enabled,telegram_events,telegram_template,channel_enabled,channel_name,channel_interval FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        row = conn.execute("SELECT telegram_bot_token,telegram_chat_id,telegram_api_id,telegram_api_hash,telegram_user_id,telegram_enabled,telegram_events,telegram_template,channel_enabled,channel_name,channel_interval FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
     if not row:
-        return {"bot_token": "", "bot_token_configured": False, "chat_id": "", "enabled": False, "events": dict(DEFAULT_TELEGRAM_EVENTS), "template": "", "channel_enabled": False, "channel_name": "oneonefivewpfx", "channel_interval": 600}
+        return {"bot_token": "", "bot_token_configured": False, "chat_id": "", "api_id": "", "api_hash_configured": False, "authorized_user_id": "", "enabled": False, "events": dict(DEFAULT_TELEGRAM_EVENTS), "template": "", "channel_enabled": False, "channel_name": "oneonefivewpfx", "channel_interval": 600}
     try:
         events = {**DEFAULT_TELEGRAM_EVENTS, **json.loads(row["telegram_events"] or "{}")}
     except ValueError:
         events = dict(DEFAULT_TELEGRAM_EVENTS)
     token = _decrypt_optional(row["telegram_bot_token"])
-    return {"bot_token": token if include_secret else "", "bot_token_configured": bool(token), "chat_id": row["telegram_chat_id"], "enabled": bool(row["telegram_enabled"]), "events": events, "template": row["telegram_template"], "channel_enabled": bool(row["channel_enabled"]), "channel_name": row["channel_name"], "channel_interval": row["channel_interval"] or 600}
+    api_hash = _decrypt_optional(row["telegram_api_hash"])
+    return {"bot_token": token if include_secret else "", "bot_token_configured": bool(token), "chat_id": row["telegram_chat_id"], "api_id": row["telegram_api_id"], "api_hash": api_hash if include_secret else "", "api_hash_configured": bool(api_hash), "authorized_user_id": row["telegram_user_id"], "enabled": bool(row["telegram_enabled"]), "events": events, "template": row["telegram_template"], "channel_enabled": bool(row["channel_enabled"]), "channel_name": row["channel_name"], "channel_interval": row["channel_interval"] or 600}
 
 
 @app.get("/api/web/telegram/settings")
@@ -1607,11 +1662,12 @@ def get_telegram_settings() -> dict[str, Any]:
 def put_telegram_settings(request: TelegramSettings) -> dict[str, Any]:
     init_database()
     with database() as conn:
-        row = conn.execute("SELECT telegram_bot_token FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        row = conn.execute("SELECT telegram_bot_token,telegram_api_hash FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
         token = encrypt(request.bot_token.strip()) if request.bot_token.strip() else (row["telegram_bot_token"] if row else "")
-        conn.execute("""INSERT INTO web_settings (installation_id,telegram_bot_token,telegram_chat_id,telegram_enabled,telegram_events,telegram_template,channel_enabled,channel_name,channel_interval,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(installation_id) DO UPDATE SET telegram_bot_token=excluded.telegram_bot_token,telegram_chat_id=excluded.telegram_chat_id,telegram_enabled=excluded.telegram_enabled,telegram_events=excluded.telegram_events,telegram_template=excluded.telegram_template,channel_enabled=excluded.channel_enabled,channel_name=excluded.channel_name,channel_interval=excluded.channel_interval,updated_at=excluded.updated_at""",
-            (WEB_INSTALLATION_ID, token, request.chat_id.strip(), int(request.enabled), json.dumps(request.events), request.template, int(request.channel_enabled), request.channel_name.strip(), request.channel_interval, int(time.time())))
+        api_hash = encrypt(request.api_hash.strip()) if request.api_hash.strip() else (row["telegram_api_hash"] if row else "")
+        conn.execute("""INSERT INTO web_settings (installation_id,telegram_bot_token,telegram_chat_id,telegram_api_id,telegram_api_hash,telegram_user_id,telegram_enabled,telegram_events,telegram_template,channel_enabled,channel_name,channel_interval,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(installation_id) DO UPDATE SET telegram_bot_token=excluded.telegram_bot_token,telegram_chat_id=excluded.telegram_chat_id,telegram_api_id=excluded.telegram_api_id,telegram_api_hash=excluded.telegram_api_hash,telegram_user_id=excluded.telegram_user_id,telegram_enabled=excluded.telegram_enabled,telegram_events=excluded.telegram_events,telegram_template=excluded.telegram_template,channel_enabled=excluded.channel_enabled,channel_name=excluded.channel_name,channel_interval=excluded.channel_interval,updated_at=excluded.updated_at""",
+            (WEB_INSTALLATION_ID, token, request.chat_id.strip(), request.api_id.strip(), api_hash, request.authorized_user_id.strip(), int(request.enabled), json.dumps(request.events), request.template, int(request.channel_enabled), request.channel_name.strip(), request.channel_interval, int(time.time())))
     return {"ok": True, "bot_token_configured": bool(token)}
 
 
@@ -1647,23 +1703,34 @@ async def run_channel_check() -> dict[str, Any]:
     config = _telegram_settings(False)
     state = _channel_status()
     now = int(time.time())
-    processed, latest, error = 0, int(state.get("last_message_id") or 0), ""
+    processed, latest, error, status = 0, int(state.get("last_message_id") or 0), "", ""
     try:
         messages = await CHANNEL_MONITOR.fetch(config["channel_name"], latest)
+        # First run establishes a cursor so enabling a channel never unlocks its
+        # entire history or unexpectedly consumes points.
+        if latest == 0 and messages:
+            latest = max(message.message_id for message in messages)
+            messages = []
+            status = "首次检查已建立频道游标；只会处理之后的新消息"
         for message in messages:
             latest = max(latest, message.message_id)
             for link in message.links:
                 try:
                     if "hdhive.com/resource/" in link:
                         slug = link.split("/resource/", 1)[1].split("?", 1)[0]
-                        await resolve_resource(ResolveRequest(slug=slug, max_unlock_points=None), WEB_INSTALLATION_ID)
+                        await web_resource_transfer(WebResourceTransfer(provider="hdhive", resource_id=slug))
                     else:
-                        logger.info("channel direct share detected message=%s", message.message_id)
+                        with database() as conn:
+                            settings = conn.execute("SELECT p115_cookie,save_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+                        if not settings or not settings["p115_cookie"]:
+                            raise P115Error("115 Cookie 未配置")
+                        await P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT).transfer(link, settings["save_directory"] or "")
                     processed += 1
                 except Exception as exc:  # one bad message must not stop monitoring
                     logger.exception("channel item failed message=%s", message.message_id)
                     error = str(exc)
-        status = f"检查完成，发现 {len(messages)} 条新消息，处理 {processed} 个资源"
+        if not (latest and not messages and status.startswith("首次检查")):
+            status = f"检查完成，发现 {len(messages)} 条新消息，处理 {processed} 个资源"
     except Exception as exc:
         logger.exception("channel monitor failed")
         status, error = "检查失败", str(exc)
@@ -1693,11 +1760,93 @@ def _channel_worker() -> None:
 
 
 def start_channel_worker() -> None:
-    global _CHANNEL_WORKER_STARTED
+    global _CHANNEL_WORKER_STARTED, _TELEGRAM_BOT_WORKER_STARTED
     if _CHANNEL_WORKER_STARTED:
         return
     _CHANNEL_WORKER_STARTED = True
     threading.Thread(target=_channel_worker, name="moon-channel-monitor", daemon=True).start()
+    if not _TELEGRAM_BOT_WORKER_STARTED:
+        _TELEGRAM_BOT_WORKER_STARTED = True
+        threading.Thread(target=_telegram_bot_worker, name="moon-telegram-bot", daemon=True).start()
+
+
+async def _telegram_command(text: str) -> str:
+    command, _, argument = text.strip().partition(" ")
+    if command in {"/start", "/help"}:
+        return "Moon Dream 命令：\n/search 片名 - 搜索影视\n/subscribe movie|tv TMDB_ID 标题 - 建立订阅\n/status - 查看授权状态"
+    if command == "/status":
+        providers = get_authorizations()["providers"]
+        return "\n".join(f"{key}: {'可用' if value.get('configured') or value.get('authorized') else '未配置'}" for key, value in providers.items())
+    if command == "/search":
+        keyword = argument.strip()
+        if not keyword:
+            return "用法：/search 影片名称"
+        provider = explore_tmdb_provider()
+        if not provider.configured:
+            return "TMDB 尚未配置，请先到授权中心配置。"
+        payload, _ = await provider.request("/search/multi", {"query": keyword, "include_adult": "false"}, ttl=120)
+        lines = [f"“{keyword}”搜索结果："]
+        for item in payload.get("results", [])[:8]:
+            media_type = item.get("media_type")
+            if media_type not in {"movie", "tv"}:
+                continue
+            title = str(item.get("title") or item.get("name") or "未命名")
+            date = str(item.get("release_date") or item.get("first_air_date") or "")
+            lines.append(f"{title} {date[:4]}\n/subscribe {media_type} {item.get('id')} {title}")
+        return "\n\n".join(lines) if len(lines) > 1 else "没有找到匹配影视。"
+    if command == "/subscribe":
+        parts = argument.split(maxsplit=2)
+        if len(parts) < 2 or parts[0] not in {"movie", "tv"} or not parts[1].isdigit():
+            return "用法：/subscribe movie|tv TMDB_ID 标题"
+        media_type, tmdb_id = parts[0], int(parts[1])
+        title = parts[2] if len(parts) > 2 else f"TMDB {tmdb_id}"
+        result = create_subscription(SubscriptionRequest(title=title, media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
+        return f"{'已存在' if result.get('duplicate') else '订阅成功'}：{title}"
+    return "无法识别命令。发送 /help 查看可用功能。"
+
+
+async def _poll_telegram_bot_once() -> None:
+    config = _telegram_settings(True)
+    if not config["enabled"] or not config["bot_token"]:
+        return
+    with database() as conn:
+        row = conn.execute("SELECT telegram_update_offset FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    offset = int(row["telegram_update_offset"] or 0) if row else 0
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.get(f"https://api.telegram.org/bot{config['bot_token']}/getUpdates", params={"offset": offset, "timeout": 0, "allowed_updates": json.dumps(["message"])})
+        payload = response.json()
+    if not payload.get("ok"):
+        raise NotificationError(str(payload.get("description") or "Telegram 更新读取失败"))
+    latest = offset
+    for update in payload.get("result", []):
+        latest = max(latest, int(update.get("update_id", 0)) + 1)
+        message = update.get("message") or {}
+        sender = str((message.get("from") or {}).get("id") or "")
+        if config["authorized_user_id"] and sender != str(config["authorized_user_id"]):
+            logger.warning("module=telegram operation=command reason=unauthorized_user user=%s", sender)
+            continue
+        text = str(message.get("text") or "")
+        chat_id = str((message.get("chat") or {}).get("id") or "")
+        if not text.startswith("/") or not chat_id:
+            continue
+        try:
+            reply = await _telegram_command(text)
+        except Exception as exc:
+            logger.exception("module=telegram operation=command error_type=%s", type(exc).__name__)
+            reply = f"命令执行失败：{type(exc).__name__}"
+        await TelegramProvider(config["bot_token"], chat_id, REQUEST_TIMEOUT).send(reply)
+    if latest != offset:
+        with database() as conn:
+            conn.execute("UPDATE web_settings SET telegram_update_offset=? WHERE installation_id=?", (latest, WEB_INSTALLATION_ID))
+
+
+def _telegram_bot_worker() -> None:
+    while True:
+        try:
+            asyncio.run(_poll_telegram_bot_once())
+        except Exception:
+            logger.exception("module=telegram operation=poll")
+        time.sleep(5)
 
 
 @app.post("/api/web/authorizations/p115/qr/start")
