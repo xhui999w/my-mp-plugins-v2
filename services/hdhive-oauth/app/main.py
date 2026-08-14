@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
+import base64
+import io
 import json
 import logging
 import os
@@ -24,6 +26,8 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 import httpx
+import qrcode
+import qrcode.image.svg
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -1739,6 +1743,28 @@ _TELEGRAM_BOT_WORKER_STARTED = False
 _NEXT_SUBSCRIPTION_CHECK = 0
 _NEXT_OFFLINE_CHECK = 0
 P115_QR_SESSIONS: dict[str, dict[str, Any]] = {}
+P115_QR_APPS = {
+    "web": "115生活_网页端",
+    "ios": "115生活_苹果端",
+    "115ios": "115管理_苹果端",
+    "android": "115生活_安卓端",
+    "115android": "115管理_安卓端",
+    "ipad": "115生活_苹果平板",
+    "115ipad": "115管理_苹果平板",
+    "qandroid": "115管理_安卓端(Q)",
+    "qios": "115管理_苹果端(Q)",
+    "qipad": "115管理_苹果平板(Q)",
+    "os_windows": "115生活_Windows端",
+    "os_mac": "115生活_macOS端",
+    "os_linux": "115生活_Linux端",
+    "wechatmini": "115生活_微信小程序",
+    "alipaymini": "115生活_支付宝小程序",
+    "harmony": "115鸿蒙端",
+}
+
+
+class P115QRStartRequest(BaseModel):
+    app: str = Field(default="web", max_length=30)
 
 
 class TelegramSettings(BaseModel):
@@ -2020,17 +2046,30 @@ def _telegram_bot_worker() -> None:
         time.sleep(5)
 
 
+@app.get("/api/web/authorizations/p115/qr/apps")
+def p115_qr_apps() -> dict[str, Any]:
+    return {"items": [{"id": key, "name": value} for key, value in P115_QR_APPS.items()], "default": "web"}
+
+
 @app.post("/api/web/authorizations/p115/qr/start")
-async def p115_qr_start() -> dict[str, Any]:
+async def p115_qr_start(request: P115QRStartRequest) -> dict[str, Any]:
+    app_name = request.app.strip().lower()
+    if app_name not in P115_QR_APPS:
+        raise HTTPException(400, "不支持的115扫码设备类型")
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        response = await client.get("https://qrcodeapi.115.com/api/1.0/web/1.0/token/", params={"app": "web"})
+        response = await client.get("https://qrcodeapi.115.com/api/1.0/web/1.0/token/", params={"app": app_name})
     payload = response.json()
     data = payload.get("data") or {}
     uid = str(data.get("uid") or "")
     if not uid:
         raise HTTPException(502, "115 暂时无法生成二维码")
-    P115_QR_SESSIONS[uid] = {"time": data.get("time"), "sign": data.get("sign"), "created": int(time.time())}
-    return {"ok": True, "session_id": uid, "qrcode": data.get("qrcode") or f"https://115.com/scan/dg-{uid}"}
+    qr_content = str(data.get("qrcode") or f"https://115.com/scan/dg-{uid}")
+    image = qrcode.make(qr_content, image_factory=qrcode.image.svg.SvgPathImage, box_size=8, border=3)
+    buffer = io.BytesIO()
+    image.save(buffer)
+    qr_image = "data:image/svg+xml;base64," + base64.b64encode(buffer.getvalue()).decode()
+    P115_QR_SESSIONS[uid] = {"time": data.get("time"), "sign": data.get("sign"), "app": app_name, "created": int(time.time())}
+    return {"ok": True, "session_id": uid, "app": app_name, "device": P115_QR_APPS[app_name], "qrcode": qr_content, "qr_image": qr_image}
 
 
 @app.get("/api/web/authorizations/p115/qr/{session_id}")
@@ -2045,7 +2084,8 @@ async def p115_qr_status(session_id: str) -> dict[str, Any]:
         if status != 2:
             labels = {-2: "二维码已过期", -1: "已取消", 0: "等待扫码", 1: "已扫码，请在手机确认"}
             return {"ok": True, "completed": False, "status": status, "message": labels.get(status, "等待确认")}
-        login = await client.post("https://passportapi.115.com/app/1.0/web/1.0/login/qrcode/", data={"account": session_id, "app": "web"})
+        app_name = str(session.get("app") or "web")
+        login = await client.post(f"https://passportapi.115.com/app/1.0/{app_name}/1.0/login/qrcode/", data={"account": session_id, "app": app_name})
     result = login.json()
     data = result.get("data") or {}
     cookie_data = data.get("cookie") or {}

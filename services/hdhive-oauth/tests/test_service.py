@@ -4,7 +4,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
@@ -261,6 +261,27 @@ class OAuthServiceTests(unittest.TestCase):
         loaded = self.client.get("/api/web/telegram/settings").json()
         self.assertTrue(loaded["bot_token_configured"])
         self.assertNotIn("secret-bot", str(loaded))
+
+    def test_p115_qr_device_options_and_validation(self):
+        apps = self.client.get("/api/web/authorizations/p115/qr/apps")
+        self.assertEqual(apps.status_code, 200)
+        app_ids = {item["id"] for item in apps.json()["items"]}
+        self.assertTrue({"web", "android", "ios", "os_mac", "harmony"}.issubset(app_ids))
+        page = self.client.get("/authorizations")
+        self.assertIn('id="p115App"', page.text)
+        response = self.client.post("/api/web/authorizations/p115/qr/start", json={"app": "advertising-app"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_p115_qr_start_returns_embedded_scannable_image(self):
+        response = Mock()
+        response.json.return_value = {"data": {"uid": "qr-session", "time": 123, "sign": "signed", "qrcode": "https://115.com/scan/dg-test"}}
+        http_client = AsyncMock()
+        http_client.__aenter__.return_value.get = AsyncMock(return_value=response)
+        with patch.object(main.httpx, "AsyncClient", return_value=http_client):
+            result = self.client.post("/api/web/authorizations/p115/qr/start", json={"app": "os_mac"})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["app"], "os_mac")
+        self.assertTrue(result.json()["qr_image"].startswith("data:image/svg+xml;base64,"))
 
     def test_trusted_notification_event_respects_disabled_event(self):
         self.client.put(
