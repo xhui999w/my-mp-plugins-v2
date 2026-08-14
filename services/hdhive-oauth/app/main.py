@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import re
 import secrets
@@ -30,6 +31,8 @@ from .explore import RANKINGS, TMDBProvider, filter_metadata, registry
 from .explore_ui import explore_html
 from .subscriptions_ui import subscriptions_html
 from .tasks_ui import tasks_html
+from .resource_ui import resource_detail_html
+from .resources import HDHiveResourceProvider, ResourceProviderRegistry, filter_options
 
 
 def required_env(name: str) -> str:
@@ -68,6 +71,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+logger = logging.getLogger("hdhive-oauth")
 
 
 @contextmanager
@@ -362,6 +366,11 @@ def health() -> dict[str, Any]:
 @app.get("/explore", response_class=HTMLResponse)
 def explore_page() -> HTMLResponse:
     return HTMLResponse(explore_html())
+
+
+@app.get("/resources", response_class=HTMLResponse)
+def resource_detail_page() -> HTMLResponse:
+    return HTMLResponse(resource_detail_html())
 
 
 @app.get("/api/explore/status")
@@ -937,6 +946,71 @@ async def search_resources(
         raise HTTPException(exc.status, f"{exc.code}: {exc.message}") from exc
 
 
+def resource_registry() -> ResourceProviderRegistry:
+    with database() as conn:
+        configured = bool(conn.execute("SELECT 1 FROM installations WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone())
+
+    async def hdhive_query(media_type: str, tmdb_id: int, title: str) -> dict[str, Any]:
+        data = await query_resources(ResourceQuery(media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
+        if not _resource_items(data) and title.strip():
+            try:
+                searched = await search_resources(SearchRequest(keyword=title.strip(), media_type=media_type), WEB_INSTALLATION_ID)
+                if _resource_items(searched):
+                    return searched
+            except HTTPException as exc:
+                logger.warning("module=resources provider=hdhive operation=title_search error_type=%s reason=%s", type(exc).__name__, exc.detail)
+        return data
+
+    return ResourceProviderRegistry([HDHiveResourceProvider(hdhive_query, configured=configured)])
+
+
+@app.get("/api/web/resources/search")
+async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(..., gt=0), title: str = Query("", max_length=200)) -> dict[str, Any]:
+    providers = resource_registry()
+    items, errors = await providers.search(media_type, tmdb_id, title)
+    for error in errors:
+        logger.error("module=resources provider=%s operation=search error_type=ProviderError reason=%s", error["provider"], error["error"])
+    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items)}
+
+
+class WebResourceTransfer(BaseModel):
+    provider: str = Field(min_length=1, max_length=50)
+    resource_id: str = Field(min_length=1, max_length=200)
+
+
+@app.post("/api/web/resources/transfer")
+async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
+    if request.provider != "hdhive":
+        raise HTTPException(400, "该资源来源暂不支持转存")
+    try:
+        result = await resolve_resource(ResolveRequest(slug=request.resource_id, max_unlock_points=None), WEB_INSTALLATION_ID)
+        return {**result, "provider": request.provider, "transfer_status": "resolved"}
+    except HTTPException as exc:
+        logger.error("module=resources provider=%s operation=transfer error_type=%s reason=%s", request.provider, type(exc).__name__, exc.detail)
+        raise
+
+
+@app.get("/api/web/subscription-status")
+def web_subscription_status(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(..., gt=0)) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, tmdb_id)).fetchone()
+    return {"subscribed": bool(row), "id": row["id"] if row else None, "status": row["status"] if row else None}
+
+
+@app.get("/api/web/subscription-statuses")
+def web_subscription_statuses(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_ids: str = Query("", max_length=4000)) -> dict[str, Any]:
+    ids = sorted({int(x) for x in tmdb_ids.split(",") if x.isdigit() and int(x) > 0})[:100]
+    if not ids:
+        return {"items": {}}
+    marks = ",".join("?" for _ in ids)
+    with database() as conn:
+        rows = conn.execute(f"SELECT id,tmdb_id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id IN ({marks}) AND status NOT IN ('cancelled','expired') ORDER BY id DESC", [WEB_INSTALLATION_ID, media_type, *ids]).fetchall()
+    items: dict[str, Any] = {}
+    for row in rows:
+        items.setdefault(str(row["tmdb_id"]), {"id": row["id"], "status": row["status"]})
+    return {"items": items}
+
+
 @app.post("/v1/subscriptions")
 def create_subscription(
     request: SubscriptionRequest,
@@ -960,6 +1034,11 @@ def create_subscription(
              request.moviepilot_id.strip(), "active", now, now),
         )
         return {"id": cur.lastrowid, "status": "active", **request.model_dump()}
+
+
+@app.post("/api/web/subscriptions")
+def web_create_subscription(request: SubscriptionRequest) -> dict[str, Any]:
+    return create_subscription(request, WEB_INSTALLATION_ID)
 
 
 @app.get("/v1/subscriptions")
