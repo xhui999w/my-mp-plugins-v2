@@ -119,8 +119,9 @@ async def protect_personal_dashboard(request: Request, call_next):
     path = request.url.path
     public = path == "/health" or path.startswith("/v1/") or path.startswith("/oauth/callback") or path in {"/admin/login", "/admin/logout"}
     if public or _admin_token_valid(request.cookies.get(ADMIN_COOKIE)):
-        if path == "/" and _admin_token_valid(request.cookies.get(ADMIN_COOKIE)):
-            return RedirectResponse("/rankings", status_code=303)
+        modern_routes = {"/": "/rankings", "/web/rankings": "/rankings", "/web/discover": "/explore"}
+        if path in modern_routes and _admin_token_valid(request.cookies.get(ADMIN_COOKIE)):
+            return RedirectResponse(modern_routes[path], status_code=303)
         return await call_next(request)
     if path.startswith("/api/"):
         return HTMLResponse('{"detail":"管理会话已失效，请重新登录"}', status_code=401, media_type="application/json")
