@@ -34,6 +34,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .explore import RANKINGS, TMDBProvider, filter_metadata, registry
+from .douban import DoubanProvider
 from .explore_ui import explore_html
 from .subscriptions_ui import subscriptions_html
 from .tasks_ui import tasks_html
@@ -337,6 +338,13 @@ def explore_tmdb_provider() -> TMDBProvider:
     return TMDBProvider(token, row["tmdb_language"] if row else "zh-CN", row["tmdb_region"] if row else "CN", REQUEST_TIMEOUT)
 
 
+_douban_provider = DoubanProvider(timeout=REQUEST_TIMEOUT)
+
+
+def explore_douban_provider() -> DoubanProvider:
+    return _douban_provider
+
+
 def valid_installation_id(value: str) -> str:
     value = (value or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{12,128}", value):
@@ -548,7 +556,13 @@ async def explore_discover(
     provider: str = Query("tmdb"), media_type: str = Query("movie", pattern="^(movie|tv)$"),
     region: str = Query(""), language: str = Query(""), genre: str = Query(""), year: str = Query(""),
     sort: str = Query("popularity.desc"), rating: float = Query(0, ge=0, le=10), page: int = Query(1, ge=1),
+    category: str = Query(""),
 ) -> dict[str, Any]:
+    if provider == "douban":
+        selected = category or ("hot-tv" if media_type == "tv" else "hot-movie")
+        if selected == "top250" and media_type == "tv":
+            selected = "hot-tv"
+        return await explore_douban_provider().discover(selected, page)
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:
         return {"items": [], "page": page, "total_pages": 0, "has_more": False, "provider": provider, "configured": False, "error": "该数据源尚未配置，请在设置页面填写 TMDB API Key。"}
@@ -568,7 +582,7 @@ async def explore_rankings() -> dict[str, Any]:
 
 RANKING_PROVIDERS: tuple[dict[str, Any], ...] = (
     {"id": "tmdb", "name": "TheMovieDB", "logo": "🎬", "enabled": True, "kind": "tmdb"},
-    {"id": "douban", "name": "豆瓣", "logo": "豆", "enabled": False, "kind": "unavailable"},
+    {"id": "douban", "name": "豆瓣", "logo": "豆", "enabled": True, "kind": "douban"},
     {"id": "netflix", "name": "Netflix", "logo": "N", "enabled": True, "kind": "watch_provider"},
     {"id": "max", "name": "HBO Max", "logo": "▣", "enabled": True, "kind": "watch_provider"},
     {"id": "prime", "name": "Prime Video", "logo": "▶", "enabled": True, "kind": "watch_provider"},
@@ -583,7 +597,7 @@ async def explore_ranking_providers() -> dict[str, Any]:
         row = conn.execute("SELECT * FROM web_settings WHERE installation_id = ?", (WEB_INSTALLATION_ID,)).fetchone()
     result = []
     for provider in RANKING_PROVIDERS:
-        configured = False
+        configured = provider["kind"] == "douban"
         if provider["kind"] in {"tmdb", "watch_provider"}:
             configured = bool(row and row["tmdb_api_key"]) or bool(os.getenv("TMDB_API_KEY", "").strip())
         result.append({**provider, "configured": configured, "status": "connected" if configured else ("unavailable" if provider["kind"] == "unavailable" else "unconfigured")})
@@ -592,6 +606,10 @@ async def explore_ranking_providers() -> dict[str, Any]:
 
 @app.get("/api/explore/ranking/{provider}/{ranking}")
 async def explore_ranking(provider: str, ranking: str, page: int = Query(1, ge=1)) -> dict[str, Any]:
+    if provider == "douban":
+        mapping = {"popular-movie": "hot-movie", "popular-tv": "hot-tv", "top-movie": "high-movie", "top-tv": "high-tv", "top250": "top250"}
+        category = mapping.get(ranking, "hot-movie")
+        return await explore_douban_provider().discover(category, page)
     if provider != "tmdb":
         info = next((item for item in RANKING_PROVIDERS if item["id"] == provider), None)
         if not info:

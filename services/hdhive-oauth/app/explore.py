@@ -208,7 +208,7 @@ class TMDBProvider:
 def registry(tmdb_configured: bool) -> list[dict[str, Any]]:
     common = ("discover", "rankings", "filters", "pagination", "details")
     providers = [ProviderInfo("tmdb", "TheMovieDB", "🎬", tmdb_configured, common)]
-    providers.append(ProviderInfo("douban", "豆瓣", "🟢", False, ("rankings",)))
+    providers.append(ProviderInfo("douban", "豆瓣", "豆", True, ("discover", "rankings", "pagination", "details")))
     for key, (name, _) in STREAMING_NAMES.items():
         providers.append(ProviderInfo(key, name, "▶", tmdb_configured, ("discover", "filters", "pagination")))
     return [provider.as_dict() for provider in providers]
