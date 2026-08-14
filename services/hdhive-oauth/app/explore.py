@@ -168,6 +168,22 @@ class TMDBProvider:
             params["with_watch_providers"] = watch_id
             if watch_region:
                 params["watch_region"] = watch_region
+        if platform in STREAMING_NAMES and not watch_region:
+            # TMDB requires a region for watch-provider discovery. For “all
+            # regions”, query a representative set and merge by TMDB id.
+            merged: dict[Any, dict[str, Any]] = {}
+            cached = True
+            for region_code in ("US", "GB", "CA", "AU", "JP", "KR", "DE", "FR"):
+                regional = dict(params)
+                regional["watch_region"] = region_code
+                payload, was_cached = await self.request(f"/discover/{media_type}", regional, ttl=600)
+                cached = cached and was_cached
+                for item in payload.get("results", []):
+                    if item.get("id") is not None:
+                        merged[item["id"]] = item
+            raw_items = list(merged.values())
+            items = [self.normalize(item, media_type, platform) for item in raw_items]
+            return {"items": items, "page": page, "page_size": len(items), "total": len(items), "total_pages": 1, "has_more": False, "provider": platform, "source": "tmdb-discover", "cached": cached, "configured": True, "error": None}
         payload, cached = await self.request(f"/discover/{media_type}", params, ttl=600)
         items = [self.normalize(item, media_type, platform or "tmdb") for item in payload.get("results", [])]
         return {"items": items, "page": payload.get("page", page), "page_size": len(items), "total": payload.get("total_results", 0), "total_pages": payload.get("total_pages", 0), "has_more": page < int(payload.get("total_pages", 0)), "provider": platform or "tmdb", "source": "tmdb-discover", "cached": cached, "configured": True, "error": None}
