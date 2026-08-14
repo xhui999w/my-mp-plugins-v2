@@ -112,6 +112,20 @@ class OAuthServiceTests(unittest.TestCase):
             failed = self.client.post(f"/v1/subscriptions/{created['id']}/run", headers=self.headers).json()
         self.assertEqual(failed["status"], "failed")
 
+    def test_explore_result_can_create_subscription_with_poster(self):
+        with main.database() as conn:
+            conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND tmdb_id=9911", (main.WEB_INSTALLATION_ID,))
+        with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": []})), patch.object(main, "search_resources", new=AsyncMock(return_value={"items": []})):
+            result = self.client.post("/web/query", data={"title": "遨游订阅测试", "media_type": "movie", "tmdb_id": 9911, "year": "2026", "poster": "https://image.example/poster.jpg"})
+        self.assertIn("订阅这部影视", result.text)
+        created = self.client.post("/web/subscribe", data={"title": "遨游订阅测试", "media_type": "movie", "tmdb_id": 9911, "year": "2026", "poster": "https://image.example/poster.jpg"}, follow_redirects=False)
+        self.assertEqual(created.status_code, 303)
+        with main.database() as conn:
+            item = conn.execute("SELECT year,poster FROM web_subscriptions WHERE installation_id=? AND tmdb_id=9911", (main.WEB_INSTALLATION_ID,)).fetchone()
+            conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND tmdb_id=9911", (main.WEB_INSTALLATION_ID,))
+        self.assertEqual(item["year"], 2026)
+        self.assertEqual(item["poster"], "https://image.example/poster.jpg")
+
     def test_oauth_callback_stores_only_encrypted_tokens(self):
         expires = int(main.time.time()) + 300
         signature = main.sign_start(self.installation_id, expires)

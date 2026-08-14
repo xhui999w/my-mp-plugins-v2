@@ -585,7 +585,7 @@ def _resource_items(payload: Any) -> list[dict[str, Any]]:
     return _resource_items(nested) if nested is not payload else []
 
 
-def _resource_page(title: str, payload: Any, status_code: int = 200) -> HTMLResponse:
+def _resource_page(title: str, payload: Any, status_code: int = 200, media_type: str = "", tmdb_id: int = 0, year: str = "", poster: str = "") -> HTMLResponse:
     safe_title = html.escape(title or "该影视")
     items = _resource_items(payload)
     cards: list[str] = []
@@ -609,16 +609,22 @@ def _resource_page(title: str, payload: Any, status_code: int = 200) -> HTMLResp
         body = f"<p>已找到 {len(cards)} 条影巢资源，选择需要的版本：</p>" + "".join(cards)
     else:
         body = f"<div class='empty'><h3>影巢暂时没有《{safe_title}》的可用资源</h3><p>这不是程序报错，只是影巢当前没有返回匹配链接。可以稍后再试，或返回遨游选择其他影片。</p></div>"
+    subscribe = ""
+    if media_type in ("movie", "tv") and tmdb_id > 0:
+        subscribe = ("<form method='post' action='/web/subscribe' style='display:inline-block;margin-right:10px'>"
+                     f"<input type='hidden' name='title' value='{html.escape(title, quote=True)}'><input type='hidden' name='media_type' value='{media_type}'>"
+                     f"<input type='hidden' name='tmdb_id' value='{tmdb_id}'><input type='hidden' name='year' value='{html.escape(year, quote=True)}'>"
+                     f"<input type='hidden' name='poster' value='{html.escape(poster, quote=True)}'><button>＋ 订阅这部影视</button></form>")
     return HTMLResponse(
         "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>{safe_title} - 影巢资源</title><style>body{{margin:0;background:#0b0906;color:#eee;font:16px system-ui,'Microsoft YaHei';padding:28px}}main{{max-width:920px;margin:auto}}h1,h3{{color:#e1bd70}}article,.empty{{background:#1d1912;border:1px solid #59401e;border-radius:14px;padding:18px;margin:14px 0}}button,.back{{display:inline-block;border:1px solid #b28036;border-radius:9px;background:#2a1d0d;color:#ffd98d;padding:10px 16px;text-decoration:none;cursor:pointer}}p{{color:#bdb3a3;line-height:1.7}}</style>"
-        f"<main><h1>《{safe_title}》影巢资源</h1>{body}<a class='back' href='/explore'>返回遨游</a></main></html>",
+        f"<main><h1>《{safe_title}》影巢资源</h1>{body}{subscribe}<a class='back' href='/explore'>返回遨游</a></main></html>",
         status_code=status_code,
     )
 
 
 @app.post("/web/query", response_class=HTMLResponse)
-async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...), title: str = Form("")) -> HTMLResponse:
+async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...), title: str = Form(""), year: str = Form(""), poster: str = Form("")) -> HTMLResponse:
     try:
         data = await query_resources(ResourceQuery(media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
         if not _resource_items(data) and title.strip():
@@ -628,9 +634,9 @@ async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...), title
                     data = searched
             except HTTPException:
                 pass
-        return _resource_page(title.strip() or f"TMDB {tmdb_id}", data)
+        return _resource_page(title.strip() or f"TMDB {tmdb_id}", data, media_type=media_type, tmdb_id=tmdb_id, year=year, poster=poster)
     except HTTPException as exc:
-        return _resource_page(title.strip() or f"TMDB {tmdb_id}", {}, exc.status_code)
+        return _resource_page(title.strip() or f"TMDB {tmdb_id}", {}, exc.status_code, media_type, tmdb_id, year, poster)
 
 
 @app.post("/web/search", response_class=HTMLResponse)
@@ -642,13 +648,14 @@ async def web_search(keyword: str = Form(...), media_type: str = Form("movie")) 
         return _result_page("Search failed", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
 
 
-@app.post("/web/subscribe", response_class=HTMLResponse)
-def web_subscribe(title: str = Form(...), media_type: str = Form(...), tmdb_id: int = Form(...)) -> HTMLResponse:
+@app.post("/web/subscribe")
+def web_subscribe(title: str = Form(...), media_type: str = Form(...), tmdb_id: int = Form(...), year: str = Form(""), poster: str = Form("")) -> RedirectResponse:
     try:
-        result = create_subscription(SubscriptionRequest(title=title, media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
-        return _result_page("Subscription added", result)
+        parsed_year = int(year) if year.isdigit() else None
+        create_subscription(SubscriptionRequest(title=title, media_type=media_type, tmdb_id=tmdb_id, year=parsed_year, poster=poster), WEB_INSTALLATION_ID)
+        return RedirectResponse("/subscriptions", status_code=303)
     except HTTPException as exc:
-        return _result_page("Subscription failed", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
+        raise exc
 
 
 @app.post("/web/resolve", response_class=HTMLResponse)
