@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from .explore import RANKINGS, TMDBProvider, filter_metadata, registry
 from .explore_ui import explore_html
+from .subscriptions_ui import subscriptions_html
 
 
 def required_env(name: str) -> str:
@@ -116,6 +117,16 @@ def init_database() -> None:
             status TEXT NOT NULL DEFAULT 'active',
             created_at INTEGER NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS subscription_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            subscription_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            resource_count INTEGER DEFAULT 0,
+            transfer_count INTEGER DEFAULT 0,
+            error TEXT DEFAULT '',
+            created_at INTEGER NOT NULL
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS web_settings (
             installation_id TEXT PRIMARY KEY,
             moviepilot_url TEXT DEFAULT '',
@@ -134,6 +145,21 @@ def init_database() -> None:
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE web_settings ADD COLUMN {name} {definition}")
+        subscription_columns = {row[1] for row in conn.execute("PRAGMA table_info(web_subscriptions)")}
+        for name, definition in (
+            ("year", "INTEGER"), ("original_title", "TEXT DEFAULT ''"),
+            ("poster", "TEXT DEFAULT ''"), ("season", "TEXT DEFAULT ''"),
+            ("subscription_scope", "TEXT DEFAULT '普通订阅'"),
+            ("category", "TEXT DEFAULT ''"), ("save_path", "TEXT DEFAULT ''"),
+            ("updated_at", "INTEGER DEFAULT 0"), ("douban_id", "TEXT DEFAULT ''"),
+            ("moviepilot_id", "TEXT DEFAULT ''"), ("error", "TEXT DEFAULT ''"),
+            ("last_run_at", "INTEGER DEFAULT 0"),
+        ):
+            if name not in subscription_columns:
+                conn.execute(f"ALTER TABLE web_subscriptions ADD COLUMN {name} {definition}")
+        transfer_columns = {row[1] for row in conn.execute("PRAGMA table_info(transfer_records)")}
+        if "subscription_id" not in transfer_columns:
+            conn.execute("ALTER TABLE transfer_records ADD COLUMN subscription_id INTEGER")
 
 
 @app.on_event("startup")
@@ -476,13 +502,10 @@ def web_discover() -> HTMLResponse:
     return _web_layout("资源发现", content)
 
 
+@app.get("/subscriptions", response_class=HTMLResponse)
 @app.get("/web/subscriptions", response_class=HTMLResponse)
 def web_subscriptions() -> HTMLResponse:
-    with database() as conn:
-        rows = conn.execute("SELECT title, media_type, tmdb_id, status, created_at FROM web_subscriptions WHERE installation_id = ? ORDER BY id DESC", (WEB_INSTALLATION_ID,)).fetchall()
-    table = "".join(f"<tr><td>{html.escape(str(r['title']))}</td><td>{r['media_type']}</td><td>{r['tmdb_id']}</td><td>{r['status']}</td><td>{r['created_at']}</td></tr>" for r in rows) or "<tr><td colspan='5'>No subscriptions yet</td></tr>"
-    content = _web_account_card() + "<div class='card'><h2>Add subscription</h2><form method='post' action='/web/subscribe'><input name='title' placeholder='Title' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Add</button></form></div><div class='card'><h2>Current subscriptions</h2><table><tr><th>Title</th><th>Type</th><th>TMDB</th><th>Status</th><th>Created</th></tr>" + table + "</table></div>"
-    return _web_layout("订阅列表", content)
+    return HTMLResponse(subscriptions_html())
 
 
 @app.get("/web/unlocks", response_class=HTMLResponse)
@@ -828,6 +851,14 @@ class SubscriptionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     media_type: str = Field(pattern="^(movie|tv)$")
     tmdb_id: int = Field(gt=0)
+    year: int | None = Field(default=None, ge=1880, le=2200)
+    poster: str = Field(default="", max_length=1000)
+    season: str = Field(default="", max_length=30)
+    subscription_scope: str = Field(default="普通订阅", max_length=50)
+    category: str = Field(default="", max_length=100)
+    save_path: str = Field(default="", max_length=500)
+    douban_id: str = Field(default="", max_length=50)
+    moviepilot_id: str = Field(default="", max_length=100)
 
 
 class SearchRequest(BaseModel):
@@ -906,22 +937,148 @@ def create_subscription(
     request: SubscriptionRequest,
     installation_id: str = Depends(require_installation),
 ) -> dict[str, Any]:
+    now = int(time.time())
     with database() as conn:
+        existing = conn.execute(
+            "SELECT id, status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1",
+            (installation_id, request.media_type, request.tmdb_id, request.season.strip()),
+        ).fetchone()
+        if existing:
+            return {"id": existing["id"], "status": existing["status"], "duplicate": True, **request.model_dump()}
         cur = conn.execute(
-            "INSERT INTO web_subscriptions (installation_id, title, media_type, tmdb_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (installation_id, request.title.strip(), request.media_type, request.tmdb_id, int(time.time())),
+            """INSERT INTO web_subscriptions
+               (installation_id,title,media_type,tmdb_id,year,poster,season,subscription_scope,category,save_path,douban_id,moviepilot_id,status,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (installation_id, request.title.strip(), request.media_type, request.tmdb_id, request.year,
+             request.poster.strip(), request.season.strip(), request.subscription_scope.strip() or "普通订阅",
+             request.category.strip(), request.save_path.strip(), request.douban_id.strip(),
+             request.moviepilot_id.strip(), "active", now, now),
         )
         return {"id": cur.lastrowid, "status": "active", **request.model_dump()}
 
 
 @app.get("/v1/subscriptions")
-def list_subscriptions(installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+def list_subscriptions(
+    tab: str = Query("current", pattern="^(current|history|all)$"),
+    search: str = Query("", max_length=100), media_type: str = Query("", pattern="^(|movie|tv)$"),
+    year: int | None = Query(None, ge=1880, le=2200), status: str = Query("", max_length=40),
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    sort: str = Query("created_desc", pattern="^(created_desc|created_asc|updated_desc|title_asc)$"),
+    installation_id: str = Depends(require_installation),
+) -> dict[str, Any]:
+    return subscription_page(installation_id, tab, search, media_type, year, status, page, page_size, sort)
+
+
+TERMINAL_SUBSCRIPTION_STATUSES = ("completed", "cancelled", "failed", "expired")
+
+
+def subscription_page(installation_id: str, tab: str = "current", search: str = "", media_type: str = "", year: int | None = None, status: str = "", page: int = 1, page_size: int = 20, sort: str = "created_desc") -> dict[str, Any]:
+    conditions = ["s.installation_id = ?"]
+    params: list[Any] = [installation_id]
+    marks = ",".join("?" for _ in TERMINAL_SUBSCRIPTION_STATUSES)
+    if tab == "current":
+        conditions.append(f"s.status NOT IN ({marks})")
+        params.extend(TERMINAL_SUBSCRIPTION_STATUSES)
+    elif tab == "history":
+        conditions.append(f"s.status IN ({marks})")
+        params.extend(TERMINAL_SUBSCRIPTION_STATUSES)
+    if search.strip():
+        conditions.append("(s.title LIKE ? OR s.original_title LIKE ?)")
+        needle = f"%{search.strip()}%"; params.extend((needle, needle))
+    if media_type:
+        conditions.append("s.media_type = ?"); params.append(media_type)
+    if year:
+        conditions.append("s.year = ?"); params.append(year)
+    if status:
+        conditions.append("s.status = ?"); params.append(status)
+    order = {"created_desc": "s.created_at DESC", "created_asc": "s.created_at ASC", "updated_desc": "s.updated_at DESC", "title_asc": "s.title COLLATE NOCASE ASC"}.get(sort, "s.created_at DESC")
+    where = " AND ".join(conditions)
     with database() as conn:
-        rows = conn.execute(
-            "SELECT id, title, media_type, tmdb_id, status, created_at FROM web_subscriptions WHERE installation_id = ? ORDER BY id DESC",
-            (installation_id,),
+        total = conn.execute(f"SELECT COUNT(*) FROM web_subscriptions s WHERE {where}", params).fetchone()[0]
+        rows = conn.execute(f"""SELECT s.*,
+            (SELECT COUNT(*) FROM subscription_runs r WHERE r.subscription_id=s.id) AS unlock_count,
+            (SELECT COUNT(*) FROM transfer_records t WHERE t.installation_id=s.installation_id AND (t.subscription_id=s.id OR (t.subscription_id IS NULL AND t.name=s.title))) AS transfer_count,
+            (SELECT COUNT(*) FROM transfer_records t WHERE t.installation_id=s.installation_id AND (t.subscription_id=s.id OR (t.subscription_id IS NULL AND t.name=s.title)) AND t.status='resolved') AS saved_count
+            FROM web_subscriptions s WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?""",
+            [*params, page_size, (page - 1) * page_size],
         ).fetchall()
-    return {"items": [dict(row) for row in rows]}
+        counts = conn.execute("SELECT SUM(status NOT IN ('completed','cancelled','failed','expired')), SUM(status IN ('completed','cancelled','failed','expired')) FROM web_subscriptions WHERE installation_id=?", (installation_id,)).fetchone()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size, "total": total, "total_pages": total_pages, "has_more": page < total_pages, "current_count": counts[0] or 0, "history_count": counts[1] or 0}
+
+
+def subscription_detail(installation_id: str, subscription_id: int) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT * FROM web_subscriptions WHERE id=? AND installation_id=?", (subscription_id, installation_id)).fetchone()
+        if not row:
+            raise HTTPException(404, "订阅不存在")
+        runs = conn.execute("SELECT id,status,resource_count,transfer_count,error,created_at FROM subscription_runs WHERE subscription_id=? ORDER BY id DESC LIMIT 20", (subscription_id,)).fetchall()
+        transfers = conn.execute("SELECT id,slug,name,share_url,status,error,created_at FROM transfer_records WHERE installation_id=? AND (subscription_id=? OR (subscription_id IS NULL AND name=?)) ORDER BY id DESC LIMIT 50", (installation_id, subscription_id, row["title"])).fetchall()
+    return {"subscription": dict(row), "runs": [dict(x) for x in runs], "transfers": [dict(x) for x in transfers]}
+
+
+@app.get("/v1/subscriptions/{subscription_id}")
+def get_subscription(subscription_id: int, installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    return subscription_detail(installation_id, subscription_id)
+
+
+@app.delete("/v1/subscriptions/{subscription_id}")
+def delete_subscription(subscription_id: int, installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    with database() as conn:
+        cur = conn.execute("UPDATE web_subscriptions SET status='cancelled', updated_at=? WHERE id=? AND installation_id=?", (int(time.time()), subscription_id, installation_id))
+        if not cur.rowcount:
+            raise HTTPException(404, "订阅不存在")
+    return {"ok": True, "deleted_files": False, "status": "cancelled"}
+
+
+async def execute_subscription(installation_id: str, subscription_id: int) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute("SELECT * FROM web_subscriptions WHERE id=? AND installation_id=?", (subscription_id, installation_id)).fetchone()
+        if not row:
+            raise HTTPException(404, "订阅不存在")
+        conn.execute("UPDATE web_subscriptions SET status='running', error='', updated_at=?, last_run_at=? WHERE id=?", (int(time.time()), int(time.time()), subscription_id))
+    try:
+        payload = await query_resources(ResourceQuery(media_type=row["media_type"], tmdb_id=row["tmdb_id"]), installation_id)
+        count = len(_resource_items(payload))
+        new_status = "resource_found" if count else "waiting_output"
+        error = ""
+    except HTTPException as exc:
+        count = 0; new_status = "failed"; error = str(exc.detail)
+    now = int(time.time())
+    with database() as conn:
+        cur = conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,error,created_at) VALUES (?,?,?,?,?,?)", (installation_id, subscription_id, new_status, count, error, now))
+        conn.execute("UPDATE web_subscriptions SET status=?, error=?, updated_at=? WHERE id=?", (new_status, error, now, subscription_id))
+    return {"ok": new_status != "failed", "run_id": cur.lastrowid, "status": new_status, "resource_count": count, "error": error}
+
+
+@app.post("/v1/subscriptions/{subscription_id}/run")
+async def run_subscription(subscription_id: int, installation_id: str = Depends(require_installation)) -> dict[str, Any]:
+    return await execute_subscription(installation_id, subscription_id)
+
+
+@app.get("/api/web/subscriptions")
+def web_subscription_list(
+    tab: str = Query("current", pattern="^(current|history|all)$"), search: str = Query("", max_length=100),
+    media_type: str = Query("", pattern="^(|movie|tv)$"), year: int | None = Query(None, ge=1880, le=2200),
+    status: str = Query("", max_length=40), page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100),
+    sort: str = Query("created_desc", pattern="^(created_desc|created_asc|updated_desc|title_asc)$"),
+) -> dict[str, Any]:
+    return subscription_page(WEB_INSTALLATION_ID, tab, search, media_type, year, status, page, page_size, sort)
+
+
+@app.get("/api/web/subscriptions/{subscription_id}")
+def web_subscription_detail(subscription_id: int) -> dict[str, Any]:
+    return subscription_detail(WEB_INSTALLATION_ID, subscription_id)
+
+
+@app.post("/api/web/subscriptions/{subscription_id}/run")
+async def web_subscription_run(subscription_id: int) -> dict[str, Any]:
+    return await execute_subscription(WEB_INSTALLATION_ID, subscription_id)
+
+
+@app.delete("/api/web/subscriptions/{subscription_id}")
+def web_subscription_delete(subscription_id: int) -> dict[str, Any]:
+    return delete_subscription(subscription_id, WEB_INSTALLATION_ID)
 
 
 class WebSettings(BaseModel):

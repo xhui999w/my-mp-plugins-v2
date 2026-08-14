@@ -35,6 +35,10 @@ class OAuthServiceTests(unittest.TestCase):
             "X-Installation-ID": self.installation_id,
             "X-Installation-Key": "installation-secret",
         }
+        with main.database() as conn:
+            conn.execute("DELETE FROM subscription_runs WHERE installation_id=?", (self.installation_id,))
+            conn.execute("DELETE FROM transfer_records WHERE installation_id=?", (self.installation_id,))
+            conn.execute("DELETE FROM web_subscriptions WHERE installation_id=?", (self.installation_id,))
 
     def test_health(self):
         self.assertEqual(self.client.get("/health").json()["ok"], True)
@@ -65,6 +69,48 @@ class OAuthServiceTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.client.get("/v1/subscriptions", headers=self.headers).json()["items"]), 1)
+
+    def test_subscription_pagination_search_and_filters(self):
+        now = int(main.time.time())
+        with main.database() as conn:
+            for index in range(15):
+                conn.execute(
+                    """INSERT INTO web_subscriptions
+                       (installation_id,title,media_type,tmdb_id,year,status,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (self.installation_id, f"测试剧集 {index}", "tv" if index % 2 else "movie", 1000 + index, 2025 + index % 2, "active", now + index, now + index),
+                )
+        page = self.client.get("/v1/subscriptions", headers=self.headers, params={"page": 2, "page_size": 5}).json()
+        self.assertEqual(page["total"], 15)
+        self.assertEqual(len(page["items"]), 5)
+        self.assertEqual(page["total_pages"], 3)
+        filtered = self.client.get("/v1/subscriptions", headers=self.headers, params={"search": "剧集 1", "media_type": "tv", "year": 2026}).json()
+        self.assertTrue(filtered["items"])
+        self.assertTrue(all(x["media_type"] == "tv" and x["year"] == 2026 for x in filtered["items"]))
+
+    def test_subscription_history_delete_and_detail_aggregation(self):
+        created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": "聚合测试", "media_type": "movie", "tmdb_id": 7788, "year": 2026}).json()
+        sub_id = created["id"]
+        with main.database() as conn:
+            conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,created_at) VALUES (?,?,?,?,?)", (self.installation_id, sub_id, "resource_found", 3, int(main.time.time())))
+            conn.execute("INSERT INTO transfer_records (installation_id,subscription_id,slug,name,status,created_at) VALUES (?,?,?,?,?,?)", (self.installation_id, sub_id, "slug-one", "聚合测试", "resolved", int(main.time.time())))
+        detail = self.client.get(f"/v1/subscriptions/{sub_id}", headers=self.headers).json()
+        self.assertEqual(len(detail["runs"]), 1)
+        self.assertEqual(len(detail["transfers"]), 1)
+        self.assertEqual(self.client.get("/v1/subscriptions", headers=self.headers).json()["items"][0]["saved_count"], 1)
+        deleted = self.client.delete(f"/v1/subscriptions/{sub_id}", headers=self.headers).json()
+        self.assertFalse(deleted["deleted_files"])
+        self.assertEqual(self.client.get("/v1/subscriptions", headers=self.headers, params={"tab": "current"}).json()["total"], 0)
+        self.assertEqual(self.client.get("/v1/subscriptions", headers=self.headers, params={"tab": "history"}).json()["total"], 1)
+
+    def test_subscription_manual_run_and_error(self):
+        created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": "执行测试", "media_type": "movie", "tmdb_id": 8899}).json()
+        with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": [{"slug": "hit"}]})):
+            result = self.client.post(f"/v1/subscriptions/{created['id']}/run", headers=self.headers).json()
+        self.assertEqual(result["status"], "resource_found")
+        with patch.object(main, "query_resources", new=AsyncMock(side_effect=main.HTTPException(502, "上游不可用"))):
+            failed = self.client.post(f"/v1/subscriptions/{created['id']}/run", headers=self.headers).json()
+        self.assertEqual(failed["status"], "failed")
 
     def test_oauth_callback_stores_only_encrypted_tokens(self):
         expires = int(main.time.time()) + 300
