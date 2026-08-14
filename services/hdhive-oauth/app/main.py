@@ -548,13 +548,66 @@ def _result_page(title: str, payload: Any, status_code: int = 200) -> HTMLRespon
     )
 
 
+def _resource_items(payload: Any) -> list[dict[str, Any]]:
+    """Accept the response envelopes used by different HDHive API versions."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("items", "resources", "list", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    nested = payload.get("data")
+    return _resource_items(nested) if nested is not payload else []
+
+
+def _resource_page(title: str, payload: Any, status_code: int = 200) -> HTMLResponse:
+    safe_title = html.escape(title or "该影视")
+    items = _resource_items(payload)
+    cards: list[str] = []
+    for item in items:
+        name = html.escape(str(item.get("title") or item.get("name") or title or "影巢资源"))
+        slug = str(item.get("slug") or item.get("resource_slug") or "").strip()
+        quality = html.escape(str(item.get("quality") or item.get("resolution") or ""))
+        size = html.escape(str(item.get("size") or item.get("file_size") or ""))
+        points = html.escape(str(item.get("unlock_points") or item.get("points") or ""))
+        details = " · ".join(value for value in (quality, size, f"{points} 积分" if points else "") if value)
+        button = ""
+        if re.fullmatch(r"[A-Za-z0-9-]+", slug):
+            button = (
+                "<form method='post' action='/web/resolve'>"
+                f"<input type='hidden' name='slug' value='{html.escape(slug, quote=True)}'>"
+                "<input type='hidden' name='max_unlock_points' value='0'>"
+                "<button>解锁并获取 115 链接</button></form>"
+            )
+        cards.append(f"<article><h3>{name}</h3><p>{details or '影巢资源'}</p>{button}</article>")
+    if cards:
+        body = f"<p>已找到 {len(cards)} 条影巢资源，选择需要的版本：</p>" + "".join(cards)
+    else:
+        body = f"<div class='empty'><h3>影巢暂时没有《{safe_title}》的可用资源</h3><p>这不是程序报错，只是影巢当前没有返回匹配链接。可以稍后再试，或返回遨游选择其他影片。</p></div>"
+    return HTMLResponse(
+        "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{safe_title} - 影巢资源</title><style>body{{margin:0;background:#0b0906;color:#eee;font:16px system-ui,'Microsoft YaHei';padding:28px}}main{{max-width:920px;margin:auto}}h1,h3{{color:#e1bd70}}article,.empty{{background:#1d1912;border:1px solid #59401e;border-radius:14px;padding:18px;margin:14px 0}}button,.back{{display:inline-block;border:1px solid #b28036;border-radius:9px;background:#2a1d0d;color:#ffd98d;padding:10px 16px;text-decoration:none;cursor:pointer}}p{{color:#bdb3a3;line-height:1.7}}</style>"
+        f"<main><h1>《{safe_title}》影巢资源</h1>{body}<a class='back' href='/explore'>返回遨游</a></main></html>",
+        status_code=status_code,
+    )
+
+
 @app.post("/web/query", response_class=HTMLResponse)
-async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...)) -> HTMLResponse:
+async def web_query(media_type: str = Form(...), tmdb_id: int = Form(...), title: str = Form("")) -> HTMLResponse:
     try:
         data = await query_resources(ResourceQuery(media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
-        return _result_page("影巢资源查询结果", data)
+        if not _resource_items(data) and title.strip():
+            try:
+                searched = await search_resources(SearchRequest(keyword=title.strip(), media_type=media_type), WEB_INSTALLATION_ID)
+                if _resource_items(searched):
+                    data = searched
+            except HTTPException:
+                pass
+        return _resource_page(title.strip() or f"TMDB {tmdb_id}", data)
     except HTTPException as exc:
-        return _result_page("查询失败", {"status": exc.status_code, "detail": exc.detail}, exc.status_code)
+        return _resource_page(title.strip() or f"TMDB {tmdb_id}", {}, exc.status_code)
 
 
 @app.post("/web/search", response_class=HTMLResponse)
