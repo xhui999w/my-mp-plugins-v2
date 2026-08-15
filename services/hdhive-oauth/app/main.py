@@ -578,7 +578,7 @@ async def explore_discover(
         # Douban's public list endpoint does not expose all TMDB-style filters.
         # Apply the filters we can safely verify instead of silently returning
         # the same unfiltered list when the user chooses a year.
-        if year.isdigit():
+        if year.isdigit() and any(item.get("year") for item in result.get("items", [])):
             result["items"] = [item for item in result.get("items", []) if item.get("year") == year]
             result["total"] = len(result["items"])
             result["page_size"] = len(result["items"])
