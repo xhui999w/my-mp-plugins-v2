@@ -12,6 +12,8 @@ concurrency:
   group: hdhive-production
   cancel-in-progress: true
 
+# Deployment is intentionally serialized so two updates cannot restart the service at once.
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
