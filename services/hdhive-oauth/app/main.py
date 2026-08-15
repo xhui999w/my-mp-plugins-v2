@@ -571,6 +571,16 @@ async def explore_discover(
     category: str = Query(""),
 ) -> dict[str, Any]:
     if provider == "douban":
+        unsupported = []
+        if region: unsupported.append("地区")
+        if genre: unsupported.append("风格")
+        if language: unsupported.append("语言")
+        if year: unsupported.append("年份")
+        if rating: unsupported.append("评分")
+        if unsupported:
+            return {"items": [], "page": page, "page_size": 0, "total": 0, "total_pages": 0,
+                    "has_more": False, "provider": "douban", "configured": True,
+                    "unsupported": unsupported, "error": "豆瓣公开榜单暂不支持：" + "、".join(unsupported) + "。请选择‘全部’或切换到 TMDB。"}
         selected = category or ("hot-tv" if media_type == "tv" else "hot-movie")
         if selected == "top250" and media_type == "tv":
             selected = "hot-tv"

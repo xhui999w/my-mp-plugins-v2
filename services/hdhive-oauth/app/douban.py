@@ -36,6 +36,12 @@ class DoubanProvider:
         # Public Douban lists do not require a user credential.
         return True
 
+    @property
+    def capabilities(self) -> dict[str, bool]:
+        return {"supports_region": False, "supports_year": False, "supports_genre": False,
+                "supports_language": False, "supports_sort": False, "supports_rating": False,
+                "supports_media_type": True, "supports_pagination": True}
+
     @staticmethod
     def _number(value: Any) -> float:
         try:
