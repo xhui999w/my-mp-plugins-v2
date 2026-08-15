@@ -585,6 +585,9 @@ async def explore_discover(
         if selected == "top250" and media_type == "tv":
             selected = "hot-tv"
         result = await explore_douban_provider().discover(selected, page)
+        # Expose the provider contract with every response so the UI can
+        # never mistake an unsupported filter for an empty result set.
+        result["capabilities"] = explore_douban_provider().capabilities
         # Douban's public list endpoint does not expose all TMDB-style filters.
         # Apply the filters we can safely verify instead of silently returning
         # the same unfiltered list when the user chooses a year.
