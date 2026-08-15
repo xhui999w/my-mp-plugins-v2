@@ -610,7 +610,23 @@ async def explore_discover(
 
 
 @app.get("/api/explore/rankings")
-async def explore_rankings() -> dict[str, Any]:
+async def explore_rankings(provider: str = Query("tmdb")) -> dict[str, Any]:
+    """Return categories belonging to the selected ranking provider."""
+    if provider == "douban":
+        return {"items": [
+            {"id": "popular-movie", "name": "热门电影"},
+            {"id": "top-movie", "name": "高分电影"},
+            {"id": "top250", "name": "Top250"},
+            {"id": "popular-tv", "name": "热门电视剧"},
+            {"id": "top-tv", "name": "高分电视剧"},
+        ]}
+    if provider in {"netflix", "max", "prime", "disney", "apple"}:
+        return {"items": [
+            {"id": "popular-movie", "name": "热门电影"},
+            {"id": "popular-tv", "name": "热门电视剧"},
+            {"id": "top-movie", "name": "高分电影"},
+            {"id": "top-tv", "name": "高分电视剧"},
+        ]}
     return {"items": [{"id": key, "name": name} for key, name in RANKINGS.items()]}
 
 
