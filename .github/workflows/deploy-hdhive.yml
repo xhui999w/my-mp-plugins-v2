@@ -6,6 +6,7 @@ on:
     paths:
       - 'services/hdhive-oauth/**'
       - '.github/workflows/deploy-hdhive.yml'
+  workflow_dispatch:
 
 concurrency:
   group: hdhive-production
