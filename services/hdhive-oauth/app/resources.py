@@ -24,6 +24,9 @@ class ResourceItem:
     language: str = ""
     source_type: str = ""
     uploader: str = ""
+    uploader_avatar: str = ""
+    points: int | None = None
+    unlock_count: int | None = None
     publish_time: str = ""
     season: str = ""
     episode: str = ""
@@ -95,6 +98,7 @@ class HDHiveResourceProvider(ResourceProvider):
         if isinstance(tags, str):
             tags = [x.strip() for x in re.split(r"[,/|]", tags) if x.strip()]
         share = str(raw.get("share_url") or raw.get("full_url") or "").strip()
+        user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
         return ResourceItem(
             provider="hdhive", provider_name="影巢", provider_resource_id=slug, title=title,
             original_title=str(raw.get("original_title") or ""),
@@ -102,7 +106,11 @@ class HDHiveResourceProvider(ResourceProvider):
             resolution=str(raw.get("resolution") or raw.get("definition") or ""),
             quality=str(raw.get("quality") or raw.get("source") or ""), size=str(raw.get("size") or raw.get("file_size") or ""),
             subtitle=str(raw.get("subtitle") or raw.get("subtitles") or ""), language=str(raw.get("language") or ""),
-            source_type=str(raw.get("source_type") or raw.get("disk_type") or "115网盘"), uploader=str(raw.get("uploader") or raw.get("author") or ""),
+            source_type=str(raw.get("source_type") or raw.get("disk_type") or raw.get("cloud_type") or raw.get("drive_type") or "115网盘"),
+            uploader=str(raw.get("uploader") or raw.get("author") or raw.get("username") or user.get("name") or ""),
+            uploader_avatar=str(raw.get("uploader_avatar") or raw.get("avatar") or user.get("avatar") or ""),
+            points=int(raw.get("points")) if str(raw.get("points") or "").isdigit() else None,
+            unlock_count=int(raw.get("unlock_count")) if str(raw.get("unlock_count") or "").isdigit() else None,
             publish_time=str(raw.get("publish_time") or raw.get("created_at") or ""), season=str(raw.get("season") or ""), episode=str(raw.get("episode") or ""),
             resource_tags=[str(x) for x in tags], transfer_supported=bool(slug),
         )
@@ -166,4 +174,4 @@ def filter_resources(items: list[ResourceItem], provider: str = "", season: str 
 
 
 def filter_options(items: list[ResourceItem]) -> dict[str, list[str]]:
-    return {key: sorted({str(getattr(item, key)) for item in items if getattr(item, key)}) for key in ("provider", "season", "resolution", "quality", "language", "source_type")}
+    return {key: sorted({str(getattr(item, key)) for item in items if getattr(item, key)}) for key in ("provider", "uploader", "season", "resolution", "quality", "language", "source_type")}

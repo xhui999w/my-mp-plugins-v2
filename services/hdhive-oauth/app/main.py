@@ -39,6 +39,7 @@ from .explore_ui import explore_html
 from .subscriptions_ui import subscriptions_html
 from .tasks_ui import tasks_html
 from .resource_ui import resource_detail_html
+from .search_ui import search_html
 from .resources import HDHiveResourceProvider, ResourceProviderRegistry, filter_options
 from .unlocks_ui import unlocks_html
 from .settings_ui import settings_html
@@ -539,6 +540,11 @@ def resource_detail_page() -> HTMLResponse:
     return HTMLResponse(resource_detail_html())
 
 
+@app.get("/search", response_class=HTMLResponse)
+def media_search_page() -> HTMLResponse:
+    return HTMLResponse(search_html())
+
+
 @app.get("/api/explore/status")
 def explore_status() -> dict[str, Any]:
     tmdb = explore_tmdb_provider()
@@ -673,6 +679,77 @@ async def explore_media(media_type: str, tmdb_id: int) -> dict[str, Any]:
         return {"configured": True, "cached": cached, "data": item, "error": None}
     except Exception as exc:
         return {"configured": True, "data": None, "error": "详情加载失败，请稍后重试。", "detail": type(exc).__name__}
+
+
+@app.get("/api/web/media/search")
+async def web_media_search(keyword: str = Query(..., min_length=1, max_length=200), media_type: str = Query("", pattern="^(|movie|tv)$")) -> dict[str, Any]:
+    """Search normalized media metadata; resource searching remains a separate shared step."""
+    tmdb = explore_tmdb_provider()
+    if not tmdb.configured:
+        raise HTTPException(409, "TMDB 尚未配置，无法匹配影视资料")
+    path = f"/search/{media_type}" if media_type else "/search/multi"
+    payload, cached = await tmdb.request(path, {"query": keyword.strip(), "page": 1}, ttl=300)
+    items: list[dict[str, Any]] = []
+    for raw in payload.get("results", []):
+        kind = media_type or raw.get("media_type")
+        if kind not in ("movie", "tv"):
+            continue
+        items.append(tmdb.normalize(raw, kind))
+    return {"items": items[:30], "total": len(items), "cached": cached}
+
+
+@app.get("/api/web/media/detail")
+async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0)) -> dict[str, Any]:
+    if not tmdb_id:
+        return {"data": None, "seasons": [], "configured": False}
+    tmdb = explore_tmdb_provider()
+    if not tmdb.configured:
+        return {"data": None, "seasons": [], "configured": False}
+    payload, cached = await tmdb.request(f"/{media_type}/{tmdb_id}", {"append_to_response": "credits"}, ttl=3600)
+    item = tmdb.normalize(payload, media_type)
+    item.update({
+        "genres": [x.get("name") for x in payload.get("genres", []) if x.get("name")],
+        "countries": [x.get("name") for x in payload.get("production_countries", []) if x.get("name")],
+        "status": payload.get("status") or "",
+        "actors": [x.get("name") for x in payload.get("credits", {}).get("cast", [])[:10] if x.get("name")],
+        "directors": [x.get("name") for x in payload.get("credits", {}).get("crew", []) if x.get("job") in ("Director", "Series Director") and x.get("name")][:4],
+    })
+    seasons = [{"season_number": x.get("season_number"), "name": x.get("name"), "episode_count": x.get("episode_count") or 0, "air_date": x.get("air_date") or "", "poster": f"https://image.tmdb.org/t/p/w342{x.get('poster_path')}" if x.get("poster_path") else ""} for x in payload.get("seasons", []) if int(x.get("season_number") or 0) >= 0]
+    return {"data": item, "seasons": seasons, "configured": True, "cached": cached}
+
+
+@app.get("/api/web/media/season")
+async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(..., ge=0)) -> dict[str, Any]:
+    tmdb = explore_tmdb_provider()
+    if not tmdb.configured:
+        raise HTTPException(409, "TMDB 尚未配置")
+    payload, cached = await tmdb.request(f"/tv/{tmdb_id}/season/{season}", ttl=3600)
+    emby_configured = False
+    emby_episode_keys: set[tuple[int, int]] = set()
+    with database() as conn:
+        settings = conn.execute("SELECT emby_url,emby_api_key,emby_user_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if settings and settings["emby_url"] and settings["emby_api_key"] and settings["emby_user_id"]:
+        emby_configured = True
+        try:
+            token = _decrypt_optional(settings["emby_api_key"])
+            headers = {"X-Emby-Token": token}
+            params = {"Recursive": "true", "IncludeItemTypes": "Series", "AnyProviderIdEquals": f"tmdb.{tmdb_id}", "Fields": "ProviderIds", "Limit": 5}
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                series_response = await client.get(f"{settings['emby_url'].rstrip('/')}/Users/{settings['emby_user_id']}/Items", headers=headers, params=params)
+                series_response.raise_for_status()
+                series_items = series_response.json().get("Items", [])
+                if series_items:
+                    episode_response = await client.get(f"{settings['emby_url'].rstrip('/')}/Shows/{series_items[0]['Id']}/Episodes", headers=headers, params={"UserId": settings["emby_user_id"], "Season": season, "Fields": "IndexNumber,ParentIndexNumber"})
+                    episode_response.raise_for_status()
+                    for emby_item in episode_response.json().get("Items", []):
+                        emby_episode_keys.add((int(emby_item.get("ParentIndexNumber") or season), int(emby_item.get("IndexNumber") or 0)))
+        except Exception as exc:
+            logger.warning("module=media provider=emby operation=episode_status error_type=%s reason=%s", type(exc).__name__, exc)
+    episodes = []
+    for x in payload.get("episodes", []):
+        key = (int(x.get("season_number") or season), int(x.get("episode_number") or 0))
+        episodes.append({"episode_number": x.get("episode_number"), "season_number": x.get("season_number", season), "name": x.get("name") or "未命名", "overview": x.get("overview") or "", "air_date": x.get("air_date") or "", "still": f"https://image.tmdb.org/t/p/w500{x.get('still_path')}" if x.get("still_path") else "", "emby_status": "available" if key in emby_episode_keys else "missing"})
+    return {"items": episodes, "cached": cached, "emby_configured": emby_configured}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -855,7 +932,7 @@ def _resource_page(title: str, payload: Any, status_code: int = 200, media_type:
     if cards:
         body = f"<p>已找到 {len(cards)} 条影巢资源，选择需要的版本：</p>" + "".join(cards)
     else:
-        body = f"<div class='empty'><h3>影巢暂时没有《{safe_title}》的可用资源</h3><p>这不是程序报错，只是影巢当前没有返回匹配链接。可以稍后再试，或返回遨游选择其他影片。</p></div>"
+        body = f"<div class='empty'><h3>影巢暂时没有《{safe_title}》的可用资源</h3><p>这不是程序报错，只是影巢当前没有返回匹配链接。可以稍后再试，或返回汇影选择其他影片。</p></div>"
     subscribe = ""
     if media_type in ("movie", "tv") and tmdb_id > 0:
         subscribe = ("<form method='post' action='/web/subscribe' style='display:inline-block;margin-right:10px'>"
@@ -865,7 +942,7 @@ def _resource_page(title: str, payload: Any, status_code: int = 200, media_type:
     return HTMLResponse(
         "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>{safe_title} - 影巢资源</title><style>body{{margin:0;background:#0b0906;color:#eee;font:16px system-ui,'Microsoft YaHei';padding:28px}}main{{max-width:920px;margin:auto}}h1,h3{{color:#e1bd70}}article,.empty{{background:#1d1912;border:1px solid #59401e;border-radius:14px;padding:18px;margin:14px 0}}button,.back{{display:inline-block;border:1px solid #b28036;border-radius:9px;background:#2a1d0d;color:#ffd98d;padding:10px 16px;text-decoration:none;cursor:pointer}}p{{color:#bdb3a3;line-height:1.7}}</style>"
-        f"<main><h1>《{safe_title}》影巢资源</h1>{body}{subscribe}<a class='back' href='/explore'>返回遨游</a></main></html>",
+        f"<main><h1>《{safe_title}》影巢资源</h1>{body}{subscribe}<a class='back' href='/explore'>返回汇影</a></main></html>",
         status_code=status_code,
     )
 
@@ -1197,7 +1274,12 @@ def resource_registry() -> ResourceProviderRegistry:
         configured = bool(conn.execute("SELECT 1 FROM installations WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone())
 
     async def hdhive_query(media_type: str, tmdb_id: int, title: str) -> dict[str, Any]:
-        data = await query_resources(ResourceQuery(media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
+        data: dict[str, Any] = {"items": []}
+        if tmdb_id > 0:
+            try:
+                data = await query_resources(ResourceQuery(media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
+            except HTTPException as exc:
+                logger.warning("module=resources provider=hdhive operation=tmdb_query error_type=%s reason=%s; falling_back=title", type(exc).__name__, exc.detail)
         if not _resource_items(data) and title.strip():
             try:
                 searched = await search_resources(SearchRequest(keyword=title.strip(), media_type=media_type), WEB_INSTALLATION_ID)
@@ -1211,12 +1293,18 @@ def resource_registry() -> ResourceProviderRegistry:
 
 
 @app.get("/api/web/resources/search")
-async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(..., gt=0), title: str = Query("", max_length=200)) -> dict[str, Any]:
+async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), title: str = Query("", max_length=200), douban_id: str = Query("", max_length=50), year: str = Query("", max_length=4)) -> dict[str, Any]:
+    if not tmdb_id and not title.strip():
+        raise HTTPException(400, "缺少可用于搜索的影视名称")
     providers = resource_registry()
     items, errors = await providers.search(media_type, tmdb_id, title)
     for error in errors:
         logger.error("module=resources provider=%s operation=search error_type=ProviderError reason=%s", error["provider"], error["error"])
-    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items)}
+    source_counts: dict[str, int] = {}
+    for item in items:
+        source = item.source_type or "其他来源"
+        source_counts[source] = source_counts.get(source, 0) + 1
+    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}}
 
 
 class WebResourceTransfer(BaseModel):

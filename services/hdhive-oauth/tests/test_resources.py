@@ -22,11 +22,14 @@ class FailingProvider(ResourceProvider):
 
 class ResourceProviderTests(unittest.TestCase):
     def test_hdhive_normalization(self):
-        item = HDHiveResourceProvider.normalize({"slug": "abc", "title": "电影 2160P", "resolution": "4K", "size": "20 GB", "tags": "HDR,中字"})
+        item = HDHiveResourceProvider.normalize({"slug": "abc", "title": "电影 2160P", "resolution": "4K", "size": "20 GB", "tags": "HDR,中字", "user": {"name": "分享者", "avatar": "https://img.example/u.jpg"}, "points": 2, "unlock_count": 9})
         self.assertEqual(item.provider, "hdhive")
         self.assertEqual(item.provider_resource_id, "abc")
         self.assertTrue(item.transfer_supported)
         self.assertEqual(item.resource_tags, ["HDR", "中字"])
+        self.assertEqual(item.uploader, "分享者")
+        self.assertEqual(item.points, 2)
+        self.assertEqual(item.unlock_count, 9)
 
     def test_deduplication_keeps_different_versions(self):
         same1 = ResourceItem("a", "A", "1", "影片", share_url="https://115.com/s/one", resolution="4K")
@@ -37,9 +40,10 @@ class ResourceProviderTests(unittest.TestCase):
         self.assertEqual(result[0].duplicate_count, 2)
 
     def test_filtering_and_options(self):
-        items = [ResourceItem("a", "A", "1", "一", resolution="4K", season="S01"), ResourceItem("b", "B", "2", "二", resolution="1080P", season="S02")]
+        items = [ResourceItem("a", "A", "1", "一", resolution="4K", season="S01", uploader="甲"), ResourceItem("b", "B", "2", "二", resolution="1080P", season="S02", uploader="乙")]
         self.assertEqual(len(filter_resources(items, resolution="4K")), 1)
         self.assertEqual(filter_options(items)["season"], ["S01", "S02"])
+        self.assertEqual(filter_options(items)["uploader"], ["乙", "甲"])
 
     def test_provider_failure_is_isolated(self):
         async def query(media_type, tmdb_id, title):

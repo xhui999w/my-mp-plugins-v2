@@ -44,6 +44,32 @@ class OAuthServiceTests(unittest.TestCase):
     def test_health(self):
         self.assertEqual(self.client.get("/health").json()["ok"], True)
 
+    def test_movieark_detail_and_search_pages(self):
+        explore = self.client.get("/explore").text
+        detail = self.client.get("/resources").text
+        search = self.client.get("/search").text
+        self.assertIn("ⓘ 详情", explore)
+        self.assertNotIn("data-action=\"search\"", explore)
+        self.assertIn("返回汇影", detail)
+        self.assertIn("TMDB / Emby 季与集", detail)
+        self.assertIn("影视与资源搜索", search)
+
+    def test_resource_search_accepts_title_without_tmdb_id(self):
+        class Registry:
+            async def search(self, media_type, tmdb_id, title):
+                self.received = (media_type, tmdb_id, title)
+                return [], []
+
+            def infos(self):
+                return []
+
+        provider = Registry()
+        with patch.object(main, "resource_registry", return_value=provider):
+            response = self.client.get("/api/web/resources/search", params={"media_type": "movie", "tmdb_id": 0, "title": "测试影片", "douban_id": "123"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(provider.received, ("movie", 0, "测试影片"))
+        self.assertEqual(response.json()["match"]["douban_id"], "123")
+
     def test_optional_admin_login_protects_dashboard(self):
         old_user, old_password = main.WEB_ADMIN_USER, main.WEB_ADMIN_PASSWORD
         main.WEB_ADMIN_USER, main.WEB_ADMIN_PASSWORD = "owner", "strong-password"
