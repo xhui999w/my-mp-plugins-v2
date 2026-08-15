@@ -574,7 +574,16 @@ async def explore_discover(
         selected = category or ("hot-tv" if media_type == "tv" else "hot-movie")
         if selected == "top250" and media_type == "tv":
             selected = "hot-tv"
-        return await explore_douban_provider().discover(selected, page)
+        result = await explore_douban_provider().discover(selected, page)
+        # Douban's public list endpoint does not expose all TMDB-style filters.
+        # Apply the filters we can safely verify instead of silently returning
+        # the same unfiltered list when the user chooses a year.
+        if year.isdigit():
+            result["items"] = [item for item in result.get("items", []) if item.get("year") == year]
+            result["total"] = len(result["items"])
+            result["page_size"] = len(result["items"])
+            result["has_more"] = False
+        return result
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:
         return {"items": [], "page": page, "total_pages": 0, "has_more": False, "provider": provider, "configured": False, "error": "该数据源尚未配置，请在设置页面填写 TMDB API Key。"}
