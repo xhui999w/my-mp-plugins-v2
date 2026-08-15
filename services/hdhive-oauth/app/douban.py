@@ -48,6 +48,9 @@ class DoubanProvider:
         douban_id = str(item.get("id") or item.get("douban_id") or "")
         title = str(item.get("title") or "未命名")
         year = str(item.get("year") or "")
+        if not year:
+            match = re.search(r"(?:19|20)\d{2}", title)
+            year = match.group(0) if match else ""
         return {
             "id": f"douban:{douban_id}", "provider": "douban", "provider_name": "豆瓣",
             "provider_id": douban_id, "douban_id": douban_id, "tmdb_id": 0,
