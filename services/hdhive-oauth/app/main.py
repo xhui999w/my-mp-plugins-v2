@@ -548,9 +548,7 @@ def explore_status() -> dict[str, Any]:
 @app.get("/api/explore/providers")
 def explore_providers() -> dict[str, Any]:
     tmdb = explore_tmdb_provider()
-    # Douban exposes curated rankings rather than a reliable free-form
-    # discover API. It belongs on /rankings and must not appear in Explore.
-    return {"items": [item for item in registry(tmdb.configured) if item["id"] != "douban"]}
+    return {"items": registry(tmdb.configured)}
 
 
 @app.get("/api/explore/filters")
@@ -562,42 +560,20 @@ async def explore_filters(media_type: str = Query("movie", pattern="^(movie|tv)$
             genres = await tmdb.genres(media_type)
         except Exception:
             genres = []
-    return {"data": filter_metadata(genres), "configured": tmdb.configured}
+    return {"data": filter_metadata(genres), "douban": explore_douban_provider().metadata(), "configured": tmdb.configured}
 
 
 @app.get("/api/explore/discover")
 async def explore_discover(
     provider: str = Query("tmdb"), media_type: str = Query("movie", pattern="^(movie|tv)$"),
-    region: str = Query(""), language: str = Query(""), genre: str = Query(""), year: str = Query(""),
+    region: str = Query(""), country: str = Query(""), language: str = Query(""), genre: str = Query(""), year: str = Query(""),
     sort: str = Query("popularity.desc"), rating: float = Query(0, ge=0, le=10), page: int = Query(1, ge=1),
     category: str = Query(""),
 ) -> dict[str, Any]:
     if provider == "douban":
-        unsupported = []
-        if region: unsupported.append("地区")
-        if genre: unsupported.append("风格")
-        if language: unsupported.append("语言")
-        if year: unsupported.append("年份")
-        if rating: unsupported.append("评分")
-        if unsupported:
-            return {"items": [], "page": page, "page_size": 0, "total": 0, "total_pages": 0,
-                    "has_more": False, "provider": "douban", "configured": True,
-                    "unsupported": unsupported, "error": "豆瓣公开榜单暂不支持：" + "、".join(unsupported) + "。请选择‘全部’或切换到 TMDB。"}
-        selected = category or ("hot-tv" if media_type == "tv" else "hot-movie")
-        if selected == "top250" and media_type == "tv":
-            selected = "hot-tv"
-        result = await explore_douban_provider().discover(selected, page)
-        # Expose the provider contract with every response so the UI can
-        # never mistake an unsupported filter for an empty result set.
+        result = await explore_douban_provider().discover({"media_type": media_type, "country": country,
+            "genre": genre, "year": year, "sort": sort, "page": page})
         result["capabilities"] = explore_douban_provider().capabilities
-        # Douban's public list endpoint does not expose all TMDB-style filters.
-        # Apply the filters we can safely verify instead of silently returning
-        # the same unfiltered list when the user chooses a year.
-        if year.isdigit() and any(item.get("year") for item in result.get("items", [])):
-            result["items"] = [item for item in result.get("items", []) if item.get("year") == year]
-            result["total"] = len(result["items"])
-            result["page_size"] = len(result["items"])
-            result["has_more"] = False
         return result
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:

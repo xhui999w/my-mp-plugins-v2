@@ -1,136 +1,178 @@
-"""Independent Douban provider used by MovieArk's backend.
-
-The browser never calls Douban directly.  JSON search is preferred for the
-hot/high-score lists; Top250 is read from the public Top250 HTML page.  A
-short-lived fresh cache plus stale-on-error fallback keeps one bad response
-from taking down the whole discovery page.
-"""
+"""Douban discovery provider backed by Douban's public Explore endpoint."""
 from __future__ import annotations
 
+import json
+import logging
 import re
 import time
-from html import unescape
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 
 class DoubanProvider:
-    JSON_URL = "https://movie.douban.com/j/search_subjects"
-    TOP250_URL = "https://movie.douban.com/top250"
-    TAGS = {
-        "hot-movie": ("movie", "热门"),
-        "high-movie": ("movie", "豆瓣高分"),
-        "hot-tv": ("tv", "热门"),
-        "high-tv": ("tv", "豆瓣高分"),
-    }
+    BASE_URL = "https://m.douban.com/rexxar/api/v2"
+    GENRES = (
+        "喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "犯罪", "惊悚", "冒险",
+        "音乐", "历史", "奇幻", "恐怖", "战争", "传记", "歌舞", "武侠", "灾难",
+        "西部", "纪录片", "短片", "剧情", "家庭", "儿童",
+    )
+    COUNTRIES = (
+        "华语", "欧美", "韩国", "日本", "中国大陆", "美国", "中国香港", "中国台湾",
+        "英国", "法国", "德国", "意大利", "西班牙", "印度", "泰国", "俄罗斯", "加拿大",
+        "澳大利亚", "爱尔兰", "瑞典", "巴西", "丹麦",
+    )
+    # Codes are returned by Douban's current Explore endpoint.
+    SORTS = {"recommend": "T", "hot": "U", "release": "R", "score": "S"}
 
-    def __init__(self, timeout: float = 15.0, ttl: int = 600):
-        self.timeout = timeout
-        self.ttl = ttl
+    def __init__(self, timeout: float = 20.0, ttl: int = 600):
+        self.timeout, self.ttl = timeout, ttl
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     @property
     def configured(self) -> bool:
-        # Public Douban lists do not require a user credential.
         return True
 
     @property
     def capabilities(self) -> dict[str, bool]:
-        return {"supports_region": False, "supports_year": False, "supports_genre": False,
-                "supports_language": False, "supports_sort": False, "supports_rating": False,
-                "supports_media_type": True, "supports_pagination": True}
+        return {
+            "supports_country": True, "supports_year": True, "supports_genre": True,
+            "supports_sort": True, "supports_media_type": True, "supports_pagination": True,
+        }
+
+    @classmethod
+    def metadata(cls) -> dict[str, Any]:
+        year = time.localtime().tm_year
+        return {
+            "genres": list(cls.GENRES), "countries": list(cls.COUNTRIES),
+            "sorts": [
+                {"code": "recommend", "name": "综合排序"}, {"code": "hot", "name": "近期热度"},
+                {"code": "release", "name": "首映时间"}, {"code": "score", "name": "高分优先"},
+            ],
+            "years": [str(value) for value in range(year, year - 8, -1)]
+            + [f"{decade}s" for decade in range((year // 10) * 10 - 10, 1950, -10)],
+        }
 
     @staticmethod
     def _number(value: Any) -> float:
         try:
-            return float(str(value).strip() or 0)
+            return float(value or 0)
         except (TypeError, ValueError):
             return 0.0
 
-    @staticmethod
-    def normalize(item: dict[str, Any], rank: int, media_type: str) -> dict[str, Any]:
-        douban_id = str(item.get("id") or item.get("douban_id") or "")
-        title = str(item.get("title") or "未命名")
+    @classmethod
+    def normalize(cls, item: dict[str, Any], rank: int, media_type: str) -> dict[str, Any]:
+        rating = item.get("rating") or {}
+        pic = item.get("pic") or {}
+        subtitle = str(item.get("card_subtitle") or "")
+        parts = [part.strip() for part in subtitle.split("/")]
         year = str(item.get("year") or "")
-        if not year:
-            match = re.search(r"(?:19|20)\d{2}", title)
+        if not re.fullmatch(r"(?:19|20)\d{2}", year):
+            match = re.search(r"(?:19|20)\d{2}", subtitle)
             year = match.group(0) if match else ""
+        countries = parts[1].split() if len(parts) > 1 else []
+        genres = parts[2].split() if len(parts) > 2 else []
+        douban_id = str(item.get("id") or "")
+        poster = pic.get("large") or pic.get("normal") if isinstance(pic, dict) else ""
+        score = rating.get("value") if isinstance(rating, dict) else rating
         return {
             "id": f"douban:{douban_id}", "provider": "douban", "provider_name": "豆瓣",
-            "provider_id": douban_id, "douban_id": douban_id, "tmdb_id": 0,
-            "source_id": douban_id, "title": title, "original_title": str(item.get("original_title") or ""),
-            "year": year, "media_type": media_type, "rating": DoubanProvider._number(item.get("rate") or item.get("rating")),
-            "vote_count": int(DoubanProvider._number(item.get("vote_count") or item.get("votes"))),
-            "poster": (f"/api/image-proxy?url={quote(str(item.get('cover') or item.get('pic') or ''), safe='')}" if (item.get("cover") or item.get("pic")) else ""), "backdrop": "", "overview": "",
-            "rank": rank, "source_url": f"https://movie.douban.com/subject/{douban_id}/" if douban_id else "",
+            "provider_id": douban_id, "douban_id": douban_id, "tmdb_id": int(item.get("tmdb_id") or 0),
+            "source_id": douban_id, "title": str(item.get("title") or "未命名"),
+            "original_title": str(item.get("original_title") or ""), "year": year,
+            "media_type": str(item.get("item_type") or item.get("type") or media_type),
+            "rating": round(cls._number(score), 1),
+            "vote_count": int(cls._number(rating.get("count") if isinstance(rating, dict) else 0)),
+            "poster": f"/api/image-proxy?url={quote(str(poster), safe='')}" if poster else "",
+            "backdrop": "", "overview": subtitle, "countries": countries, "region": countries,
+            "genres": genres, "languages": [], "rank": rank,
+            "source_url": f"https://movie.douban.com/subject/{douban_id}/",
         }
 
     @staticmethod
-    def _headers() -> dict[str, str]:
-        return {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36 MovieArk/1.0",
-            "Referer": "https://movie.douban.com/", "Accept": "application/json,text/plain,*/*",
+    def _year_tag(value: str) -> str:
+        if value.isdigit() and len(value) == 4:
+            return value
+        if value.endswith("s") and value[:-1].isdigit():
+            return value[:-1] + "年代"
+        return ""
+
+    async def discover(self, query: dict[str, Any] | str, page: int | None = None, count: int = 20) -> dict[str, Any]:
+        # Legacy ranking calls remain compatible; the rankings page is not
+        # coupled to the Explore UI.
+        if isinstance(query, str):
+            category = query
+            query = {
+                "media_type": "tv" if category.endswith("-tv") else "movie",
+                "sort": "score" if category.startswith("high-") or category == "top250" else "hot",
+                "page": page or 1,
+            }
+        media_type = "tv" if query.get("media_type") == "tv" else "movie"
+        page = max(1, int(query.get("page", 1)))
+        genre = str(query.get("genre") or "")
+        country = str(query.get("country") or "")
+        sort = str(query.get("sort") or "recommend")
+        year = str(query.get("year") or "")
+        if genre and genre not in self.GENRES:
+            raise ValueError("INVALID_DOUBAN_GENRE")
+        if country and country not in self.COUNTRIES:
+            raise ValueError("INVALID_DOUBAN_COUNTRY")
+        if sort not in self.SORTS:
+            sort = "recommend"
+
+        selected = {key: value for key, value in (("类型", genre), ("地区", country)) if value}
+        # Douban applies Explore filters through both selected_categories and
+        # the tags list. Omitting tags makes the server silently ignore the UI.
+        tags = [value for value in (genre, country, self._year_tag(year)) if value]
+        if not tags:
+            tags = ["电视剧" if media_type == "tv" else "电影"]
+        params = {
+            "refresh": "0", "start": (page - 1) * count, "count": count,
+            "selected_categories": json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
+            "uncollect": "false", "tags": ",".join(tags), "sort": self.SORTS[sort],
         }
-
-    def _result(self, category: str, page: int, items: list[dict[str, Any]], count: int) -> dict[str, Any]:
-        return {"items": items, "page": page, "page_size": len(items), "total": len(items),
-                "total_pages": page + (1 if len(items) >= count else 0), "has_more": len(items) >= count,
-                "provider": "douban", "category": category, "configured": True, "error": None}
-
-    async def _json_list(self, category: str, page: int, count: int) -> dict[str, Any]:
-        media_type, tag = self.TAGS.get(category, self.TAGS["hot-movie"])
-        params = {"type": media_type, "tag": tag, "page_limit": min(max(count, 1), 50), "page_start": max(0, (page - 1) * count)}
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            response = await client.get(self.JSON_URL, params=params, headers=self._headers())
-        if response.status_code in (403, 429):
-            raise RuntimeError(f"DOUBAN_HTTP_{response.status_code}")
-        response.raise_for_status()
-        payload = response.json()
-        subjects = payload.get("subjects", []) if isinstance(payload, dict) else []
-        items = [self.normalize(x, i + 1 + (page - 1) * count, media_type) for i, x in enumerate(subjects) if isinstance(x, dict)]
-        return self._result(category, page, items, count)
-
-    async def _top250(self, page: int, count: int) -> dict[str, Any]:
-        start = max(0, (page - 1) * count)
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            response = await client.get(self.TOP250_URL, params={"start": start, "filter": ""}, headers=self._headers())
-        if response.status_code in (403, 429):
-            raise RuntimeError(f"DOUBAN_HTTP_{response.status_code}")
-        response.raise_for_status()
-        text = response.text
-        items: list[dict[str, Any]] = []
-        for block in re.findall(r'<div class="item">(.*?)</div>\s*</div>', text, flags=re.S):
-            link = re.search(r'href="https://movie\.douban\.com/subject/(\d+)/?"', block)
-            title = re.search(r'<span class="title">\s*(.*?)\s*</span>', block, flags=re.S)
-            rating = re.search(r'<span class="rating_num"[^>]*>\s*([\d.]+)', block)
-            pic = re.search(r'<img[^>]+src="([^"]+)"', block)
-            rank = re.search(r'<em class="">\s*(\d+)', block)
-            info = re.search(r'<p class="">(.*?)</p>', block, flags=re.S)
-            if not link or not title:
-                continue
-            clean = lambda value: re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", value or ""))).strip()
-            info_text = clean(info.group(1) if info else "")
-            year_match = re.search(r"(\d{4})", info_text)
-            item = {"id": link.group(1), "title": clean(title.group(1)), "rate": rating.group(1) if rating else 0,
-                    "cover": urljoin(self.TOP250_URL, pic.group(1)) if pic else "", "year": year_match.group(1) if year_match else ""}
-            items.append(self.normalize(item, int(rank.group(1)) if rank else start + len(items) + 1, "movie"))
-        return self._result("top250", page, items, count)
-
-    async def discover(self, category: str = "hot-movie", page: int = 1, count: int = 20) -> dict[str, Any]:
-        category = category if category in (*self.TAGS, "top250") else "hot-movie"
-        key = f"{category}:{page}:{count}"
-        now = time.time()
+        key = "douban:explore:" + json.dumps(
+            {**params, "media_type": media_type, "page": page}, ensure_ascii=False, sort_keys=True,
+        )
         cached = self._cache.get(key)
+        now = time.time()
         if cached and now - cached[0] < self.ttl:
             return {**cached[1], "cached": True}
+
+        logger.info("[douban] type=%s sort=%s genre=%s country=%s year=%s page=%s", media_type, sort, genre, country, year, page)
         try:
-            result = await self._top250(page, count) if category == "top250" else await self._json_list(category, page, count)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+                "Referer": "https://movie.douban.com/explore", "Accept": "application/json",
+            }
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                response = await client.get(f"{self.BASE_URL}/{media_type}/recommend", params=params, headers=headers)
+            if response.status_code in (403, 429):
+                raise RuntimeError(f"DOUBAN_HTTP_{response.status_code}")
+            response.raise_for_status()
+            payload = response.json()
+            raw = payload.get("items", []) if isinstance(payload, dict) else []
+            subjects = [item for item in raw if isinstance(item, dict) and item.get("card") == "subject" and item.get("id")]
+            items = [self.normalize(item, (page - 1) * count + index + 1, media_type) for index, item in enumerate(subjects)]
+            total = int(payload.get("total") or len(items))
+            result = {
+                "items": items, "page": page, "page_size": len(items), "total": total,
+                "total_pages": (total + count - 1) // count if total else 0,
+                "has_more": page * count < total, "provider": "douban", "source": "douban-explore",
+                "configured": True, "error": None,
+                "query": {"media_type": media_type, "sort": sort, "genre": genre, "country": country, "year": year},
+            }
             self._cache[key] = (now, result)
             return {**result, "cached": False}
         except Exception as exc:
+            logger.warning("[douban] request failed error_type=%s", type(exc).__name__)
             if cached:
-                return {**cached[1], "cached": True, "stale": True, "error": f"豆瓣暂时不可用，显示缓存数据（{type(exc).__name__}）"}
-            return {"items": [], "page": page, "page_size": 0, "total": 0, "total_pages": 0, "has_more": False,
-                    "provider": "douban", "category": category, "configured": True, "error": f"豆瓣数据暂时不可用（{type(exc).__name__}）"}
+                return {**cached[1], "cached": True, "stale": True, "error": "豆瓣暂时不可用，正在显示缓存结果。"}
+            return {
+                "items": [], "page": page, "page_size": 0, "total": 0, "total_pages": 0,
+                "has_more": False, "provider": "douban", "source": "douban-explore", "configured": True,
+                "error": "豆瓣数据暂时不可用，请稍后重试。", "detail": type(exc).__name__,
+            }
