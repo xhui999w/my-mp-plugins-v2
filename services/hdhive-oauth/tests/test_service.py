@@ -70,6 +70,18 @@ class OAuthServiceTests(unittest.TestCase):
         self.assertEqual(provider.received, ("movie", 0, "测试影片"))
         self.assertEqual(response.json()["match"]["douban_id"], "123")
 
+    def test_douban_subscription_without_tmdb_id_is_supported_and_deduplicated(self):
+        payload = {"title": "豆瓣订阅测试", "media_type": "movie", "tmdb_id": 0, "douban_id": "1292052", "year": 1994}
+        with main.database() as conn:
+            conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND douban_id=?", (main.WEB_INSTALLATION_ID, payload["douban_id"]))
+        first = self.client.post("/api/web/subscriptions", json=payload)
+        second = self.client.post("/api/web/subscriptions", json=payload)
+        self.assertEqual(first.status_code, 200)
+        self.assertFalse(first.json().get("duplicate", False))
+        self.assertTrue(second.json()["duplicate"])
+        status = self.client.get("/api/web/subscription-status", params={"media_type": "movie", "tmdb_id": 0, "douban_id": payload["douban_id"]})
+        self.assertTrue(status.json()["subscribed"])
+
     def test_optional_admin_login_protects_dashboard(self):
         old_user, old_password = main.WEB_ADMIN_USER, main.WEB_ADMIN_PASSWORD
         main.WEB_ADMIN_USER, main.WEB_ADMIN_PASSWORD = "owner", "strong-password"

@@ -1187,7 +1187,7 @@ async def resolve_resource(
 class SubscriptionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     media_type: str = Field(pattern="^(movie|tv)$")
-    tmdb_id: int = Field(gt=0)
+    tmdb_id: int = Field(default=0, ge=0)
     year: int | None = Field(default=None, ge=1880, le=2200)
     poster: str = Field(default="", max_length=1000)
     season: str = Field(default="", max_length=30)
@@ -1304,7 +1304,10 @@ async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$
     for item in items:
         source = item.source_type or "其他来源"
         source_counts[source] = source_counts.get(source, 0) + 1
-    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}}
+    with database() as conn:
+        settings = conn.execute("SELECT save_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    save_path = str(settings["save_directory"] or "") if settings else ""
+    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "save_path": save_path, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}}
 
 
 class WebResourceTransfer(BaseModel):
@@ -1351,9 +1354,14 @@ async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
 
 
 @app.get("/api/web/subscription-status")
-def web_subscription_status(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(..., gt=0)) -> dict[str, Any]:
+def web_subscription_status(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), douban_id: str = Query("", max_length=50), title: str = Query("", max_length=200), year: int | None = Query(None, ge=1880, le=2200)) -> dict[str, Any]:
     with database() as conn:
-        row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, tmdb_id)).fetchone()
+        if tmdb_id:
+            row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, tmdb_id)).fetchone()
+        elif douban_id.strip():
+            row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND douban_id=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, douban_id.strip())).fetchone()
+        else:
+            row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND title=? AND COALESCE(year,0)=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, title.strip(), year or 0)).fetchone()
     return {"subscribed": bool(row), "id": row["id"] if row else None, "status": row["status"] if row else None}
 
 
@@ -1378,10 +1386,12 @@ def create_subscription(
 ) -> dict[str, Any]:
     now = int(time.time())
     with database() as conn:
-        existing = conn.execute(
-            "SELECT id, status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1",
-            (installation_id, request.media_type, request.tmdb_id, request.season.strip()),
-        ).fetchone()
+        if request.tmdb_id:
+            existing = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (installation_id, request.media_type, request.tmdb_id, request.season.strip())).fetchone()
+        elif request.douban_id.strip():
+            existing = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND douban_id=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (installation_id, request.media_type, request.douban_id.strip(), request.season.strip())).fetchone()
+        else:
+            existing = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND title=? AND COALESCE(year,0)=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (installation_id, request.media_type, request.title.strip(), request.year or 0, request.season.strip())).fetchone()
         if existing:
             return {"id": existing["id"], "status": existing["status"], "duplicate": True, **request.model_dump()}
         cur = conn.execute(
