@@ -548,7 +548,9 @@ def explore_status() -> dict[str, Any]:
 @app.get("/api/explore/providers")
 def explore_providers() -> dict[str, Any]:
     tmdb = explore_tmdb_provider()
-    return {"items": registry(tmdb.configured)}
+    # Douban exposes curated rankings rather than a reliable free-form
+    # discover API. It belongs on /rankings and must not appear in Explore.
+    return {"items": [item for item in registry(tmdb.configured) if item["id"] != "douban"]}
 
 
 @app.get("/api/explore/filters")
