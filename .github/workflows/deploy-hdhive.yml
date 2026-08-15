@@ -1,11 +1,13 @@
 name: Deploy HDHive OAuth
 
 on:
-  push:
+  # Deploy only after the image workflow has finished publishing `latest`.
+  # A push-triggered deploy could pull the previous image while the build was
+  # still running, making a successful deployment appear unchanged.
+  workflow_run:
+    workflows: ["Build HDHive OAuth image"]
+    types: [completed]
     branches: [main]
-    paths:
-      - 'services/hdhive-oauth/**'
-      - '.github/workflows/deploy-hdhive.yml'
   workflow_dispatch:
 
 concurrency:
@@ -16,6 +18,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Deploy on server
