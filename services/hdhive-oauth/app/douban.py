@@ -11,7 +11,7 @@ import re
 import time
 from html import unescape
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import httpx
 
@@ -54,7 +54,7 @@ class DoubanProvider:
             "source_id": douban_id, "title": title, "original_title": str(item.get("original_title") or ""),
             "year": year, "media_type": media_type, "rating": DoubanProvider._number(item.get("rate") or item.get("rating")),
             "vote_count": int(DoubanProvider._number(item.get("vote_count") or item.get("votes"))),
-            "poster": str(item.get("cover") or item.get("pic") or ""), "backdrop": "", "overview": "",
+            "poster": (f"/api/image-proxy?url={quote(str(item.get('cover') or item.get('pic') or ''), safe='')}" if (item.get("cover") or item.get("pic")) else ""), "backdrop": "", "overview": "",
             "rank": rank, "source_url": f"https://movie.douban.com/subject/{douban_id}/" if douban_id else "",
         }
 

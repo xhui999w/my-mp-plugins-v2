@@ -30,7 +30,7 @@ import qrcode
 import qrcode.image.svg
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 from .explore import RANKINGS, TMDBProvider, filter_metadata, registry
@@ -515,6 +515,18 @@ async def authorized_request(
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "service": "hdhive-oauth"}
+
+
+@app.get("/api/image-proxy")
+async def image_proxy(url: str = Query(..., min_length=12, max_length=2048)) -> Response:
+    """Proxy public poster images so Douban's hotlink protection stays server-side."""
+    if not url.startswith(("https://img", "http://img")) or "doubanio.com" not in url:
+        raise HTTPException(400, "Unsupported image host")
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        response = await client.get(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://movie.douban.com/"})
+    if response.status_code != 200:
+        raise HTTPException(response.status_code, "Image unavailable")
+    return Response(content=response.content, media_type=response.headers.get("content-type", "image/jpeg"), headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/explore", response_class=HTMLResponse)
