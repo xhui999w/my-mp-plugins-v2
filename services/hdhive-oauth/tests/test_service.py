@@ -52,7 +52,12 @@ class OAuthServiceTests(unittest.TestCase):
         self.assertNotIn("data-action=\"search\"", explore)
         self.assertIn("返回汇影", detail)
         self.assertIn("TMDB / Emby 季与集", detail)
+        self.assertIn("Emby 未配置", detail)
+        self.assertIn("data-collapsed", detail)
+        self.assertIn("resolved_tmdb_id", detail)
         self.assertIn("影视与资源搜索", search)
+        self.assertIn("ⓘ 详情", search)
+        self.assertIn("data-action=\"subscribe\"", search)
 
     def test_resource_search_accepts_title_without_tmdb_id(self):
         class Registry:
@@ -226,9 +231,9 @@ class OAuthServiceTests(unittest.TestCase):
         with main.database() as conn:
             conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND tmdb_id=9911", (main.WEB_INSTALLATION_ID,))
         with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": []})), patch.object(main, "search_resources", new=AsyncMock(return_value={"items": []})):
-            result = self.client.post("/web/query", data={"title": "遨游订阅测试", "media_type": "movie", "tmdb_id": 9911, "year": "2026", "poster": "https://image.example/poster.jpg"})
+            result = self.client.post("/web/query", data={"title": "汇影订阅测试", "media_type": "movie", "tmdb_id": 9911, "year": "2026", "poster": "https://image.example/poster.jpg"})
         self.assertIn("订阅这部影视", result.text)
-        created = self.client.post("/web/subscribe", data={"title": "遨游订阅测试", "media_type": "movie", "tmdb_id": 9911, "year": "2026", "poster": "https://image.example/poster.jpg"}, follow_redirects=False)
+        created = self.client.post("/web/subscribe", data={"title": "汇影订阅测试", "media_type": "movie", "tmdb_id": 9911, "year": "2026", "poster": "https://image.example/poster.jpg"}, follow_redirects=False)
         self.assertEqual(created.status_code, 303)
         with main.database() as conn:
             item = conn.execute("SELECT year,poster FROM web_subscriptions WHERE installation_id=? AND tmdb_id=9911", (main.WEB_INSTALLATION_ID,)).fetchone()
@@ -395,3 +400,4 @@ class OAuthServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

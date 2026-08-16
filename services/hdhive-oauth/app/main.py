@@ -756,7 +756,21 @@ async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"),
         "directors": [x.get("name") for x in payload.get("credits", {}).get("crew", []) if x.get("job") in ("Director", "Series Director") and x.get("name")][:4],
     })
     seasons = [{"season_number": x.get("season_number"), "name": x.get("name"), "episode_count": x.get("episode_count") or 0, "air_date": x.get("air_date") or "", "poster": f"https://image.tmdb.org/t/p/w342{x.get('poster_path')}" if x.get("poster_path") else ""} for x in payload.get("seasons", []) if int(x.get("season_number") or 0) >= 0]
-    return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution}
+    emby_status: str | None = None
+    with database() as conn:
+        settings = conn.execute("SELECT emby_url,emby_api_key,emby_user_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if settings and settings["emby_url"] and settings["emby_api_key"] and settings["emby_user_id"]:
+        try:
+            token = _decrypt_optional(settings["emby_api_key"])
+            headers = {"X-Emby-Token": token}
+            params = {"Recursive": "true", "IncludeItemTypes": "Movie" if media_type == "movie" else "Series", "AnyProviderIdEquals": f"tmdb.{tmdb_id}", "Fields": "ProviderIds", "Limit": 5}
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                emby_response = await client.get(f"{settings['emby_url'].rstrip('/')}/Users/{settings['emby_user_id']}/Items", headers=headers, params=params)
+                emby_response.raise_for_status()
+                emby_status = "available" if emby_response.json().get("Items") else "missing"
+        except Exception as exc:
+            logger.warning("module=media provider=emby operation=library_status error_type=%s reason=%s", type(exc).__name__, exc)
+    return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution, "emby_status": emby_status}
 
 @app.get("/api/web/media/season")
 async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(..., ge=0)) -> dict[str, Any]:
@@ -851,7 +865,7 @@ async def web_rankings() -> HTMLResponse:
 
 @app.get("/web/discover", response_class=HTMLResponse)
 def web_discover() -> HTMLResponse:
-    content = _web_account_card() + "<div class='card'><h2>Resource discovery</h2><p>Search directly by title; the API returns matching HDHive resources.</p><form method='post' action='/web/search'><input name='keyword' placeholder='Resource name' required><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><button>Search HDHive</button></form><hr><p class='muted'>Advanced: use a TMDB ID when you need an exact match.</p><form method='post' action='/web/query'><select name='media_type'><option value='movie'>Movie</option><option value='tv'>TV</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>Exact query</button></form></div>"
+    content = _web_account_card() + "<div class='card'><h2>汇影资源发现</h2><p>按影视名称直接搜索，接口返回匹配的影巢资源。</p><form method='post' action='/web/search'><input name='keyword' placeholder='影视名称' required><select name='media_type'><option value='movie'>电影</option><option value='tv'>电视剧</option></select><button>搜索影巢资源</button></form><hr><p class='muted'>进阶：需要精确匹配时可使用 TMDB ID 查询。</p><form method='post' action='/web/query'><select name='media_type'><option value='movie'>电影</option><option value='tv'>电视剧</option></select><input name='tmdb_id' type='number' placeholder='TMDB ID' required><button>精确查询</button></form></div>"
     return _web_layout("资源发现", content)
 
 
