@@ -343,6 +343,7 @@ def init_database() -> None:
             ("emby_api_key", "TEXT DEFAULT ''"),
             ("emby_user_id", "TEXT DEFAULT ''"),
             ("p115_cookie", "TEXT DEFAULT ''"),
+            ("p115_security_key", "TEXT DEFAULT ''"),
             ("telegram_bot_token", "TEXT DEFAULT ''"),
             ("telegram_chat_id", "TEXT DEFAULT ''"),
             ("telegram_api_id", "TEXT DEFAULT ''"),
@@ -2092,12 +2093,13 @@ class BusinessSettings(BaseModel):
     ed2k_poll_interval: int = Field(default=60, ge=10, le=3600)
     ed2k_retry_count: int = Field(default=3, ge=0, le=20)
     ed2k_auto_archive: bool = True
+    p115_security_key: str = Field(default="", max_length=64)
 
 
 BUSINESS_SETTING_COLUMNS = (
     "root_directory,save_directory,save_folder_id,scrape_directory,save_wait_seconds,retry_count,"
     "duplicate_policy,subscription_auto_transfer,subscription_interval,offline_enabled,ed2k_directory,ed2k_poll_interval,"
-    "ed2k_retry_count,ed2k_auto_archive"
+    "ed2k_retry_count,ed2k_auto_archive,p115_security_key"
 )
 
 
@@ -2115,6 +2117,7 @@ def get_business_settings() -> dict[str, Any]:
     result["offline_enabled"] = bool(result["offline_enabled"])
     result["ed2k_auto_archive"] = bool(result["ed2k_auto_archive"])
     result["subscription_auto_transfer"] = bool(result["subscription_auto_transfer"])
+    result["p115_security_key"] = _decrypt_optional(result["p115_security_key"])
     return result
 
 
@@ -2122,12 +2125,20 @@ def get_business_settings() -> dict[str, Any]:
 def put_business_settings(request: BusinessSettings) -> dict[str, Any]:
     values = request.model_dump()
     with database() as conn:
+        current = conn.execute(
+            "SELECT p115_security_key FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)
+        ).fetchone()
+        security_key = values["p115_security_key"].strip()
+        if security_key:
+            secret = encrypt(security_key)
+        else:
+            secret = current["p115_security_key"] if current and current["p115_security_key"] else ""
         conn.execute(
             """INSERT INTO web_settings
             (installation_id,root_directory,save_directory,save_folder_id,scrape_directory,save_wait_seconds,
              retry_count,duplicate_policy,subscription_auto_transfer,subscription_interval,offline_enabled,ed2k_directory,ed2k_poll_interval,
-             ed2k_retry_count,ed2k_auto_archive,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ed2k_retry_count,ed2k_auto_archive,p115_security_key,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(installation_id) DO UPDATE SET
              root_directory=excluded.root_directory,save_directory=excluded.save_directory,
              save_folder_id=excluded.save_folder_id,
@@ -2137,12 +2148,12 @@ def put_business_settings(request: BusinessSettings) -> dict[str, Any]:
              offline_enabled=excluded.offline_enabled,ed2k_directory=excluded.ed2k_directory,
              ed2k_poll_interval=excluded.ed2k_poll_interval,
              ed2k_retry_count=excluded.ed2k_retry_count,
-             ed2k_auto_archive=excluded.ed2k_auto_archive,updated_at=excluded.updated_at""",
+             ed2k_auto_archive=excluded.ed2k_auto_archive,p115_security_key=excluded.p115_security_key,updated_at=excluded.updated_at""",
             (WEB_INSTALLATION_ID, values["root_directory"].strip(), values["save_directory"].strip(),
              values["save_folder_id"].strip(), values["scrape_directory"].strip(), values["save_wait_seconds"], values["retry_count"],
              values["duplicate_policy"], int(values["subscription_auto_transfer"]), values["subscription_interval"], int(values["offline_enabled"]), values["ed2k_directory"].strip(),
              values["ed2k_poll_interval"], values["ed2k_retry_count"],
-             int(values["ed2k_auto_archive"]), int(time.time())),
+             int(values["ed2k_auto_archive"]), secret, int(time.time())),
         )
     return {"ok": True, **request.model_dump()}
 
@@ -2195,11 +2206,11 @@ def list_offline_tasks(page: int = Query(1, ge=1), page_size: int = Query(20, ge
 async def web_115_folders(cid: str = Query("", max_length=32)) -> dict[str, Any]:
     """读取当前115账号的网盘目录，cid 为空表示根目录。"""
     with database() as conn:
-        row = conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        row = conn.execute("SELECT p115_cookie,p115_security_key FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
     if not row or not row["p115_cookie"]:
         raise HTTPException(409, "115 尚未授权，请先到授权中心扫码或配置 Cookie")
     try:
-        result = await P115Client(decrypt(row["p115_cookie"]), REQUEST_TIMEOUT).folders(cid.strip())
+        result = await P115Client(decrypt(row["p115_cookie"]), REQUEST_TIMEOUT).folders(cid.strip(), _decrypt_optional(row["p115_security_key"]))
         return {**result, "cookie_ok": True}
     except P115Error as exc:
         if "Cookie" in str(exc) or "失效" in str(exc) or "UID" in str(exc):

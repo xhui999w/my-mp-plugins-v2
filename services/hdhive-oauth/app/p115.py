@@ -1,6 +1,7 @@
 """Minimal async 115 transfer client, adapted to the existing plugin workflow."""
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -33,7 +34,27 @@ class P115Client:
             raise P115Error("115 Cookie 已失效或无法获取账号 UID")
         return uid
 
-    async def folders(self, cid: str = "0") -> dict[str, Any]:
+    async def security_token(self, security_key: str, client: httpx.AsyncClient) -> str:
+        """用安全密钥换取 115 校验凭证 token，返回空串表示未配置安全密钥。"""
+        key = str(security_key or "").strip()
+        if not key:
+            return ""
+        passwd = hashlib.md5(f"{key:>06}".encode("ascii")).hexdigest()
+        response = await client.post(
+            "https://passportapi.115.com/app/1.0/web/1.0/user/security_key_check",
+            data={"passwd": passwd},
+            headers=self.headers,
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise P115Error("115 安全密钥验证接口返回异常") from exc
+        token = str((payload.get("data") or {}).get("token") or "")
+        if not token:
+            raise P115Error(str(payload.get("message") or payload.get("error") or "115 安全密钥验证失败"))
+        return token
+
+    async def folders(self, cid: str = "0", security_key: str = "") -> dict[str, Any]:
         """列出 115 网盘目录，cid='0' 表示根目录。"""
         if not self.cookie:
             raise P115Error("115 Cookie 未配置")
@@ -44,22 +65,35 @@ class P115Client:
         }
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             await self.user_id(client)
+            token = await self.security_token(security_key, client)
+            if token:
+                params["token"] = token
             response = await client.get("https://webapi.115.com/files", params=params, headers=self.headers)
             payload = response.json()
         if payload.get("state") is not True:
-            raise P115Error(str(payload.get("error") or payload.get("message") or "读取115目录失败"))
-        data = payload.get("data") or {}
-        raw_path = data.get("path") or []
+            error = str(payload.get("error") or payload.get("message") or "读取115目录失败")
+            if "安全密钥" in error:
+                raise P115Error("请先在业务设置中填写 115 安全密钥")
+            raise P115Error(error)
+        data = payload.get("data") or []
+        if isinstance(data, dict):
+            items = data.get("list") or []
+            raw_path = data.get("path") or []
+            count = int(data.get("folder_count") or len(items))
+        else:
+            items = data
+            raw_path = payload.get("path") or []
+            count = int(payload.get("count") or len(items))
         path_parts = [{"cid": str(item.get("cid") or ""), "name": str(item.get("name") or item.get("file_name") or "")} for item in raw_path if isinstance(item, dict)]
         folders: list[dict[str, Any]] = []
-        for item in data.get("list") or []:
+        for item in items:
             if not isinstance(item, dict):
                 continue
-            fid = str(item.get("cid") or "")
-            name = str(item.get("name") or item.get("file_name") or "")
+            fid = str(item.get("cid") or item.get("fid") or "")
+            name = str(item.get("name") or item.get("n") or item.get("file_name") or item.get("fn") or "")
             if fid and name:
                 folders.append({"cid": fid, "pid": str(item.get("pid") or ""), "name": name})
-        return {"cid": str(data.get("cid") or cid or "0"), "path": path_parts, "folders": folders, "count": int(data.get("folder_count") or len(folders))}
+        return {"cid": str(data.get("cid") if isinstance(data, dict) else cid or "0") or cid or "0", "path": path_parts, "folders": folders, "count": count}
 
     async def transfer(self, share_url: str, target_cid: str = "") -> dict[str, Any]:
         if not self.cookie:
