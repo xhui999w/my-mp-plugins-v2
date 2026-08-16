@@ -681,6 +681,43 @@ async def explore_media(media_type: str, tmdb_id: int) -> dict[str, Any]:
         return {"configured": True, "data": None, "error": "详情加载失败，请稍后重试。", "detail": type(exc).__name__}
 
 
+async def resolve_tmdb_id(media_type: str, title: str, year: str = "") -> dict[str, Any]:
+    """通过 TMDB 标题搜索反查 TMDB ID，用于只有豆瓣/标题、没有 TMDB ID 的影视。"""
+    if not title.strip():
+        return {}
+    tmdb = explore_tmdb_provider()
+    if not tmdb.configured:
+        return {}
+    try:
+        path = "/search/movie" if media_type == "movie" else "/search/tv"
+        payload, _ = await tmdb.request(path, {"query": title.strip(), "page": 1, "include_adult": "false"}, ttl=3600)
+    except Exception as exc:
+        logger.warning("module=media provider=tmdb operation=resolve_id error_type=%s reason=%s", type(exc).__name__, exc)
+        return {}
+    results = payload.get("results") or []
+    if not results:
+        return {}
+    target_year = str(year or "").strip()
+    best: dict[str, Any] | None = None
+    for raw in results:
+        date = str(raw.get("release_date") or raw.get("first_air_date") or "")
+        item_year = date[:4]
+        candidate = {
+            "tmdb_id": raw.get("id"),
+            "title": raw.get("title") or raw.get("name") or "",
+            "year": item_year,
+            "poster": f"https://image.tmdb.org/t/p/w342{raw.get('poster_path')}" if raw.get("poster_path") else "",
+            "backdrop": f"https://image.tmdb.org/t/p/w780{raw.get('backdrop_path')}" if raw.get("backdrop_path") else "",
+            "rating": round(float(raw.get("vote_average") or 0), 1),
+            "overview": raw.get("overview") or "",
+        }
+        if best is None:
+            best = candidate
+        if target_year and item_year == target_year:
+            return candidate
+    return best or {}
+
+
 @app.get("/api/web/media/search")
 async def web_media_search(keyword: str = Query(..., min_length=1, max_length=200), media_type: str = Query("", pattern="^(|movie|tv)$")) -> dict[str, Any]:
     """Search normalized media metadata; resource searching remains a separate shared step."""
@@ -699,12 +736,16 @@ async def web_media_search(keyword: str = Query(..., min_length=1, max_length=20
 
 
 @app.get("/api/web/media/detail")
-async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0)) -> dict[str, Any]:
+async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), title: str = Query("", max_length=200), year: str = Query("", max_length=4)) -> dict[str, Any]:
+    resolution: dict[str, Any] = {}
+    if not tmdb_id and title.strip():
+        resolution = await resolve_tmdb_id(media_type, title, year)
+        tmdb_id = int(resolution.get("tmdb_id") or 0)
     if not tmdb_id:
-        return {"data": None, "seasons": [], "configured": False}
+        return {"data": None, "seasons": [], "configured": False, "resolution": resolution}
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:
-        return {"data": None, "seasons": [], "configured": False}
+        return {"data": None, "seasons": [], "configured": False, "resolution": resolution}
     payload, cached = await tmdb.request(f"/{media_type}/{tmdb_id}", {"append_to_response": "credits"}, ttl=3600)
     item = tmdb.normalize(payload, media_type)
     item.update({
@@ -715,8 +756,7 @@ async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"),
         "directors": [x.get("name") for x in payload.get("credits", {}).get("crew", []) if x.get("job") in ("Director", "Series Director") and x.get("name")][:4],
     })
     seasons = [{"season_number": x.get("season_number"), "name": x.get("name"), "episode_count": x.get("episode_count") or 0, "air_date": x.get("air_date") or "", "poster": f"https://image.tmdb.org/t/p/w342{x.get('poster_path')}" if x.get("poster_path") else ""} for x in payload.get("seasons", []) if int(x.get("season_number") or 0) >= 0]
-    return {"data": item, "seasons": seasons, "configured": True, "cached": cached}
-
+    return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution}
 
 @app.get("/api/web/media/season")
 async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(..., ge=0)) -> dict[str, Any]:
@@ -1273,21 +1313,24 @@ def resource_registry() -> ResourceProviderRegistry:
     with database() as conn:
         configured = bool(conn.execute("SELECT 1 FROM installations WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone())
 
-    async def hdhive_query(media_type: str, tmdb_id: int, title: str) -> dict[str, Any]:
+    async def hdhive_query(media_type: str, tmdb_id: int, title: str) -> tuple[dict[str, Any], list[dict[str, str]]]:
         data: dict[str, Any] = {"items": []}
+        errors: list[dict[str, str]] = []
         if tmdb_id > 0:
             try:
                 data = await query_resources(ResourceQuery(media_type=media_type, tmdb_id=tmdb_id), WEB_INSTALLATION_ID)
             except HTTPException as exc:
+                errors.append({"provider": "hdhive", "error": f"按 TMDB ID 查询失败：{exc.detail}"})
                 logger.warning("module=resources provider=hdhive operation=tmdb_query error_type=%s reason=%s; falling_back=title", type(exc).__name__, exc.detail)
         if not _resource_items(data) and title.strip():
             try:
                 searched = await search_resources(SearchRequest(keyword=title.strip(), media_type=media_type), WEB_INSTALLATION_ID)
                 if _resource_items(searched):
-                    return searched
+                    return searched, errors
             except HTTPException as exc:
+                errors.append({"provider": "hdhive", "error": f"标题搜索失败：{exc.detail}"})
                 logger.warning("module=resources provider=hdhive operation=title_search error_type=%s reason=%s", type(exc).__name__, exc.detail)
-        return data
+        return data, errors
 
     return ResourceProviderRegistry([HDHiveResourceProvider(hdhive_query, configured=configured)])
 
@@ -1296,8 +1339,13 @@ def resource_registry() -> ResourceProviderRegistry:
 async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), title: str = Query("", max_length=200), douban_id: str = Query("", max_length=50), year: str = Query("", max_length=4)) -> dict[str, Any]:
     if not tmdb_id and not title.strip():
         raise HTTPException(400, "缺少可用于搜索的影视名称")
+    resolved_tmdb_id = tmdb_id
+    resolution: dict[str, Any] = {}
+    if not tmdb_id and title.strip():
+        resolution = await resolve_tmdb_id(media_type, title, year)
+        resolved_tmdb_id = int(resolution.get("tmdb_id") or 0)
     providers = resource_registry()
-    items, errors = await providers.search(media_type, tmdb_id, title)
+    items, errors = await providers.search(media_type, resolved_tmdb_id, title)
     for error in errors:
         logger.error("module=resources provider=%s operation=search error_type=ProviderError reason=%s", error["provider"], error["error"])
     source_counts: dict[str, int] = {}
@@ -1307,7 +1355,7 @@ async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$
     with database() as conn:
         settings = conn.execute("SELECT save_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
     save_path = str(settings["save_directory"] or "") if settings else ""
-    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "save_path": save_path, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}}
+    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "save_path": save_path, "resolved_tmdb_id": resolved_tmdb_id or None, "resolution": resolution, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}}
 
 
 class WebResourceTransfer(BaseModel):

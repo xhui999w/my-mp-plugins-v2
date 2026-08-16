@@ -22,9 +22,12 @@ class ResourceItem:
     size: str = ""
     subtitle: str = ""
     language: str = ""
+    audio: str = ""
     source_type: str = ""
     uploader: str = ""
     uploader_avatar: str = ""
+    user_level: str = ""
+    vip: bool = False
     points: int | None = None
     unlock_count: int | None = None
     publish_time: str = ""
@@ -71,7 +74,7 @@ class HDHiveResourceProvider(ResourceProvider):
     logo = "🎬"
     capabilities = ("search", "detail", "unlock", "transfer")
 
-    def __init__(self, query: Callable[[str, int, str], Awaitable[dict[str, Any]]], configured: bool = True):
+    def __init__(self, query: Callable[[str, int, str], Awaitable[Any]], configured: bool = True):
         self._query = query
         self._configured = configured
 
@@ -91,6 +94,21 @@ class HDHiveResourceProvider(ResourceProvider):
         return HDHiveResourceProvider._items(payload.get("data"))
 
     @staticmethod
+    def _clean_list(value: Any) -> str:
+        """HDHive 会把数组序列化成 Python 字面量字符串，例如 ['蓝光原盘/ISO']。"""
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            parts = [str(x).strip() for x in value if str(x).strip()]
+            return " / ".join(parts)
+        text = str(value).strip()
+        if text.startswith("[") and text.endswith("]"):
+            inner = text[1:-1]
+            parts = [x.strip().strip("'\"") for x in re.split(r"[,\n]", inner) if x.strip()]
+            return " / ".join(parts)
+        return text
+
+    @staticmethod
     def normalize(raw: dict[str, Any]) -> ResourceItem:
         slug = str(raw.get("slug") or raw.get("resource_slug") or raw.get("id") or "").strip()
         title = str(raw.get("title") or raw.get("name") or slug or "未命名资源").strip()
@@ -99,27 +117,57 @@ class HDHiveResourceProvider(ResourceProvider):
             tags = [x.strip() for x in re.split(r"[,/|]", tags) if x.strip()]
         share = str(raw.get("share_url") or raw.get("full_url") or "").strip()
         user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
+        media = raw.get("media") if isinstance(raw.get("media"), dict) else {}
+        points_value = raw.get("actual_unlock_points")
+        if points_value is None:
+            points_value = raw.get("unlock_points")
+        if points_value is None:
+            points_value = raw.get("points")
+        points: int | None = None
+        if str(points_value or "").isdigit():
+            points = int(points_value)
+        if raw.get("is_unlocked") or raw.get("is_free_for_user"):
+            points = 0
+        source_type = str(
+            raw.get("source_type") or raw.get("disk_type") or raw.get("cloud_type")
+            or raw.get("drive_type") or raw.get("pan_type") or raw.get("website") or "115网盘"
+        ).strip()
+        unlock_count: int | None = None
+        if str(raw.get("unlock_count") or "").isdigit():
+            unlock_count = int(raw.get("unlock_count"))
         return ResourceItem(
             provider="hdhive", provider_name="影巢", provider_resource_id=slug, title=title,
             original_title=str(raw.get("original_title") or ""),
             url=str(raw.get("url") or (f"https://hdhive.com/resource/{slug}" if slug else "")), share_url=share,
-            resolution=str(raw.get("resolution") or raw.get("definition") or ""),
-            quality=str(raw.get("quality") or raw.get("source") or ""), size=str(raw.get("size") or raw.get("file_size") or ""),
-            subtitle=str(raw.get("subtitle") or raw.get("subtitles") or ""), language=str(raw.get("language") or ""),
-            source_type=str(raw.get("source_type") or raw.get("disk_type") or raw.get("cloud_type") or raw.get("drive_type") or "115网盘"),
+            resolution=HDHiveResourceProvider._clean_list(raw.get("resolution") or raw.get("definition") or media.get("resolution") or ""),
+            quality=HDHiveResourceProvider._clean_list(raw.get("quality") or raw.get("source") or media.get("quality") or ""),
+            size=str(raw.get("size") or raw.get("file_size") or ""),
+            subtitle=HDHiveResourceProvider._clean_list(raw.get("subtitle") or raw.get("subtitles") or media.get("subtitle") or ""),
+            language=str(raw.get("language") or media.get("language") or ""),
+            audio=HDHiveResourceProvider._clean_list(raw.get("audio") or raw.get("audio_info") or media.get("audio") or ""),
+            source_type=source_type,
             uploader=str(raw.get("uploader") or raw.get("author") or raw.get("username") or user.get("name") or ""),
             uploader_avatar=str(raw.get("uploader_avatar") or raw.get("avatar") or user.get("avatar") or ""),
-            points=int(raw.get("points")) if str(raw.get("points") or "").isdigit() else None,
-            unlock_count=int(raw.get("unlock_count")) if str(raw.get("unlock_count") or "").isdigit() else None,
-            publish_time=str(raw.get("publish_time") or raw.get("created_at") or ""), season=str(raw.get("season") or ""), episode=str(raw.get("episode") or ""),
+            user_level=str(raw.get("user_level") or raw.get("level") or user.get("level") or ""),
+            vip=bool(raw.get("is_vip") or raw.get("vip") or raw.get("member") or user.get("is_vip")),
+            points=points,
+            unlock_count=unlock_count,
+            publish_time=str(raw.get("publish_time") or raw.get("created_at") or ""),
+            season=str(raw.get("season") if raw.get("season") is not None else media.get("season") or ""),
+            episode=str(raw.get("episode") if raw.get("episode") is not None else media.get("episode") or ""),
             resource_tags=[str(x) for x in tags], transfer_supported=bool(slug),
         )
 
-    async def search(self, media_type: str, tmdb_id: int, title: str = "") -> list[ResourceItem]:
+    async def search(self, media_type: str, tmdb_id: int, title: str = "") -> tuple[list[ResourceItem], list[dict[str, str]]]:
         if not self.configured:
-            return []
-        payload = await self._query(media_type, tmdb_id, title)
-        return [self.normalize(x) for x in self._items(payload)]
+            return [], []
+        result = await self._query(media_type, tmdb_id, title)
+        if isinstance(result, tuple):
+            payload, errors = result
+        else:
+            payload, errors = result, []
+        items = [self.normalize(x) for x in self._items(payload)]
+        return items, [dict(e) if isinstance(e, dict) else {"provider": self.id, "error": str(e)} for e in errors]
 
 
 class ResourceProviderRegistry:
@@ -133,7 +181,13 @@ class ResourceProviderRegistry:
             if not provider.enabled or not provider.configured:
                 continue
             try:
-                items.extend(await provider.search(media_type, tmdb_id, title))
+                result = await provider.search(media_type, tmdb_id, title)
+                if isinstance(result, tuple):
+                    provider_items, provider_errors = result
+                    items.extend(provider_items)
+                    errors.extend(provider_errors)
+                else:
+                    items.extend(result)
             except Exception as exc:  # isolation: one provider must not stop the rest
                 errors.append({"provider": provider.id, "error": str(exc)})
         return deduplicate_resources(items), errors

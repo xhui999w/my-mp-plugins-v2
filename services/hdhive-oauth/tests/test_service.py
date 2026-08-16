@@ -70,6 +70,43 @@ class OAuthServiceTests(unittest.TestCase):
         self.assertEqual(provider.received, ("movie", 0, "测试影片"))
         self.assertEqual(response.json()["match"]["douban_id"], "123")
 
+    def test_resource_search_resolves_tmdb_id_when_missing(self):
+        class Registry:
+            def __init__(self):
+                self.received = None
+            async def search(self, media_type, tmdb_id, title):
+                self.received = (media_type, tmdb_id, title)
+                return [], []
+            def infos(self):
+                return []
+
+        provider = Registry()
+        with patch.object(main, "resource_registry", return_value=provider), \
+             patch.object(main, "resolve_tmdb_id", new=AsyncMock(return_value={"tmdb_id": 532753, "title": "我不是药神", "year": "2018"})):
+            response = self.client.get("/api/web/resources/search", params={"media_type": "movie", "tmdb_id": 0, "title": "我不是药神", "douban_id": "26752088", "year": "2018"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(provider.received, ("movie", 532753, "我不是药神"))
+        self.assertEqual(response.json()["resolved_tmdb_id"], 532753)
+
+    def test_media_detail_resolves_title_without_tmdb_id(self):
+        tmdb_payload = {
+            "id": 532753, "title": "我不是药神", "original_title": "我不是药神",
+            "overview": "", "release_date": "2018-07-06", "vote_average": 8.2,
+            "genres": [], "production_countries": [], "status": "Released",
+            "credits": {"cast": [], "crew": []}, "seasons": [],
+        }
+        provider = Mock()
+        provider.configured = True
+        provider.normalize = main.TMDBProvider.normalize
+        provider.request = AsyncMock(return_value=(tmdb_payload, False))
+        with patch.object(main, "resolve_tmdb_id", new=AsyncMock(return_value={"tmdb_id": 532753})), \
+             patch.object(main, "explore_tmdb_provider", return_value=provider):
+            response = self.client.get("/api/web/media/detail", params={"media_type": "movie", "tmdb_id": 0, "title": "我不是药神", "year": "2018"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["resolved_tmdb_id"], 532753)
+        self.assertEqual(response.json()["data"]["tmdb_id"], 532753)
+
+
     def test_douban_subscription_without_tmdb_id_is_supported_and_deduplicated(self):
         payload = {"title": "豆瓣订阅测试", "media_type": "movie", "tmdb_id": 0, "douban_id": "1292052", "year": 1994}
         with main.database() as conn:

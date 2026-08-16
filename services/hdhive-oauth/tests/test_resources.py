@@ -55,5 +55,31 @@ class ResourceProviderTests(unittest.TestCase):
         self.assertEqual(errors[0]["provider"], "broken")
 
 
+    def test_normalize_cleans_python_list_quality_and_pan_type(self):
+        item = HDHiveResourceProvider.normalize({
+            "slug": "abc", "title": "电影", "quality": ["蓝光原盘/REMUX", "4K"],
+            "pan_type": "123云盘", "actual_unlock_points": 3, "media": {"season": 2, "episode": 5},
+        })
+        self.assertEqual(item.quality, "蓝光原盘/REMUX / 4K")
+        self.assertEqual(item.source_type, "123云盘")
+        self.assertEqual(item.points, 3)
+        self.assertEqual(item.season, "2")
+        self.assertEqual(item.episode, "5")
+
+    def test_normalize_parses_quoted_list_string(self):
+        item = HDHiveResourceProvider.normalize({"slug": "x", "title": "影片", "quality": "['蓝光原盘/ISO']", "is_free_for_user": True})
+        self.assertEqual(item.quality, "蓝光原盘/ISO")
+        self.assertEqual(item.points, 0)
+
+    def test_provider_search_surfaces_query_errors(self):
+        async def query(media_type, tmdb_id, title):
+            return {"items": []}, [{"provider": "hdhive", "error": "标题搜索失败：HDHive returned HTTP 404"}]
+
+        provider = HDHiveResourceProvider(query)
+        items, errors = asyncio.run(provider.search("movie", 0, "测试"))
+        self.assertEqual(items, [])
+        self.assertEqual(errors[0]["error"], "标题搜索失败：HDHive returned HTTP 404")
+
+
 if __name__ == "__main__":
     unittest.main()
