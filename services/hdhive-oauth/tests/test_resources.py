@@ -21,15 +21,37 @@ class FailingProvider(ResourceProvider):
 
 
 class ResourceProviderTests(unittest.TestCase):
-    def test_hdhive_normalization(self):
-        item = HDHiveResourceProvider.normalize({"slug": "abc", "title": "电影 2160P", "resolution": "4K", "size": "20 GB", "tags": "HDR,中字", "user": {"name": "分享者", "avatar": "https://img.example/u.jpg"}, "points": 2, "unlock_count": 9})
+    def test_hdhive_normalization_real_api_fields(self):
+        item = HDHiveResourceProvider.normalize({
+            "slug": "abc", "title": "电影 2160P", "resolution": "4K", "share_size": "20 GB",
+            "tags": "HDR,中字", "pan_type": "115",
+            "user": {"id": 1, "nickname": "分享者", "avatar_url": "https://img.example/u.jpg"},
+            "unlock_points": 2, "unlocked_users_count": 9, "is_unlocked": False,
+        })
         self.assertEqual(item.provider, "hdhive")
         self.assertEqual(item.provider_resource_id, "abc")
         self.assertTrue(item.transfer_supported)
         self.assertEqual(item.resource_tags, ["HDR", "中字"])
         self.assertEqual(item.uploader, "分享者")
+        self.assertEqual(item.uploader_avatar, "https://img.example/u.jpg")
+        self.assertEqual(item.size, "20 GB")
         self.assertEqual(item.points, 2)
         self.assertEqual(item.unlock_count, 9)
+        self.assertFalse(item.is_unlocked)
+        self.assertEqual(item.source_type, "115网盘")
+
+    def test_hdhive_normalization_non_115_source_is_not_transfer_supported(self):
+        item = HDHiveResourceProvider.normalize({"slug": "abc", "title": "电影", "pan_type": "quark", "unlock_points": 0})
+        self.assertFalse(item.transfer_supported)
+        self.assertEqual(item.source_type, "夸克网盘")
+
+    def test_hdhive_normalization_unlocked_flag_and_ed2k_offline(self):
+        item = HDHiveResourceProvider.normalize({"slug": "abc", "title": "电影", "pan_type": "115", "unlock_points": 2, "is_unlocked": True})
+        self.assertTrue(item.is_unlocked)
+        self.assertTrue(item.transfer_supported)
+        self.assertEqual(item.points, 2)
+        magnet = HDHiveResourceProvider.normalize({"slug": "m1", "title": "磁力", "pan_type": "magnet"})
+        self.assertTrue(magnet.transfer_supported)
 
     def test_deduplication_keeps_different_versions(self):
         same1 = ResourceItem("a", "A", "1", "影片", share_url="https://115.com/s/one", resolution="4K")
@@ -67,9 +89,10 @@ class ResourceProviderTests(unittest.TestCase):
         self.assertEqual(item.episode, "5")
 
     def test_normalize_parses_quoted_list_string(self):
-        item = HDHiveResourceProvider.normalize({"slug": "x", "title": "影片", "quality": "['蓝光原盘/ISO']", "is_free_for_user": True})
+        item = HDHiveResourceProvider.normalize({"slug": "x", "title": "影片", "quality": "['蓝光原盘/ISO']", "unlock_points": 0, "is_free_for_user": True})
         self.assertEqual(item.quality, "蓝光原盘/ISO")
         self.assertEqual(item.points, 0)
+        self.assertFalse(item.is_unlocked)
 
     def test_provider_search_surfaces_query_errors(self):
         async def query(media_type, tmdb_id, title):

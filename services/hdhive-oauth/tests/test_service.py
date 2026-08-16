@@ -386,6 +386,38 @@ class OAuthServiceTests(unittest.TestCase):
             row = conn.execute("SELECT title FROM web_subscriptions WHERE installation_id=? AND tmdb_id=998877", (main.WEB_INSTALLATION_ID,)).fetchone()
         self.assertEqual(row["title"], "Telegram测试影片")
 
+    def test_classify_share_link(self):
+        self.assertEqual(main.classify_share_link("https://115cdn.com/s/abc?password=1"), "115")
+        self.assertEqual(main.classify_share_link("https://115.com/s/abc"), "115")
+        self.assertEqual(main.classify_share_link("https://pan.quark.cn/s/abc"), "unsupported")
+        self.assertEqual(main.classify_share_link("magnet:?xt=urn:btih:abc"), "offline")
+        self.assertEqual(main.classify_share_link("ed2k://|file|a.mkv|1|abc|/"), "offline")
+        self.assertEqual(main.classify_share_link(""), "empty")
+
+    def test_transfer_reports_unsupported_source_without_calling_115(self):
+        with patch.object(main, "resolve_resource", new=AsyncMock(return_value={"name": "资源", "share_url": "https://pan.quark.cn/s/c2c3370f6d7e", "password": "", "files": [], "slug": "abc", "already_owned": False, "is_unlocked": True, "link_type": "unsupported", "pan_type": "quark", "uploader": "用户", "points": 0})), patch.object(main.P115Client, "transfer", new=AsyncMock()) as transfer_mock:
+            response = self.client.post("/api/web/resources/transfer", json={"provider": "hdhive", "resource_id": "abc"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("当前来源暂不支持直接转存115", response.json()["detail"])
+        transfer_mock.assert_not_called()
+
+    def test_transfer_115_success_updates_record(self):
+        now = int(main.time.time())
+        with main.database() as conn:
+            conn.execute("INSERT OR REPLACE INTO installations (installation_id,access_token,refresh_token,expires_at,user_json,updated_at) VALUES (?,?,?,?,?,?)", (main.WEB_INSTALLATION_ID, main.encrypt("access"), main.encrypt("refresh"), now + 3600, "{}", now))
+            conn.execute("INSERT INTO web_settings (installation_id,p115_cookie,updated_at) VALUES (?,?,?) ON CONFLICT(installation_id) DO UPDATE SET p115_cookie=excluded.p115_cookie", (main.WEB_INSTALLATION_ID, main.encrypt("UID=1"), now))
+            conn.execute("INSERT INTO transfer_records (installation_id,slug,name,share_url,status,processing_status,source_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (main.WEB_INSTALLATION_ID, "abc", "影片", "https://115cdn.com/s/abc123?password=x9", "resolved", "resolved", "115网盘", now, now))
+        with patch.object(main, "resolve_resource", new=AsyncMock(return_value={"name": "影片", "share_url": "https://115cdn.com/s/abc123?password=x9", "password": "x9", "files": [], "slug": "abc", "already_owned": False, "is_unlocked": True, "link_type": "115", "pan_type": "115", "uploader": "用户", "points": 0})), patch.object(main.P115Client, "transfer", new=AsyncMock(return_value={"ok": True, "count": 1, "message": "转存成功：1 个文件"})), patch.object(main, "_telegram_settings", return_value={"enabled": False}):
+            response = self.client.post("/api/web/resources/transfer", json={"provider": "hdhive", "resource_id": "abc"})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["transfer_status"], "completed")
+        self.assertEqual(body["link_type"], "115")
+        with main.database() as conn:
+            row = conn.execute("SELECT status,processing_status FROM transfer_records WHERE installation_id=? AND slug=? ORDER BY id DESC LIMIT 1", (main.WEB_INSTALLATION_ID, "abc")).fetchone()
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["processing_status"], "completed")
+
     def test_web_subscription_reuses_real_transfer_pipeline(self):
         now = int(main.time.time())
         with main.database() as conn:

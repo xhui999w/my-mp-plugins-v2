@@ -40,7 +40,7 @@ from .subscriptions_ui import subscriptions_html
 from .tasks_ui import tasks_html
 from .resource_ui import resource_detail_html
 from .search_ui import search_html
-from .resources import HDHiveResourceProvider, ResourceProviderRegistry, filter_options
+from .resources import HDHiveResourceProvider, ResourceProviderRegistry, filter_options, humanize_pan_type
 from .unlocks_ui import unlocks_html
 from .settings_ui import settings_html
 from .authorizations_ui import authorizations_html
@@ -82,6 +82,38 @@ RESOURCE_RE = re.compile(
     r"^https?://(?:[A-Za-z0-9-]+\.)?hdhive\.com/resource/([A-Za-z0-9-]+)/?$",
     re.IGNORECASE,
 )
+
+
+SHARE_115_RE = re.compile(r"(?:115\.com|115cdn\.com)/s/", re.IGNORECASE)
+OFFLINE_LINK_RE = re.compile(r"^(?:magnet:\?|ed2k://)", re.IGNORECASE)
+
+
+def classify_share_link(url: str) -> str:
+    """判断解锁后真实链接类型：115 / offline(magnet,ed2k) / unsupported / empty。"""
+    if not url.strip():
+        return "empty"
+    if SHARE_115_RE.search(url):
+        return "115"
+    if OFFLINE_LINK_RE.match(url):
+        return "offline"
+    return "unsupported"
+
+
+def _list_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return " / ".join(str(x).strip() for x in value if str(x).strip())
+    return str(value).strip()
+
+
+def _link_domain(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return str(urlparse(url).netloc or "unknown")
+    except Exception:
+        return "unknown"
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -757,9 +789,12 @@ async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"),
     })
     seasons = [{"season_number": x.get("season_number"), "name": x.get("name"), "episode_count": x.get("episode_count") or 0, "air_date": x.get("air_date") or "", "poster": f"https://image.tmdb.org/t/p/w342{x.get('poster_path')}" if x.get("poster_path") else ""} for x in payload.get("seasons", []) if int(x.get("season_number") or 0) >= 0]
     emby_status: str | None = None
+    emby_configured = False
+    emby_error = False
     with database() as conn:
         settings = conn.execute("SELECT emby_url,emby_api_key,emby_user_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
     if settings and settings["emby_url"] and settings["emby_api_key"] and settings["emby_user_id"]:
+        emby_configured = True
         try:
             token = _decrypt_optional(settings["emby_api_key"])
             headers = {"X-Emby-Token": token}
@@ -769,8 +804,9 @@ async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"),
                 emby_response.raise_for_status()
                 emby_status = "available" if emby_response.json().get("Items") else "missing"
         except Exception as exc:
+            emby_error = True
             logger.warning("module=media provider=emby operation=library_status error_type=%s reason=%s", type(exc).__name__, exc)
-    return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution, "emby_status": emby_status}
+    return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution, "emby_status": emby_status, "emby_configured": emby_configured, "emby_error": emby_error}
 
 @app.get("/api/web/media/season")
 async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(..., ge=0)) -> dict[str, Any]:
@@ -779,6 +815,7 @@ async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(
         raise HTTPException(409, "TMDB 尚未配置")
     payload, cached = await tmdb.request(f"/tv/{tmdb_id}/season/{season}", ttl=3600)
     emby_configured = False
+    emby_error = False
     emby_episode_keys: set[tuple[int, int]] = set()
     with database() as conn:
         settings = conn.execute("SELECT emby_url,emby_api_key,emby_user_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
@@ -796,14 +833,28 @@ async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(
                     episode_response = await client.get(f"{settings['emby_url'].rstrip('/')}/Shows/{series_items[0]['Id']}/Episodes", headers=headers, params={"UserId": settings["emby_user_id"], "Season": season, "Fields": "IndexNumber,ParentIndexNumber"})
                     episode_response.raise_for_status()
                     for emby_item in episode_response.json().get("Items", []):
-                        emby_episode_keys.add((int(emby_item.get("ParentIndexNumber") or season), int(emby_item.get("IndexNumber") or 0)))
+                        parent = emby_item.get("ParentIndexNumber")
+                        index = emby_item.get("IndexNumber")
+                        emby_episode_keys.add((int(season if parent is None else parent), int(index if index is not None else 0)))
         except Exception as exc:
+            emby_error = True
             logger.warning("module=media provider=emby operation=episode_status error_type=%s reason=%s", type(exc).__name__, exc)
     episodes = []
     for x in payload.get("episodes", []):
         key = (int(x.get("season_number") or season), int(x.get("episode_number") or 0))
-        episodes.append({"episode_number": x.get("episode_number"), "season_number": x.get("season_number", season), "name": x.get("name") or "未命名", "overview": x.get("overview") or "", "air_date": x.get("air_date") or "", "still": f"https://image.tmdb.org/t/p/w500{x.get('still_path')}" if x.get("still_path") else "", "emby_status": "available" if key in emby_episode_keys else "missing"})
-    return {"items": episodes, "cached": cached, "emby_configured": emby_configured}
+        if not emby_configured:
+            emby_status = "unconfigured"
+        elif emby_error:
+            emby_status = "unknown"
+        else:
+            emby_status = "available" if key in emby_episode_keys else "missing"
+        episodes.append({"episode_number": x.get("episode_number"), "season_number": x.get("season_number", season), "name": x.get("name") or "未命名", "overview": x.get("overview") or "", "air_date": x.get("air_date") or "", "still": f"https://image.tmdb.org/t/p/w500{x.get('still_path')}" if x.get("still_path") else "", "emby_status": emby_status})
+    total = len(episodes)
+    available = sum(1 for e in episodes if e["emby_status"] == "available")
+    stats: dict[str, Any] | None = None
+    if emby_configured and not emby_error:
+        stats = {"total": total, "available": available, "missing": total - available, "completed": total > 0 and available == total}
+    return {"items": episodes, "cached": cached, "emby_configured": emby_configured, "emby_error": emby_error, "stats": stats}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1193,48 +1244,81 @@ async def resolve_resource(
         slug = match.group(1) if match else ""
     if not re.fullmatch(r"[A-Za-z0-9-]+", slug):
         raise HTTPException(400, "Invalid HDHive resource slug")
+    detail: dict[str, Any] = {}
+    url = ""
+    password = ""
+    files: list[Any] = []
+    already_owned = False
     try:
-        if request.max_unlock_points is not None:
-            detail = await authorized_request(
-                installation_id, "GET", f"/api/open/shares/{quote(slug)}"
-            )
-            unlocked = bool(detail.get("is_unlocked") or detail.get("is_free_for_user"))
-            points = int(
-                detail.get("actual_unlock_points") or detail.get("unlock_points") or 0
-            )
-            if not unlocked and points > request.max_unlock_points:
-                raise HTTPException(
-                    409,
-                    f"UNLOCK_BUDGET_EXCEEDED: need {points}, limit {request.max_unlock_points}",
-                )
-        data = await authorized_request(
-            installation_id,
-            "POST",
-            "/api/open/resources/unlock",
-            body={"slug": slug},
+        detail = await authorized_request(
+            installation_id, "GET", f"/api/open/shares/{quote(slug)}"
         )
+        unlocked = bool(detail.get("is_unlocked"))
+        points = int(
+            detail.get("actual_unlock_points")
+            if detail.get("actual_unlock_points") is not None
+            else detail.get("unlock_points") or 0
+        )
+        if request.max_unlock_points is not None and not unlocked and points > request.max_unlock_points:
+            raise HTTPException(
+                409,
+                f"UNLOCK_BUDGET_EXCEEDED: need {points}, limit {request.max_unlock_points}",
+            )
+        # 已解锁且本地已保存真实链接 → 直接复用，不再调用解锁接口，避免重复扣积分
+        reuse_url = ""
+        with database() as conn:
+            row = conn.execute(
+                "SELECT share_url FROM transfer_records WHERE installation_id=? AND slug=? AND share_url!='' ORDER BY id DESC LIMIT 1",
+                (installation_id, slug),
+            ).fetchone()
+            if row:
+                reuse_url = str(row["share_url"] or "")
+        if unlocked and reuse_url:
+            url = reuse_url
+            already_owned = True
+            logger.info("module=resources provider=hdhive operation=resolve reuse=true already_unlocked=true slug=%s", slug)
+        else:
+            data = await authorized_request(
+                installation_id,
+                "POST",
+                "/api/open/resources/unlock",
+                body={"slug": slug},
+            )
+            url = str(data.get("full_url") or data.get("url") or "").strip()
+            password = str(data.get("access_code") or "")
+            files = data.get("files") if isinstance(data.get("files"), list) else []
+            already_owned = bool(data.get("already_owned"))
+            logger.info("module=resources provider=hdhive operation=unlock success slug=%s link_type=%s already_owned=%s", slug, classify_share_link(url), already_owned)
     except HDHiveAPIError as exc:
+        logger.warning("module=resources provider=hdhive operation=resolve error_type=HDHiveAPIError code=%s reason=%s", exc.code, exc.message)
         raise HTTPException(exc.status, f"{exc.code}: {exc.message}") from exc
-    url = str(data.get("full_url") or data.get("url") or "").strip()
-    name = str(data.get("title") or data.get("name") or slug)
+    name = str(detail.get("title") or detail.get("name") or slug)
+    user = detail.get("user") if isinstance(detail.get("user"), dict) else {}
+    uploader = str(user.get("nickname") or user.get("username") or user.get("name") or "")
     now = int(time.time())
+    source_type = humanize_pan_type(detail.get("pan_type")) or "其他来源"
     with database() as conn:
         conn.execute(
             """INSERT INTO transfer_records
                (installation_id,slug,name,share_url,status,resolution,quality,size,uploader,points,action,processing_status,source_type,created_at,updated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (installation_id, slug, name, url, "resolved", str(data.get("resolution") or ""),
-             str(data.get("quality") or ""), str(data.get("size") or data.get("file_size") or ""),
-             str(data.get("uploader") or data.get("author") or ""), int(data.get("unlock_points") or 0),
-             "资源解锁", "resolved", "115网盘", now, now),
+            (installation_id, slug, name, url, "resolved",
+             _list_text(detail.get("video_resolution")), _list_text(detail.get("source")),
+             str(detail.get("share_size") or detail.get("size") or ""), uploader,
+             int(detail.get("unlock_points") or 0), "资源解锁", "resolved", source_type, now, now),
         )
     return {
         "name": name,
         "share_url": url,
-        "password": str(data.get("access_code") or ""),
-        "files": data.get("files") if isinstance(data.get("files"), list) else [],
+        "password": password,
+        "files": files,
         "slug": slug,
-        "already_owned": bool(data.get("already_owned")),
+        "already_owned": already_owned,
+        "is_unlocked": bool(detail.get("is_unlocked")),
+        "link_type": classify_share_link(url),
+        "pan_type": str(detail.get("pan_type") or ""),
+        "uploader": uploader,
+        "points": int(detail.get("unlock_points") or 0),
     }
 
 
@@ -1383,30 +1467,45 @@ async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
         raise HTTPException(400, "该资源来源暂不支持转存")
     try:
         result = await resolve_resource(ResolveRequest(slug=request.resource_id, max_unlock_points=None), WEB_INSTALLATION_ID)
+        share_url = str(result.get("share_url") or "").strip()
+        link_type = classify_share_link(share_url)
+        if link_type == "empty":
+            raise HTTPException(502, "影巢解锁成功但未返回分享链接，请稍后重试")
+        if link_type == "unsupported":
+            logger.info("module=resources provider=hdhive operation=transfer unsupported_link=true slug=%s link_domain=%s", request.resource_id, _link_domain(share_url))
+            raise HTTPException(400, "当前来源暂不支持直接转存115（影巢已解锁并保留原链接，可在解锁记录中查看）")
         with database() as conn:
-            settings = conn.execute("SELECT p115_cookie,save_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+            settings = conn.execute("SELECT p115_cookie,save_directory,ed2k_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
         if not settings or not settings["p115_cookie"]:
             raise HTTPException(409, "影巢资源已解锁，但115尚未授权；请到授权中心配置 Cookie 后重试")
         client = P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT)
-        transferred = await client.transfer(result["share_url"], settings["save_directory"] or "")
+        logger.info("module=resources provider=115 operation=transfer_start link_type=%s slug=%s", link_type, request.resource_id)
+        save_path = settings["save_directory"] or ""
+        if link_type == "115":
+            transferred = await client.transfer(share_url, save_path)
+        else:
+            save_path = settings["ed2k_directory"] or ""
+            offline = await client.offline(share_url, save_path)
+            transferred = {**offline, "message": "已提交115离线下载任务" if offline.get("ok") else offline.get("message")}
+        logger.info("module=resources provider=115 operation=transfer_success link_type=%s slug=%s", link_type, request.resource_id)
         with database() as conn:
-            conn.execute("UPDATE transfer_records SET status='completed',processing_status='completed',save_path=?,updated_at=? WHERE installation_id=? AND slug=? AND id=(SELECT MAX(id) FROM transfer_records WHERE installation_id=? AND slug=?)",
-                         (settings["save_directory"] or "", int(time.time()), WEB_INSTALLATION_ID, request.resource_id, WEB_INSTALLATION_ID, request.resource_id))
+            conn.execute("UPDATE transfer_records SET status='completed',processing_status='completed',save_path=?,error='',updated_at=? WHERE installation_id=? AND slug=? AND id=(SELECT MAX(id) FROM transfer_records WHERE installation_id=? AND slug=?)",
+                         (save_path, int(time.time()), WEB_INSTALLATION_ID, request.resource_id, WEB_INSTALLATION_ID, request.resource_id))
         try:
             service = notification_service()
             config = _telegram_settings(False)
             if config["enabled"]:
-                await service.notify("transfer_success", {"title": result["name"], "status": "转存成功", "resource": request.resource_id, "resolution": "", "size": "", "save_path": settings["save_directory"] or "115根目录", "error": ""})
+                await service.notify("transfer_success", {"title": result["name"], "status": "转存成功", "resource": request.resource_id, "resolution": "", "size": "", "save_path": save_path or "115根目录", "error": ""})
         except Exception:
             logger.exception("module=notifications provider=telegram operation=transfer_success")
-        return {**result, **transferred, "provider": request.provider, "transfer_status": "completed"}
+        return {**result, **transferred, "provider": request.provider, "transfer_status": "completed", "link_type": link_type}
     except P115Error as exc:
         logger.error("module=resources provider=115 operation=transfer error_type=P115Error reason=%s", exc)
         with database() as conn:
             conn.execute("UPDATE transfer_records SET status='failed',processing_status='failed',error=?,updated_at=? WHERE installation_id=? AND slug=?", (str(exc), int(time.time()), WEB_INSTALLATION_ID, request.resource_id))
         try:
             if _telegram_settings(False)["enabled"]:
-                await notification_service().notify("transfer_failed", {"title": request.resource_id, "status": "转存失败", "resource": request.provider, "resolution": "", "size": "", "save_path": "", "error": str(exc)})
+                await notification_service().notify("transfer_failed", {"title": result.get("name", request.resource_id), "status": "转存失败", "resource": request.provider, "resolution": "", "size": "", "save_path": "", "error": str(exc)})
         except Exception:
             logger.exception("module=notifications provider=telegram operation=transfer_failed")
         raise HTTPException(502, str(exc)) from exc

@@ -19,7 +19,7 @@ class P115Client:
 
     @staticmethod
     def share_parts(url: str) -> tuple[str, str]:
-        match = re.search(r"115\.com/s/([A-Za-z0-9]+)", url)
+        match = re.search(r"(?:115\.com|115cdn\.com)/s/([A-Za-z0-9]+)", url)
         if not match:
             raise P115Error("不是有效的115分享链接")
         query = parse_qs(urlparse(url).query)

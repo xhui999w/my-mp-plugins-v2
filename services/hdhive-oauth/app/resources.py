@@ -29,6 +29,7 @@ class ResourceItem:
     user_level: str = ""
     vip: bool = False
     points: int | None = None
+    is_unlocked: bool = False
     unlock_count: int | None = None
     publish_time: str = ""
     season: str = ""
@@ -66,6 +67,30 @@ class ResourceProvider:
 
     def info(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "logo": self.logo, "enabled": self.enabled, "configured": self.configured, "capabilities": list(self.capabilities)}
+
+
+PAN_TYPE_LABELS = {
+    "115": "115网盘",
+    "quark": "夸克网盘",
+    "aliPan": "阿里云盘",
+    "aliyun": "阿里云盘",
+    "baiDu": "百度网盘",
+    "xunLei": "迅雷",
+    "tianyi": "天翼云盘",
+    "123": "123云盘",
+    "139": "移动云盘",
+    "guangYa": "光丫网盘",
+    "ed2k": "ED2K",
+    "magnet": "磁力链接",
+}
+
+
+def humanize_pan_type(value: object) -> str:
+    """把影巢 pan_type 映射为可读网盘名称，未知类型原样返回。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return PAN_TYPE_LABELS.get(text) or text
 
 
 class HDHiveResourceProvider(ResourceProvider):
@@ -124,38 +149,42 @@ class HDHiveResourceProvider(ResourceProvider):
         if points_value is None:
             points_value = raw.get("points")
         points: int | None = None
-        if str(points_value or "").isdigit():
+        if isinstance(points_value, (int, float)) and not isinstance(points_value, bool):
             points = int(points_value)
-        if raw.get("is_unlocked") or raw.get("is_free_for_user"):
-            points = 0
-        source_type = str(
-            raw.get("source_type") or raw.get("disk_type") or raw.get("cloud_type")
-            or raw.get("drive_type") or raw.get("pan_type") or raw.get("website") or "115网盘"
+        elif str(points_value or "").isdigit():
+            points = int(points_value)
+        is_unlocked = bool(raw.get("is_unlocked"))
+        raw_pan = str(
+            raw.get("pan_type") or raw.get("source_type") or raw.get("disk_type")
+            or raw.get("cloud_type") or raw.get("drive_type") or raw.get("website") or ""
         ).strip()
+        source_type = humanize_pan_type(raw_pan) or "其他来源"
+        transfer_supported = raw_pan.strip().lower() in ("115", "magnet", "ed2k")
         unlock_count: int | None = None
-        if str(raw.get("unlock_count") or "").isdigit():
-            unlock_count = int(raw.get("unlock_count"))
+        if str(raw.get("unlocked_users_count") or raw.get("unlock_count") or "").isdigit():
+            unlock_count = int(raw.get("unlocked_users_count") or raw.get("unlock_count"))
         return ResourceItem(
             provider="hdhive", provider_name="影巢", provider_resource_id=slug, title=title,
             original_title=str(raw.get("original_title") or ""),
             url=str(raw.get("url") or (f"https://hdhive.com/resource/{slug}" if slug else "")), share_url=share,
             resolution=HDHiveResourceProvider._clean_list(raw.get("resolution") or raw.get("definition") or media.get("resolution") or ""),
             quality=HDHiveResourceProvider._clean_list(raw.get("quality") or raw.get("source") or media.get("quality") or ""),
-            size=str(raw.get("size") or raw.get("file_size") or ""),
+            size=str(raw.get("share_size") or raw.get("size") or raw.get("file_size") or ""),
             subtitle=HDHiveResourceProvider._clean_list(raw.get("subtitle") or raw.get("subtitles") or media.get("subtitle") or ""),
             language=str(raw.get("language") or media.get("language") or ""),
             audio=HDHiveResourceProvider._clean_list(raw.get("audio") or raw.get("audio_info") or media.get("audio") or ""),
             source_type=source_type,
-            uploader=str(raw.get("uploader") or raw.get("author") or raw.get("username") or user.get("name") or ""),
-            uploader_avatar=str(raw.get("uploader_avatar") or raw.get("avatar") or user.get("avatar") or ""),
+            uploader=str(user.get("nickname") or user.get("name") or raw.get("uploader") or raw.get("author") or raw.get("username") or ""),
+            uploader_avatar=str(user.get("avatar_url") or user.get("avatar") or raw.get("uploader_avatar") or raw.get("avatar") or ""),
             user_level=str(raw.get("user_level") or raw.get("level") or user.get("level") or ""),
             vip=bool(raw.get("is_vip") or raw.get("vip") or raw.get("member") or user.get("is_vip")),
             points=points,
+            is_unlocked=is_unlocked,
             unlock_count=unlock_count,
             publish_time=str(raw.get("publish_time") or raw.get("created_at") or ""),
             season=str(raw.get("season") if raw.get("season") is not None else media.get("season") or ""),
             episode=str(raw.get("episode") if raw.get("episode") is not None else media.get("episode") or ""),
-            resource_tags=[str(x) for x in tags], transfer_supported=bool(slug),
+            resource_tags=[str(x) for x in tags], transfer_supported=transfer_supported,
         )
 
     async def search(self, media_type: str, tmdb_id: int, title: str = "") -> tuple[list[ResourceItem], list[dict[str, str]]]:
