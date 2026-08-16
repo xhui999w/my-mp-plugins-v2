@@ -40,6 +40,8 @@ class OAuthServiceTests(unittest.TestCase):
             conn.execute("DELETE FROM subscription_runs WHERE installation_id=?", (self.installation_id,))
             conn.execute("DELETE FROM transfer_records WHERE installation_id=?", (self.installation_id,))
             conn.execute("DELETE FROM web_subscriptions WHERE installation_id=?", (self.installation_id,))
+            conn.execute("DELETE FROM search_history")
+            conn.execute("DELETE FROM resource_search_cache")
 
     def test_health(self):
         self.assertEqual(self.client.get("/health").json()["ok"], True)
@@ -48,7 +50,7 @@ class OAuthServiceTests(unittest.TestCase):
         explore = self.client.get("/explore").text
         detail = self.client.get("/resources").text
         search = self.client.get("/search").text
-        self.assertIn("ⓘ 详情", explore)
+        self.assertIn("title=\"查看详情\"", explore)
         self.assertNotIn("data-action=\"search\"", explore)
         self.assertIn("返回汇影", detail)
         self.assertIn("TMDB / Emby 季与集", detail)
@@ -56,7 +58,7 @@ class OAuthServiceTests(unittest.TestCase):
         self.assertIn("data-collapsed", detail)
         self.assertIn("resolved_tmdb_id", detail)
         self.assertIn("影视与资源搜索", search)
-        self.assertIn("ⓘ 详情", search)
+        self.assertIn("title=\"查看详情\"", search)
         self.assertIn("data-action=\"subscribe\"", search)
 
     def test_resource_search_accepts_title_without_tmdb_id(self):
@@ -106,7 +108,7 @@ class OAuthServiceTests(unittest.TestCase):
         provider.request = AsyncMock(return_value=(tmdb_payload, False))
         with patch.object(main, "resolve_tmdb_id", new=AsyncMock(return_value={"tmdb_id": 532753})), \
              patch.object(main, "explore_tmdb_provider", return_value=provider):
-            response = self.client.get("/api/web/media/detail", params={"media_type": "movie", "tmdb_id": 0, "title": "我不是药神", "year": "2018"})
+            response = self.client.get("/api/web/media/detail", params={"media_type": "movie", "tmdb_id": 0, "title": "深海特搜", "year": "2023"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["resolved_tmdb_id"], 532753)
         self.assertEqual(response.json()["data"]["tmdb_id"], 532753)
@@ -216,7 +218,7 @@ class OAuthServiceTests(unittest.TestCase):
         page = self.client.get("/unlocks")
         self.assertEqual(page.status_code, 200)
         self.assertIn("批量删除", page.text)
-        self.assertIn("全部处理状态", page.text)
+        self.assertIn("全部转存状态", page.text)
 
     def test_subscription_manual_run_and_error(self):
         created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": "执行测试", "media_type": "movie", "tmdb_id": 8899}).json()
@@ -411,12 +413,14 @@ class OAuthServiceTests(unittest.TestCase):
             response = self.client.post("/api/web/resources/transfer", json={"provider": "hdhive", "resource_id": "abc"})
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["transfer_status"], "completed")
+        self.assertEqual(body["transfer_status"], "success")
         self.assertEqual(body["link_type"], "115")
         with main.database() as conn:
-            row = conn.execute("SELECT status,processing_status FROM transfer_records WHERE installation_id=? AND slug=? ORDER BY id DESC LIMIT 1", (main.WEB_INSTALLATION_ID, "abc")).fetchone()
+            row = conn.execute("SELECT status,processing_status,unlock_status,transfer_status FROM transfer_records WHERE installation_id=? AND slug=? ORDER BY id DESC LIMIT 1", (main.WEB_INSTALLATION_ID, "abc")).fetchone()
         self.assertEqual(row["status"], "completed")
         self.assertEqual(row["processing_status"], "completed")
+        self.assertEqual(row["unlock_status"], "unlocked")
+        self.assertEqual(row["transfer_status"], "success")
 
     def test_web_subscription_reuses_real_transfer_pipeline(self):
         now = int(main.time.time())
@@ -428,6 +432,76 @@ class OAuthServiceTests(unittest.TestCase):
             result = self.client.post(f"/api/web/subscriptions/{created['id']}/run").json()
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["transfer_count"], 1)
+
+
+    def test_search_history_and_cache_persistence(self):
+        class Registry:
+            async def search(self, media_type, tmdb_id, title):
+                return [], []
+            def infos(self):
+                return []
+
+        provider = Registry()
+        with patch.object(main, "resource_registry", return_value=provider),              patch.object(main, "resolve_tmdb_id", new=AsyncMock(return_value={"tmdb_id": 532753, "title": "我不是药神", "year": "2018"})):
+            response = self.client.get("/api/web/resources/search", params={"media_type": "movie", "tmdb_id": 0, "title": "深海特搜", "year": "2023", "poster": "https://img.example/p.jpg"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["searched_at"])
+        cached = self.client.get("/api/web/resources/search/cached", params={"media_type": "movie", "tmdb_id": 0, "title": "深海特搜", "year": "2023"}).json()
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["resolved_tmdb_id"], 532753)
+        history = self.client.get("/api/web/search-history").json()
+        self.assertEqual(history["items"][0]["title"], "深海特搜")
+        self.assertEqual(history["items"][0]["result_count"], 0)
+        hid = history["items"][0]["id"]
+        self.assertEqual(self.client.delete(f"/api/web/search-history/{hid}").status_code, 200)
+        self.assertEqual(self.client.get("/api/web/search-history").json()["items"], [])
+        self.client.get("/api/web/resources/search", params={"media_type": "tv", "tmdb_id": 0, "title": "狂飙"})
+        cleared = self.client.delete("/api/web/search-history").json()
+        self.assertEqual(cleared["deleted"], 1)
+
+    def test_unlock_transfer_status_migration(self):
+        now = int(main.time.time())
+        with main.database() as conn:
+            conn.execute("DELETE FROM transfer_records WHERE installation_id=? AND slug LIKE 'mig-%'", (main.WEB_INSTALLATION_ID,))
+            for status, share in (("completed", "https://115cdn.com/s/abc123"), ("resolved", "https://115cdn.com/s/def456"), ("failed", ""), ("failed", "https://pan.quark.cn/s/x1")):
+                conn.execute("INSERT INTO transfer_records (installation_id,slug,name,share_url,status,processing_status,source_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                             (main.WEB_INSTALLATION_ID, "mig-" + status + share[:3], "迁移测试", share, status, status, "115网盘", now, now))
+        main.init_database()
+        with main.database() as conn:
+            completed = conn.execute("SELECT unlock_status,transfer_status FROM transfer_records WHERE slug='mig-completedhtt'").fetchone()
+            resolved = conn.execute("SELECT unlock_status,transfer_status FROM transfer_records WHERE slug='mig-resolvedhtt'").fetchone()
+            failed_empty = conn.execute("SELECT unlock_status,transfer_status FROM transfer_records WHERE slug='mig-failed'").fetchone()
+            failed_share = conn.execute("SELECT unlock_status,transfer_status FROM transfer_records WHERE slug='mig-failedhtt'").fetchone()
+        self.assertEqual(dict(completed), {"unlock_status": "unlocked", "transfer_status": "success"})
+        self.assertEqual(dict(resolved), {"unlock_status": "unlocked", "transfer_status": "pending"})
+        self.assertEqual(dict(failed_empty), {"unlock_status": "failed", "transfer_status": "pending"})
+        self.assertEqual(dict(failed_share), {"unlock_status": "unlocked", "transfer_status": "failed"})
+
+    def test_log_center_endpoints_and_masking(self):
+        with main.database() as conn:
+            conn.execute("INSERT INTO app_logs (ts, level, module, message) VALUES (?,?,?,?)", (int(main.time.time()), "ERROR", "resources", "module=resources provider=115 operation=transfer error_type=P115Error token=SECRET123"))
+        page = self.client.get("/logs").text
+        self.assertIn("日志中心", page)
+        logs = self.client.get("/api/web/logs", params={"level": "ERROR", "module": "resources"}).json()
+        self.assertTrue(logs["total"] >= 1)
+        self.assertIn("SECRET", logs["items"][0]["message"])
+        modules = self.client.get("/api/web/logs/modules").json()
+        self.assertIn("resources", modules["modules"])
+        with main.database() as conn:
+            conn.execute("DELETE FROM app_logs WHERE module='resources' AND message LIKE '%SECRET123%'")
+
+    def test_115_folders_endpoint(self):
+        now = int(main.time.time())
+        with main.database() as conn:
+            conn.execute("INSERT INTO web_settings (installation_id,p115_cookie,updated_at) VALUES (?,?,?) ON CONFLICT(installation_id) DO UPDATE SET p115_cookie=excluded.p115_cookie", (main.WEB_INSTALLATION_ID, main.encrypt("UID=1"), now))
+        with patch.object(main.P115Client, "folders", new=AsyncMock(return_value={"cid": "0", "path": [], "folders": [{"cid": "1001", "pid": "0", "name": "影视"}], "count": 1})):
+            response = self.client.get("/api/web/115/folders")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["folders"][0]["name"], "影视")
+        with patch.object(main.P115Client, "folders", new=AsyncMock(side_effect=main.P115Error("115 Cookie 已失效或无法获取账号 UID"))):
+            failed = self.client.get("/api/web/115/folders")
+        self.assertEqual(failed.status_code, 401)
+        self.assertIn("重新扫码", failed.json()["detail"])
 
 
 if __name__ == "__main__":

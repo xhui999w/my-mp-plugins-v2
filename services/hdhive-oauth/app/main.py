@@ -42,6 +42,7 @@ from .resource_ui import resource_detail_html
 from .search_ui import search_html
 from .resources import HDHiveResourceProvider, ResourceProviderRegistry, filter_options, humanize_pan_type
 from .unlocks_ui import unlocks_html
+from .logs_ui import logs_html
 from .settings_ui import settings_html
 from .authorizations_ui import authorizations_html
 from .telegram_ui import telegram_html
@@ -285,6 +286,36 @@ def init_database() -> None:
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS resource_search_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            tmdb_id INTEGER DEFAULT 0,
+            douban_id TEXT DEFAULT '',
+            title TEXT NOT NULL,
+            year TEXT DEFAULT '',
+            result_json TEXT NOT NULL,
+            searched_at INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS search_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            media_type TEXT DEFAULT '',
+            year TEXT DEFAULT '',
+            tmdb_id INTEGER DEFAULT 0,
+            douban_id TEXT DEFAULT '',
+            poster TEXT DEFAULT '',
+            result_count INTEGER DEFAULT 0,
+            searched_at INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS app_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            level TEXT NOT NULL,
+            module TEXT DEFAULT '',
+            message TEXT NOT NULL
+        )""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(web_settings)")}
         for name, definition in (
             ("tmdb_api_key", "TEXT DEFAULT ''"),
@@ -298,6 +329,7 @@ def init_database() -> None:
             ("apple_token", "TEXT DEFAULT ''"),
             ("root_directory", "TEXT DEFAULT ''"),
             ("scrape_directory", "TEXT DEFAULT ''"),
+            ("save_folder_id", "TEXT DEFAULT ''"),
             ("save_wait_seconds", "INTEGER DEFAULT 30"),
             ("retry_count", "INTEGER DEFAULT 3"),
             ("duplicate_policy", "TEXT DEFAULT 'skip'"),
@@ -347,9 +379,77 @@ def init_database() -> None:
             ("action", "TEXT DEFAULT '资源解锁'"), ("save_path", "TEXT DEFAULT ''"),
             ("processing_status", "TEXT DEFAULT 'pending'"),
             ("source_type", "TEXT DEFAULT '115网盘'"), ("updated_at", "INTEGER DEFAULT 0"),
+            ("unlock_status", "TEXT DEFAULT ''"), ("transfer_status", "TEXT DEFAULT ''"),
         ):
             if name not in transfer_columns:
                 conn.execute(f"ALTER TABLE transfer_records ADD COLUMN {name} {definition}")
+        # 安全迁移：把旧 status 拆分为 unlock_status / transfer_status，只处理一次
+        migrated = conn.execute("SELECT COUNT(*) FROM transfer_records WHERE (unlock_status='' OR transfer_status='') AND status!=''").fetchone()[0]
+        if migrated:
+            rows = conn.execute("SELECT id,status,share_url FROM transfer_records WHERE (unlock_status='' OR transfer_status='') AND status!=''").fetchall()
+            for row in rows:
+                if row["status"] == "completed":
+                    unlock_s, transfer_s = "unlocked", "success"
+                elif row["status"] == "resolved":
+                    unlock_s, transfer_s = "unlocked", "pending"
+                elif row["status"] == "failed":
+                    unlock_s = "unlocked" if (row["share_url"] or "") else "failed"
+                    transfer_s = "failed" if (row["share_url"] or "") else "pending"
+                else:
+                    unlock_s, transfer_s = "pending", "pending"
+                conn.execute("UPDATE transfer_records SET unlock_status=?,transfer_status=? WHERE id=?", (unlock_s, transfer_s, row["id"]))
+    install_db_log_handler()
+
+
+_SECRET_PATTERN = re.compile(r"(?i)\b(cookie|token|api[_-]?key|password|passwd|secret|authorization|access[_-]?key)[=:]\s*([^\s&,;\"]{3,})")
+
+
+def _mask_secrets(text: str) -> str:
+    return _SECRET_PATTERN.sub(lambda m: f"{m.group(1)}=***", text)
+
+
+class DBLogHandler(logging.Handler):
+    """Persist business logs to app_logs with token/cookie/key masking."""
+
+    _installed = False
+    _emit_count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = _mask_secrets(self.format(record))
+            match = re.search(r"(?:^|\s)module=([A-Za-z0-9_\-]+)", message)
+            module = match.group(1) if match else ""
+            with database() as conn:
+                conn.execute(
+                    "INSERT INTO app_logs (ts, level, module, message) VALUES (?,?,?,?)",
+                    (int(record.created), record.levelname, module, message[:4000]),
+                )
+            DBLogHandler._emit_count += 1
+            if DBLogHandler._emit_count % 200 == 0:
+                self._prune()
+        except Exception:
+            pass
+
+    def _prune(self) -> None:
+        try:
+            with database() as conn:
+                conn.execute("DELETE FROM app_logs WHERE ts < ?", (int(time.time()) - 30 * 86400,))
+                conn.execute(
+                    "DELETE FROM app_logs WHERE id NOT IN (SELECT id FROM app_logs ORDER BY id DESC LIMIT 10000)"
+                )
+        except Exception:
+            pass
+
+
+def install_db_log_handler() -> None:
+    if DBLogHandler._installed:
+        return
+    handler = DBLogHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger("hdhive-oauth").addHandler(handler)
+    logging.getLogger().addHandler(handler)
+    DBLogHandler._installed = True
+    handler._prune()
 
 
 def encrypt(value: str) -> str:
@@ -764,6 +864,17 @@ async def web_media_search(keyword: str = Query(..., min_length=1, max_length=20
         if kind not in ("movie", "tv"):
             continue
         items.append(tmdb.normalize(raw, kind))
+    if items:
+        first = items[0]
+        _save_search_history(
+            str(first.get("media_type") or media_type or "movie"),
+            int(first.get("tmdb_id") or 0),
+            str(first.get("douban_id") or ""),
+            str(first.get("title") or keyword),
+            str(first.get("year") or ""),
+            str(first.get("poster") or ""),
+            len(items),
+        )
     return {"items": items[:30], "total": len(items), "cached": cached}
 
 
@@ -880,7 +991,7 @@ def dashboard() -> HTMLResponse:
 
 
 def _web_layout(title: str, content: str) -> HTMLResponse:
-    nav = "<nav><a href='/'>首页</a><a href='/web/rankings'>榜单</a><a href='/web/discover'>资源发现</a><a href='/web/subscriptions'>订阅列表</a><a href='/web/tasks'>订阅任务</a><a href='/web/unlocks'>解锁记录</a><a href='/web/settings'>设置</a></nav>"
+    nav = "<nav><a href='/'>首页</a><a href='/web/rankings'>榜单</a><a href='/web/discover'>资源发现</a><a href='/web/subscriptions'>订阅列表</a><a href='/web/tasks'>订阅任务</a><a href='/web/unlocks'>解锁记录</a><a href='/web/settings'>设置</a><a href='/web/logs'>日志中心</a></nav>"
     return HTMLResponse(f"""<!doctype html><meta charset='utf-8'><title>{html.escape(title)}</title><style>
 body{{margin:0;background:#0d0b08;color:#eee;font:15px system-ui}}nav{{padding:18px 28px;background:#17120b;border-bottom:1px solid #654b20}}nav a{{color:#e2bd73;margin-right:22px;text-decoration:none}}main{{max-width:1250px;margin:28px auto;padding:28px;background:#17130d;border:1px solid #604821;border-radius:16px}}h1{{color:#e5c47d}}h2{{color:#d5b16b}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}}.card{{padding:20px;background:#211a11;border:1px solid #4a381e;border-radius:12px}}.muted{{color:#aaa}}table{{width:100%;border-collapse:collapse}}td,th{{padding:12px;border-bottom:1px solid #3e301d;text-align:left}}input,select,button{{padding:10px;margin:5px;background:#0f0d0a;color:#eee;border:1px solid #896b36;border-radius:6px}}button{{color:#f1cd80;cursor:pointer}}a.btn{{display:inline-block;padding:10px 14px;background:#76531f;color:#fff;border-radius:6px;text-decoration:none}}</style>{nav}<main><h1>{html.escape(title)}</h1>{content}</main>""")
 
@@ -936,6 +1047,12 @@ def web_unlocks() -> HTMLResponse:
 @app.get("/web/tasks", response_class=HTMLResponse)
 def web_tasks() -> HTMLResponse:
     return HTMLResponse(tasks_html())
+
+
+@app.get("/logs", response_class=HTMLResponse)
+@app.get("/web/logs", response_class=HTMLResponse)
+def web_logs_page() -> HTMLResponse:
+    return HTMLResponse(logs_html())
 
 
 @app.get("/web/settings-legacy", response_class=HTMLResponse)
@@ -1298,15 +1415,34 @@ async def resolve_resource(
     now = int(time.time())
     source_type = humanize_pan_type(detail.get("pan_type")) or "其他来源"
     with database() as conn:
-        conn.execute(
-            """INSERT INTO transfer_records
-               (installation_id,slug,name,share_url,status,resolution,quality,size,uploader,points,action,processing_status,source_type,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (installation_id, slug, name, url, "resolved",
-             _list_text(detail.get("video_resolution")), _list_text(detail.get("source")),
-             str(detail.get("share_size") or detail.get("size") or ""), uploader,
-             int(detail.get("unlock_points") or 0), "资源解锁", "resolved", source_type, now, now),
-        )
+        existing = conn.execute(
+            "SELECT id,transfer_status FROM transfer_records WHERE installation_id=? AND slug=? ORDER BY id DESC LIMIT 1",
+            (installation_id, slug),
+        ).fetchone()
+        if existing:
+            prev_transfer = str(existing["transfer_status"] or "pending")
+            transfer_s = prev_transfer if prev_transfer in ("success", "processing", "failed") else "pending"
+            status_s = "completed" if transfer_s == "success" else "resolved"
+            conn.execute(
+                """UPDATE transfer_records SET name=?,share_url=?,status=?,resolution=?,quality=?,size=?,uploader=?,points=?,action=?,processing_status=?,source_type=?,unlock_status='unlocked',transfer_status=?,updated_at=? WHERE id=?""",
+                (name, url, status_s,
+                 _list_text(detail.get("video_resolution")), _list_text(detail.get("source")),
+                 str(detail.get("share_size") or detail.get("size") or ""), uploader,
+                 int(detail.get("unlock_points") or 0), "资源解锁",
+                 "completed" if transfer_s == "success" else "resolved",
+                 source_type, transfer_s, now, existing["id"]),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO transfer_records
+                   (installation_id,slug,name,share_url,status,resolution,quality,size,uploader,points,action,processing_status,source_type,unlock_status,transfer_status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (installation_id, slug, name, url, "resolved",
+                 _list_text(detail.get("video_resolution")), _list_text(detail.get("source")),
+                 str(detail.get("share_size") or detail.get("size") or ""), uploader,
+                 int(detail.get("unlock_points") or 0), "资源解锁", "resolved", source_type,
+                 "unlocked", "pending", now, now),
+            )
     return {
         "name": name,
         "share_url": url,
@@ -1433,8 +1569,54 @@ def resource_registry() -> ResourceProviderRegistry:
     return ResourceProviderRegistry([HDHiveResourceProvider(hdhive_query, configured=configured)])
 
 
+_CACHE_MATCH_SQL = """( (?!=0 AND tmdb_id=?) OR (?=0 AND title=? AND COALESCE(year,'')=COALESCE(?,'')) )"""
+
+
+def _save_search_cache(media_type: str, tmdb_id: int, douban_id: str, title: str, year: str, result_json: str) -> None:
+    now = int(time.time())
+    with database() as conn:
+        conn.execute(
+            f"DELETE FROM resource_search_cache WHERE installation_id=? AND media_type=? AND {_CACHE_MATCH_SQL}",
+            (WEB_INSTALLATION_ID, media_type, tmdb_id, tmdb_id, tmdb_id, title, year),
+        )
+        conn.execute(
+            "INSERT INTO resource_search_cache (installation_id,media_type,tmdb_id,douban_id,title,year,result_json,searched_at) VALUES (?,?,?,?,?,?,?,?)",
+            (WEB_INSTALLATION_ID, media_type, tmdb_id, douban_id, title, year, result_json, now),
+        )
+        conn.execute(
+            """DELETE FROM resource_search_cache WHERE installation_id=? AND id NOT IN (
+                SELECT id FROM resource_search_cache WHERE installation_id=? ORDER BY searched_at DESC LIMIT 30)""",
+            (WEB_INSTALLATION_ID, WEB_INSTALLATION_ID),
+        )
+
+
+def _save_search_history(media_type: str, tmdb_id: int, douban_id: str, title: str, year: str, poster: str, result_count: int) -> None:
+    now = int(time.time())
+    history_title = title or str(tmdb_id)
+    with database() as conn:
+        row = conn.execute(
+            "SELECT id FROM search_history WHERE installation_id=? AND media_type=? AND title=? AND COALESCE(year,'')=? ORDER BY id DESC LIMIT 1",
+            (WEB_INSTALLATION_ID, media_type, history_title, year),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE search_history SET tmdb_id=?,douban_id=?,poster=?,result_count=?,searched_at=? WHERE id=?",
+                (tmdb_id, douban_id, poster, result_count, now, row["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO search_history (installation_id,title,media_type,year,tmdb_id,douban_id,poster,result_count,searched_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (WEB_INSTALLATION_ID, history_title, media_type, year, tmdb_id, douban_id, poster, result_count, now),
+            )
+        conn.execute(
+            """DELETE FROM search_history WHERE installation_id=? AND id NOT IN (
+                SELECT id FROM search_history WHERE installation_id=? ORDER BY searched_at DESC LIMIT 20)""",
+            (WEB_INSTALLATION_ID, WEB_INSTALLATION_ID),
+        )
+
+
 @app.get("/api/web/resources/search")
-async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), title: str = Query("", max_length=200), douban_id: str = Query("", max_length=50), year: str = Query("", max_length=4)) -> dict[str, Any]:
+async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), title: str = Query("", max_length=200), douban_id: str = Query("", max_length=50), year: str = Query("", max_length=4), poster: str = Query("", max_length=1000)) -> dict[str, Any]:
     if not tmdb_id and not title.strip():
         raise HTTPException(400, "缺少可用于搜索的影视名称")
     resolved_tmdb_id = tmdb_id
@@ -1451,14 +1633,115 @@ async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$
         source = item.source_type or "其他来源"
         source_counts[source] = source_counts.get(source, 0) + 1
     with database() as conn:
-        settings = conn.execute("SELECT save_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        settings = conn.execute("SELECT save_directory,save_folder_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
     save_path = str(settings["save_directory"] or "") if settings else ""
-    return {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "save_path": save_path, "resolved_tmdb_id": resolved_tmdb_id or None, "resolution": resolution, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}}
+    save_folder_id = str(settings["save_folder_id"] or "") if settings else ""
+    payload = {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "save_path": save_path, "save_folder_id": save_folder_id, "resolved_tmdb_id": resolved_tmdb_id or None, "resolution": resolution, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}, "searched_at": int(time.time()), "cached": False}
+    _save_search_cache(media_type, resolved_tmdb_id, douban_id, title, year, json.dumps(payload, ensure_ascii=False, default=str))
+    poster = ""
+    for item in items:
+        if item.uploader_avatar:
+            poster = item.uploader_avatar
+    _save_search_history(media_type, resolved_tmdb_id, douban_id, title, year, poster, len(items))
+    return payload
+
+
+@app.get("/api/web/resources/search/cached")
+def web_resource_search_cached(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), douban_id: str = Query("", max_length=50), title: str = Query("", max_length=200), year: str = Query("", max_length=4)) -> dict[str, Any]:
+    with database() as conn:
+        row = conn.execute(
+            f"SELECT * FROM resource_search_cache WHERE installation_id=? AND media_type=? AND {_CACHE_MATCH_SQL} ORDER BY searched_at DESC, id DESC LIMIT 1",
+            (WEB_INSTALLATION_ID, media_type, tmdb_id, tmdb_id, tmdb_id, title, year),
+        ).fetchone()
+    if not row:
+        return {"cached": False}
+    payload = json.loads(row["result_json"])
+    payload["cached"] = True
+    payload["searched_at"] = int(row["searched_at"])
+    return payload
+
+
+@app.get("/api/web/search-history")
+def web_search_history(limit: int = Query(20, ge=1, le=50)) -> dict[str, Any]:
+    with database() as conn:
+        rows = conn.execute(
+            "SELECT id,title,media_type,year,tmdb_id,douban_id,poster,result_count,searched_at FROM search_history WHERE installation_id=? ORDER BY searched_at DESC, id DESC LIMIT ?",
+            (WEB_INSTALLATION_ID, limit),
+        ).fetchall()
+    return {"items": [dict(x) for x in rows]}
+
+
+@app.delete("/api/web/search-history/{history_id}")
+def web_search_history_delete(history_id: int) -> dict[str, Any]:
+    with database() as conn:
+        cur = conn.execute("DELETE FROM search_history WHERE installation_id=? AND id=?", (WEB_INSTALLATION_ID, history_id))
+    if not cur.rowcount:
+        raise HTTPException(404, "搜索记录不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/web/search-history")
+def web_search_history_clear() -> dict[str, Any]:
+    with database() as conn:
+        cur = conn.execute("DELETE FROM search_history WHERE installation_id=?", (WEB_INSTALLATION_ID,))
+    return {"ok": True, "deleted": cur.rowcount}
 
 
 class WebResourceTransfer(BaseModel):
     provider: str = Field(min_length=1, max_length=50)
     resource_id: str = Field(min_length=1, max_length=200)
+
+
+async def _execute_transfer(result: dict[str, Any], resource_id: str) -> dict[str, Any]:
+    """解锁已完成，执行真实115转存并更新 unlock/transfer 状态。"""
+    share_url = str(result.get("share_url") or "").strip()
+    link_type = classify_share_link(share_url)
+    if link_type == "empty":
+        raise HTTPException(502, "影巢解锁成功但未返回分享链接，请稍后重试")
+    if link_type == "unsupported":
+        logger.info("module=resources provider=hdhive operation=transfer unsupported_link=true slug=%s link_domain=%s", resource_id, _link_domain(share_url))
+        raise HTTPException(400, "当前来源暂不支持直接转存115（影巢已解锁并保留原链接，可在解锁记录中查看）")
+    with database() as conn:
+        settings = conn.execute("SELECT p115_cookie,save_directory,save_folder_id,ed2k_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if not settings or not settings["p115_cookie"]:
+        raise HTTPException(409, "影巢资源已解锁，但115尚未授权；请到授权中心配置 Cookie 后重试")
+    client = P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT)
+    logger.info("module=resources provider=115 operation=transfer_start link_type=%s slug=%s", link_type, resource_id)
+    target_cid = str(settings["save_folder_id"] or "")
+    save_path = ""
+    transferred: dict[str, Any] = {}
+    try:
+        if link_type == "115":
+            transferred = await client.transfer(share_url, target_cid)
+        else:
+            save_path = settings["ed2k_directory"] or ""
+            offline = await client.offline(share_url, save_path)
+            transferred = {**offline, "message": "已提交115离线下载任务" if offline.get("ok") else offline.get("message")}
+    except P115Error as exc:
+        logger.error("module=resources provider=115 operation=transfer error_type=P115Error reason=%s", exc)
+        with database() as conn:
+            conn.execute("UPDATE transfer_records SET status='failed',processing_status='failed',unlock_status='unlocked',transfer_status='failed',error=?,updated_at=? WHERE installation_id=? AND slug=? AND id=(SELECT MAX(id) FROM transfer_records WHERE installation_id=? AND slug=?)",
+                         (str(exc), int(time.time()), WEB_INSTALLATION_ID, resource_id, WEB_INSTALLATION_ID, resource_id))
+        try:
+            if _telegram_settings(False)["enabled"]:
+                await notification_service().notify("transfer_failed", {"title": result.get("name", resource_id), "status": "转存失败", "resource": resource_id, "resolution": "", "size": "", "save_path": "", "error": str(exc)})
+        except Exception:
+            logger.exception("module=notifications provider=telegram operation=transfer_failed")
+        raise
+    logger.info("module=resources provider=115 operation=transfer_success link_type=%s slug=%s", link_type, resource_id)
+    if link_type == "115":
+        save_path = target_cid or settings["save_directory"] or ""
+    with database() as conn:
+        conn.execute("UPDATE transfer_records SET status='completed',processing_status='completed',unlock_status='unlocked',transfer_status='success',save_path=?,error='',updated_at=? WHERE installation_id=? AND slug=? AND id=(SELECT MAX(id) FROM transfer_records WHERE installation_id=? AND slug=?)",
+                     (save_path, int(time.time()), WEB_INSTALLATION_ID, resource_id, WEB_INSTALLATION_ID, resource_id))
+    try:
+        service = notification_service()
+        config = _telegram_settings(False)
+        if config["enabled"]:
+            await service.notify("transfer_success", {"title": result["name"], "status": "转存成功", "resource": resource_id, "resolution": "", "size": "", "save_path": save_path or "115根目录", "error": ""})
+    except Exception:
+        logger.exception("module=notifications provider=telegram operation=transfer_success")
+    return {**result, **transferred, "provider": "hdhive", "transfer_status": "success", "link_type": link_type, "save_path": save_path}
 
 
 @app.post("/api/web/resources/transfer")
@@ -1467,47 +1750,8 @@ async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
         raise HTTPException(400, "该资源来源暂不支持转存")
     try:
         result = await resolve_resource(ResolveRequest(slug=request.resource_id, max_unlock_points=None), WEB_INSTALLATION_ID)
-        share_url = str(result.get("share_url") or "").strip()
-        link_type = classify_share_link(share_url)
-        if link_type == "empty":
-            raise HTTPException(502, "影巢解锁成功但未返回分享链接，请稍后重试")
-        if link_type == "unsupported":
-            logger.info("module=resources provider=hdhive operation=transfer unsupported_link=true slug=%s link_domain=%s", request.resource_id, _link_domain(share_url))
-            raise HTTPException(400, "当前来源暂不支持直接转存115（影巢已解锁并保留原链接，可在解锁记录中查看）")
-        with database() as conn:
-            settings = conn.execute("SELECT p115_cookie,save_directory,ed2k_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
-        if not settings or not settings["p115_cookie"]:
-            raise HTTPException(409, "影巢资源已解锁，但115尚未授权；请到授权中心配置 Cookie 后重试")
-        client = P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT)
-        logger.info("module=resources provider=115 operation=transfer_start link_type=%s slug=%s", link_type, request.resource_id)
-        save_path = settings["save_directory"] or ""
-        if link_type == "115":
-            transferred = await client.transfer(share_url, save_path)
-        else:
-            save_path = settings["ed2k_directory"] or ""
-            offline = await client.offline(share_url, save_path)
-            transferred = {**offline, "message": "已提交115离线下载任务" if offline.get("ok") else offline.get("message")}
-        logger.info("module=resources provider=115 operation=transfer_success link_type=%s slug=%s", link_type, request.resource_id)
-        with database() as conn:
-            conn.execute("UPDATE transfer_records SET status='completed',processing_status='completed',save_path=?,error='',updated_at=? WHERE installation_id=? AND slug=? AND id=(SELECT MAX(id) FROM transfer_records WHERE installation_id=? AND slug=?)",
-                         (save_path, int(time.time()), WEB_INSTALLATION_ID, request.resource_id, WEB_INSTALLATION_ID, request.resource_id))
-        try:
-            service = notification_service()
-            config = _telegram_settings(False)
-            if config["enabled"]:
-                await service.notify("transfer_success", {"title": result["name"], "status": "转存成功", "resource": request.resource_id, "resolution": "", "size": "", "save_path": save_path or "115根目录", "error": ""})
-        except Exception:
-            logger.exception("module=notifications provider=telegram operation=transfer_success")
-        return {**result, **transferred, "provider": request.provider, "transfer_status": "completed", "link_type": link_type}
+        return await _execute_transfer(result, request.resource_id)
     except P115Error as exc:
-        logger.error("module=resources provider=115 operation=transfer error_type=P115Error reason=%s", exc)
-        with database() as conn:
-            conn.execute("UPDATE transfer_records SET status='failed',processing_status='failed',error=?,updated_at=? WHERE installation_id=? AND slug=?", (str(exc), int(time.time()), WEB_INSTALLATION_ID, request.resource_id))
-        try:
-            if _telegram_settings(False)["enabled"]:
-                await notification_service().notify("transfer_failed", {"title": result.get("name", request.resource_id), "status": "转存失败", "resource": request.provider, "resolution": "", "size": "", "save_path": "", "error": str(exc)})
-        except Exception:
-            logger.exception("module=notifications provider=telegram operation=transfer_failed")
         raise HTTPException(502, str(exc)) from exc
     except HTTPException as exc:
         logger.error("module=resources provider=%s operation=transfer error_type=%s reason=%s", request.provider, type(exc).__name__, exc.detail)
@@ -1746,7 +1990,7 @@ def web_task_detail(task_id: int) -> dict[str, Any]:
     return {"task": dict(row)}
 
 
-def unlock_page(installation_id: str, page: int = 1, page_size: int = 15, search: str = "", action: str = "", status: str = "", processing_status: str = "") -> dict[str, Any]:
+def unlock_page(installation_id: str, page: int = 1, page_size: int = 15, search: str = "", action: str = "", status: str = "", processing_status: str = "", unlock_status: str = "", transfer_status: str = "") -> dict[str, Any]:
     conditions = ["installation_id=?"]
     params: list[Any] = [installation_id]
     if search.strip():
@@ -1757,18 +2001,22 @@ def unlock_page(installation_id: str, page: int = 1, page_size: int = 15, search
         conditions.append("status=?"); params.append(status)
     if processing_status:
         conditions.append("processing_status=?"); params.append(processing_status)
+    if unlock_status:
+        conditions.append("unlock_status=?"); params.append(unlock_status)
+    if transfer_status:
+        conditions.append("transfer_status=?"); params.append(transfer_status)
     where = " AND ".join(conditions)
     with database() as conn:
         total = conn.execute(f"SELECT COUNT(*) FROM transfer_records WHERE {where}", params).fetchone()[0]
-        rows = conn.execute(f"""SELECT id,subscription_id,slug,name,share_url,status,error,media_type,tmdb_id,resolution,quality,size,uploader,points,action,save_path,processing_status,source_type,created_at,updated_at
+        rows = conn.execute(f"""SELECT id,subscription_id,slug,name,share_url,status,error,media_type,tmdb_id,resolution,quality,size,uploader,points,action,save_path,processing_status,source_type,unlock_status,transfer_status,created_at,updated_at
             FROM transfer_records WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?""", [*params, page_size, (page - 1) * page_size]).fetchall()
     total_pages = max(1, (total + page_size - 1) // page_size)
     return {"items": [dict(x) for x in rows], "page": page, "page_size": page_size, "total": total, "total_pages": total_pages, "has_more": page < total_pages}
 
 
 @app.get("/api/web/unlocks")
-def web_unlock_list(page: int = Query(1, ge=1), page_size: int = Query(15, ge=1, le=100), search: str = Query("", max_length=100), action: str = Query("", max_length=50), status: str = Query("", max_length=40), processing_status: str = Query("", max_length=40)) -> dict[str, Any]:
-    return unlock_page(WEB_INSTALLATION_ID, page, page_size, search, action, status, processing_status)
+def web_unlock_list(page: int = Query(1, ge=1), page_size: int = Query(15, ge=1, le=100), search: str = Query("", max_length=100), action: str = Query("", max_length=50), status: str = Query("", max_length=40), processing_status: str = Query("", max_length=40), unlock_status: str = Query("", max_length=40), transfer_status: str = Query("", max_length=40)) -> dict[str, Any]:
+    return unlock_page(WEB_INSTALLATION_ID, page, page_size, search, action, status, processing_status, unlock_status, transfer_status)
 
 
 @app.get("/api/web/unlocks/{record_id}")
@@ -1783,17 +2031,25 @@ def web_unlock_detail(record_id: int) -> dict[str, Any]:
 @app.post("/api/web/unlocks/{record_id}/retry")
 async def web_unlock_retry(record_id: int) -> dict[str, Any]:
     with database() as conn:
-        row = conn.execute("SELECT slug FROM transfer_records WHERE id=? AND installation_id=?", (record_id, WEB_INSTALLATION_ID)).fetchone()
+        row = conn.execute("SELECT slug,unlock_status FROM transfer_records WHERE id=? AND installation_id=?", (record_id, WEB_INSTALLATION_ID)).fetchone()
     if not row:
         raise HTTPException(404, "解锁记录不存在")
     try:
         result = await resolve_resource(ResolveRequest(slug=row["slug"], max_unlock_points=None), WEB_INSTALLATION_ID)
         with database() as conn:
-            conn.execute("UPDATE transfer_records SET status='resolved',processing_status='resolved',share_url=?,error='',updated_at=? WHERE id=?", (result.get("share_url", ""), int(time.time()), record_id))
-        return {"ok": True, "share_url": result.get("share_url", "")}
+            conn.execute("UPDATE transfer_records SET status='resolved',processing_status='resolved',unlock_status='unlocked',share_url=?,error='',updated_at=? WHERE id=?", (result.get("share_url", ""), int(time.time()), record_id))
+        transferred = await _execute_transfer(result, row["slug"])
+        with database() as conn:
+            conn.execute("UPDATE transfer_records SET status='completed',processing_status='completed',unlock_status='unlocked',transfer_status='success',share_url=?,save_path=?,error='',updated_at=? WHERE id=?",
+                         (result.get("share_url", ""), transferred.get("save_path", ""), int(time.time()), record_id))
+        return {"ok": True, **transferred}
+    except P115Error as exc:
+        with database() as conn:
+            conn.execute("UPDATE transfer_records SET unlock_status='unlocked',transfer_status='failed',error=?,updated_at=? WHERE id=?", (str(exc), int(time.time()), record_id))
+        raise HTTPException(502, str(exc)) from exc
     except HTTPException as exc:
         with database() as conn:
-            conn.execute("UPDATE transfer_records SET status='failed',processing_status='failed',error=?,updated_at=? WHERE id=?", (str(exc.detail), int(time.time()), record_id))
+            conn.execute("UPDATE transfer_records SET error=?,updated_at=? WHERE id=?", (str(exc.detail), int(time.time()), record_id))
         raise
 
 
@@ -1824,6 +2080,7 @@ class WebSettings(BaseModel):
 class BusinessSettings(BaseModel):
     root_directory: str = Field(default="", max_length=500)
     save_directory: str = Field(default="", max_length=500)
+    save_folder_id: str = Field(default="", max_length=64)
     scrape_directory: str = Field(default="", max_length=500)
     save_wait_seconds: int = Field(default=30, ge=0, le=3600)
     retry_count: int = Field(default=3, ge=0, le=20)
@@ -1838,7 +2095,7 @@ class BusinessSettings(BaseModel):
 
 
 BUSINESS_SETTING_COLUMNS = (
-    "root_directory,save_directory,scrape_directory,save_wait_seconds,retry_count,"
+    "root_directory,save_directory,save_folder_id,scrape_directory,save_wait_seconds,retry_count,"
     "duplicate_policy,subscription_auto_transfer,subscription_interval,offline_enabled,ed2k_directory,ed2k_poll_interval,"
     "ed2k_retry_count,ed2k_auto_archive"
 )
@@ -1867,12 +2124,13 @@ def put_business_settings(request: BusinessSettings) -> dict[str, Any]:
     with database() as conn:
         conn.execute(
             """INSERT INTO web_settings
-            (installation_id,root_directory,save_directory,scrape_directory,save_wait_seconds,
+            (installation_id,root_directory,save_directory,save_folder_id,scrape_directory,save_wait_seconds,
              retry_count,duplicate_policy,subscription_auto_transfer,subscription_interval,offline_enabled,ed2k_directory,ed2k_poll_interval,
              ed2k_retry_count,ed2k_auto_archive,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(installation_id) DO UPDATE SET
              root_directory=excluded.root_directory,save_directory=excluded.save_directory,
+             save_folder_id=excluded.save_folder_id,
              scrape_directory=excluded.scrape_directory,save_wait_seconds=excluded.save_wait_seconds,
              retry_count=excluded.retry_count,duplicate_policy=excluded.duplicate_policy,
              subscription_auto_transfer=excluded.subscription_auto_transfer,subscription_interval=excluded.subscription_interval,
@@ -1881,7 +2139,7 @@ def put_business_settings(request: BusinessSettings) -> dict[str, Any]:
              ed2k_retry_count=excluded.ed2k_retry_count,
              ed2k_auto_archive=excluded.ed2k_auto_archive,updated_at=excluded.updated_at""",
             (WEB_INSTALLATION_ID, values["root_directory"].strip(), values["save_directory"].strip(),
-             values["scrape_directory"].strip(), values["save_wait_seconds"], values["retry_count"],
+             values["save_folder_id"].strip(), values["scrape_directory"].strip(), values["save_wait_seconds"], values["retry_count"],
              values["duplicate_policy"], int(values["subscription_auto_transfer"]), values["subscription_interval"], int(values["offline_enabled"]), values["ed2k_directory"].strip(),
              values["ed2k_poll_interval"], values["ed2k_retry_count"],
              int(values["ed2k_auto_archive"]), int(time.time())),
@@ -1931,6 +2189,22 @@ def list_offline_tasks(page: int = Query(1, ge=1), page_size: int = Query(20, ge
         rows = conn.execute("SELECT id,task_url,provider_task_id,status,save_path,error,retry_count,created_at,updated_at FROM offline_tasks WHERE installation_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (WEB_INSTALLATION_ID, page_size, offset)).fetchall()
     pages = max(1, (total + page_size - 1) // page_size)
     return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size, "total": total, "total_pages": pages, "has_more": page < pages}
+
+
+@app.get("/api/web/115/folders")
+async def web_115_folders(cid: str = Query("", max_length=32)) -> dict[str, Any]:
+    """读取当前115账号的网盘目录，cid 为空表示根目录。"""
+    with database() as conn:
+        row = conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if not row or not row["p115_cookie"]:
+        raise HTTPException(409, "115 尚未授权，请先到授权中心扫码或配置 Cookie")
+    try:
+        result = await P115Client(decrypt(row["p115_cookie"]), REQUEST_TIMEOUT).folders(cid.strip())
+        return {**result, "cookie_ok": True}
+    except P115Error as exc:
+        if "Cookie" in str(exc) or "失效" in str(exc) or "UID" in str(exc):
+            raise HTTPException(401, "115 授权已失效，请重新扫码授权") from exc
+        raise HTTPException(502, str(exc)) from exc
 
 
 class AuthorizationUpdate(BaseModel):
@@ -2227,10 +2501,10 @@ async def run_channel_check() -> dict[str, Any]:
                         await web_resource_transfer(WebResourceTransfer(provider="hdhive", resource_id=slug))
                     else:
                         with database() as conn:
-                            settings = conn.execute("SELECT p115_cookie,save_directory FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+                            settings = conn.execute("SELECT p115_cookie,save_directory,save_folder_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
                         if not settings or not settings["p115_cookie"]:
                             raise P115Error("115 Cookie 未配置")
-                        await P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT).transfer(link, settings["save_directory"] or "")
+                        await P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT).transfer(link, str(settings["save_folder_id"] or "") or settings["save_directory"] or "")
                     processed += 1
                 except Exception as exc:  # one bad message must not stop monitoring
                     logger.exception("channel item failed message=%s", message.message_id)
@@ -2384,6 +2658,33 @@ def _telegram_bot_worker() -> None:
         except Exception:
             logger.exception("module=telegram operation=poll")
         time.sleep(5)
+
+
+@app.get("/api/web/logs/modules")
+def web_log_modules() -> dict[str, Any]:
+    with database() as conn:
+        rows = conn.execute("SELECT DISTINCT module FROM app_logs WHERE module!='' ORDER BY module").fetchall()
+    return {"modules": [row["module"] for row in rows]}
+
+
+@app.get("/api/web/logs")
+def web_log_list(page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), level: str = Query("", max_length=20), module: str = Query("", max_length=80), keyword: str = Query("", max_length=200), range_seconds: int = Query(0, ge=0)) -> dict[str, Any]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if level.strip():
+        conditions.append("level=?"); params.append(level.strip().upper())
+    if module.strip():
+        conditions.append("module=?"); params.append(module.strip())
+    if keyword.strip():
+        conditions.append("message LIKE ?"); params.append(f"%{keyword.strip()}%")
+    if range_seconds and range_seconds > 0:
+        conditions.append("ts>=?"); params.append(int(time.time()) - range_seconds)
+    where = " AND ".join(conditions) if conditions else "1=1"
+    with database() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM app_logs WHERE {where}", params).fetchone()[0]
+        rows = conn.execute(f"SELECT id,ts,level,module,message FROM app_logs WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?", [*params, page_size, (page - 1) * page_size]).fetchall()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return {"items": [dict(x) for x in rows], "page": page, "page_size": page_size, "total": total, "total_pages": total_pages, "has_more": page < total_pages}
 
 
 @app.get("/api/web/authorizations/p115/qr/apps")

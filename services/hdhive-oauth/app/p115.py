@@ -33,6 +33,34 @@ class P115Client:
             raise P115Error("115 Cookie 已失效或无法获取账号 UID")
         return uid
 
+    async def folders(self, cid: str = "0") -> dict[str, Any]:
+        """列出 115 网盘目录，cid='0' 表示根目录。"""
+        if not self.cookie:
+            raise P115Error("115 Cookie 未配置")
+        params = {
+            "aid": 1, "cid": cid or "0", "o": "user_ptime", "asc": 0,
+            "offset": 0, "show_dir": 1, "limit": 1000, "type": 0,
+            "star": 0, "fc_mix": 0, "format": "json",
+        }
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            await self.user_id(client)
+            response = await client.get("https://webapi.115.com/files", params=params, headers=self.headers)
+            payload = response.json()
+        if payload.get("state") is not True:
+            raise P115Error(str(payload.get("error") or payload.get("message") or "读取115目录失败"))
+        data = payload.get("data") or {}
+        raw_path = data.get("path") or []
+        path_parts = [{"cid": str(item.get("cid") or ""), "name": str(item.get("name") or item.get("file_name") or "")} for item in raw_path if isinstance(item, dict)]
+        folders: list[dict[str, Any]] = []
+        for item in data.get("list") or []:
+            if not isinstance(item, dict):
+                continue
+            fid = str(item.get("cid") or "")
+            name = str(item.get("name") or item.get("file_name") or "")
+            if fid and name:
+                folders.append({"cid": fid, "pid": str(item.get("pid") or ""), "name": name})
+        return {"cid": str(data.get("cid") or cid or "0"), "path": path_parts, "folders": folders, "count": int(data.get("folder_count") or len(folders))}
+
     async def transfer(self, share_url: str, target_cid: str = "") -> dict[str, Any]:
         if not self.cookie:
             raise P115Error("115 Cookie 未配置")
