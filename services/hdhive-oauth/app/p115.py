@@ -1,6 +1,7 @@
 """Minimal async 115 transfer client, adapted to the existing plugin workflow."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from typing import Any
@@ -27,8 +28,11 @@ class P115Client:
         return match.group(1), str((query.get("password") or query.get("code") or [""])[0])
 
     async def user_id(self, client: httpx.AsyncClient) -> str:
-        response = await client.get("https://my.115.com/?ct=ajax&ac=get_user_aq", headers=self.headers)
-        data = response.json()
+        try:
+            response = await client.get("https://my.115.com/?ct=ajax&ac=get_user_aq", headers=self.headers)
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise P115Error(f"115 连接异常：{exc}") from exc
         uid = str((data.get("data") or {}).get("uid") or "")
         if not uid:
             raise P115Error("115 Cookie 已失效或无法获取账号 UID")
@@ -40,15 +44,15 @@ class P115Client:
         if not key:
             return ""
         passwd = hashlib.md5(f"{key:>06}".encode("ascii")).hexdigest()
-        response = await client.post(
-            "https://passportapi.115.com/app/1.0/web/1.0/user/security_key_check",
-            data={"passwd": passwd},
-            headers=self.headers,
-        )
         try:
+            response = await client.post(
+                "https://passportapi.115.com/app/1.0/web/1.0/user/security_key_check",
+                data={"passwd": passwd},
+                headers=self.headers,
+            )
             payload = response.json()
-        except ValueError as exc:
-            raise P115Error("115 安全密钥验证接口返回异常") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise P115Error(f"115 安全密钥验证网络异常：{exc}") from exc
         token = str((payload.get("data") or {}).get("token") or "")
         if not token:
             raise P115Error(str(payload.get("message") or payload.get("error") or "115 安全密钥验证失败"))
@@ -68,8 +72,19 @@ class P115Client:
             token = await self.security_token(security_key, client)
             if token:
                 params["token"] = token
-            response = await client.get("https://webapi.115.com/files", params=params, headers=self.headers)
-            payload = response.json()
+            payload = None
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    response = await client.get("https://webapi.115.com/files", params=params, headers=self.headers)
+                    payload = response.json()
+                    break
+                except (httpx.HTTPError, ValueError) as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+            if payload is None:
+                raise P115Error(f"读取 115 目录超时，请重试（{last_error}）")
         if payload.get("state") is not True:
             error = str(payload.get("error") or payload.get("message") or "读取115目录失败")
             if "安全密钥" in error:
