@@ -53,15 +53,16 @@ class OAuthServiceTests(unittest.TestCase):
         explore = self.client.get("/explore").text
         detail = self.client.get("/resources").text
         search = self.client.get("/search").text
-        self.assertIn("title=\"查看详情\"", explore)
-        self.assertNotIn("data-action=\"search\"", explore)
+        self.assertIn("data-action=\"search\"", explore)
+        self.assertIn("data-action=\"subscribe\"", explore)
+        self.assertIn("cover-actions", explore)
         self.assertIn("返回汇影", detail)
         self.assertIn("TMDB / Emby 季与集", detail)
         self.assertIn("Emby 未配置", detail)
         self.assertIn("data-collapsed", detail)
         self.assertIn("resolved_tmdb_id", detail)
         self.assertIn("影视与资源搜索", search)
-        self.assertIn("title=\"查看详情\"", search)
+        self.assertIn("data-action=\"search\"", search)
         self.assertIn("data-action=\"subscribe\"", search)
 
     def test_resource_search_accepts_title_without_tmdb_id(self):

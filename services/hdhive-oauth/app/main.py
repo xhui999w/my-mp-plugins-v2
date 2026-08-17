@@ -790,13 +790,13 @@ async def explore_rankings(provider: str = Query("tmdb")) -> dict[str, Any]:
 
 
 RANKING_PROVIDERS: tuple[dict[str, Any], ...] = (
-    {"id": "tmdb", "name": "TheMovieDB", "logo": "🎬", "enabled": True, "kind": "tmdb"},
-    {"id": "douban", "name": "豆瓣", "logo": "豆", "enabled": True, "kind": "douban"},
-    {"id": "netflix", "name": "Netflix", "logo": "N", "enabled": True, "kind": "watch_provider"},
-    {"id": "max", "name": "HBO Max", "logo": "▣", "enabled": True, "kind": "watch_provider"},
-    {"id": "prime", "name": "Prime Video", "logo": "▶", "enabled": True, "kind": "watch_provider"},
-    {"id": "disney", "name": "Disney+", "logo": "D", "enabled": True, "kind": "watch_provider"},
-    {"id": "apple", "name": "Apple TV+", "logo": "", "enabled": True, "kind": "watch_provider"},
+    {"id": "tmdb", "name": "TheMovieDB", "logo": "tmdb", "enabled": True, "kind": "tmdb"},
+    {"id": "douban", "name": "豆瓣", "logo": "douban", "enabled": True, "kind": "douban"},
+    {"id": "netflix", "name": "Netflix", "logo": "netflix", "enabled": True, "kind": "watch_provider"},
+    {"id": "max", "name": "HBO Max", "logo": "max", "enabled": True, "kind": "watch_provider"},
+    {"id": "prime", "name": "Prime Video", "logo": "prime", "enabled": True, "kind": "watch_provider"},
+    {"id": "disney", "name": "Disney+", "logo": "disney", "enabled": True, "kind": "watch_provider"},
+    {"id": "apple", "name": "Apple TV+", "logo": "apple", "enabled": True, "kind": "watch_provider"},
 )
 
 
