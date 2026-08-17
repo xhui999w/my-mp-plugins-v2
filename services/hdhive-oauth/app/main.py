@@ -485,6 +485,7 @@ class DBLogHandler(logging.Handler):
 def install_db_log_handler() -> None:
     if DBLogHandler._installed:
         return
+    logging.getLogger("hdhive-oauth").setLevel(logging.INFO)
     handler = DBLogHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))
     logging.getLogger("hdhive-oauth").addHandler(handler)
