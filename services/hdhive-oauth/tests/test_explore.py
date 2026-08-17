@@ -52,6 +52,51 @@ class ExploreTests(unittest.TestCase):
             self.assertTrue(result["has_more"])
         asyncio.run(scenario())
 
+    
+
+    def test_streaming_ranking_routes_through_tmdb_discover(self):
+        from test_service import main
+        client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(main.app)
+        tmdb = TMDBProvider("key")
+        payload = {"items": [{"id": "tmdb:movie:1", "provider": "netflix"}], "page": 1, "total_pages": 1, "has_more": False, "configured": True, "error": None, "provider": "netflix"}
+        with patch.object(main, "explore_tmdb_provider", return_value=tmdb), patch.object(tmdb, "discover", new=AsyncMock(return_value=payload)) as discover:
+            response = client.get("/api/explore/ranking/netflix/popular-movie")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["configured"])
+        self.assertEqual(body["provider"], "netflix")
+        query = discover.await_args.args[0]
+        self.assertEqual(query["platform"], "netflix")
+        self.assertEqual(query["media_type"], "movie")
+        self.assertEqual(query["sort"], "popularity.desc")
+        self.assertEqual(query["rating"], 0)
+        self.assertEqual(query["page"], 1)
+
+    def test_streaming_ranking_top_lists_require_votes(self):
+        from test_service import main
+        client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(main.app)
+        tmdb = TMDBProvider("key")
+        payload = {"items": [], "page": 1, "total_pages": 1, "has_more": False, "configured": True, "error": None, "provider": "disney"}
+        with patch.object(main, "explore_tmdb_provider", return_value=tmdb), patch.object(tmdb, "discover", new=AsyncMock(return_value=payload)) as discover:
+            response = client.get("/api/explore/ranking/disney/top-tv")
+        self.assertEqual(response.status_code, 200)
+        query = discover.await_args.args[0]
+        self.assertEqual(query["platform"], "disney")
+        self.assertEqual(query["media_type"], "tv")
+        self.assertEqual(query["sort"], "vote_average.desc")
+        self.assertEqual(query["rating"], 50)
+
+    def test_streaming_ranking_tmdb_unconfigured_message(self):
+        from test_service import main
+        client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(main.app)
+        response = client.get("/api/explore/ranking/netflix/popular-movie")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["configured"])
+        self.assertIn("TMDB 尚未配置", body["error"])
+        self.assertNotIn("Netflix 尚未配置", body["error"])
+
+
     def test_missing_token_does_not_break_explore_page(self):
         from test_service import main
         client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(main.app)

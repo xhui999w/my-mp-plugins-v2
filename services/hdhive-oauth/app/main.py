@@ -813,20 +813,44 @@ async def explore_ranking_providers() -> dict[str, Any]:
     return {"items": result}
 
 
+STREAMING_RANKING_SORTS = {
+    "popular-movie": ("movie", "popularity.desc", 0),
+    "popular-tv": ("tv", "popularity.desc", 0),
+    "top-movie": ("movie", "vote_average.desc", 50),
+    "top-tv": ("tv", "vote_average.desc", 50),
+}
+
+
+async def streaming_ranking(tmdb: TMDBProvider, provider: str, ranking: str, page: int) -> dict[str, Any]:
+    """Netflix / HBO Max / Prime Video / Disney+ / Apple TV+ 榜单。
+
+    这些平台没有独立凭据，全部基于 TMDB Watch Providers + TMDB Discover。
+    只要 TMDB 已配置可用，平台就自动可用。
+    """
+    spec = STREAMING_RANKING_SORTS.get(ranking)
+    if not spec:
+        return {"items": [], "configured": True, "provider": provider, "error": "该平台暂无此榜单。"}
+    media_type, sort, min_votes = spec
+    try:
+        return await tmdb.discover({
+            "platform": provider, "media_type": media_type, "region": "",
+            "sort": sort, "rating": min_votes, "page": page,
+        })
+    except Exception as exc:
+        return {"items": [], "configured": True, "provider": provider, "error": "榜单加载失败，请稍后重试。", "detail": type(exc).__name__}
+
+
 @app.get("/api/explore/ranking/{provider}/{ranking}")
 async def explore_ranking(provider: str, ranking: str, page: int = Query(1, ge=1)) -> dict[str, Any]:
     if provider == "douban":
         mapping = {"popular-movie": "hot-movie", "popular-tv": "hot-tv", "top-movie": "high-movie", "top-tv": "high-tv", "top250": "top250"}
         category = mapping.get(ranking, "hot-movie")
         return await explore_douban_provider().discover(category, page)
-    if provider != "tmdb":
-        info = next((item for item in RANKING_PROVIDERS if item["id"] == provider), None)
-        if not info:
-            raise HTTPException(404, "数据源不存在")
-        return {"items": [], "configured": False, "provider": provider, "error": f"{info['name']} 尚未配置，前往授权中心添加凭据后即可启用。"}
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:
-        return {"items": [], "configured": False, "error": "TMDB 尚未配置。"}
+        return {"items": [], "configured": False, "error": "TMDB 尚未配置，流媒体榜单依赖 TMDB。前往授权中心配置 TMDB 后即可启用。"}
+    if provider in {"netflix", "max", "prime", "disney", "apple"}:
+        return await streaming_ranking(tmdb, provider, ranking, page)
     if provider != "tmdb" or ranking not in RANKINGS:
         raise HTTPException(404, "榜单不存在")
     try:
