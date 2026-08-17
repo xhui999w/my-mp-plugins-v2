@@ -154,6 +154,10 @@ class TMDBProvider:
         media_type = query.get("media_type", "movie")
         page = max(1, int(query.get("page", 1)))
         params: dict[str, Any] = {"page": page, "sort_by": query.get("sort", "popularity.desc"), "vote_average.gte": query.get("rating", 0)}
+        min_votes = query.get("min_votes")
+        if min_votes:
+            params["vote_count.gte"] = min_votes
+
         mappings = {"region": "region", "language": "with_original_language", "genre": "with_genres", "year": "primary_release_year" if media_type == "movie" else "first_air_date_year"}
         for source, target in mappings.items():
             if query.get(source):

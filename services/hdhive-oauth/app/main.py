@@ -814,10 +814,10 @@ async def explore_ranking_providers() -> dict[str, Any]:
 
 
 STREAMING_RANKING_SORTS = {
-    "popular-movie": ("movie", "popularity.desc", 0),
-    "popular-tv": ("tv", "popularity.desc", 0),
-    "top-movie": ("movie", "vote_average.desc", 50),
-    "top-tv": ("tv", "vote_average.desc", 50),
+    "popular-movie": ("movie", "popularity.desc", 0, 0),
+    "popular-tv": ("tv", "popularity.desc", 0, 0),
+    "top-movie": ("movie", "vote_average.desc", 7.0, 50),
+    "top-tv": ("tv", "vote_average.desc", 7.0, 50),
 }
 
 
@@ -830,11 +830,11 @@ async def streaming_ranking(tmdb: TMDBProvider, provider: str, ranking: str, pag
     spec = STREAMING_RANKING_SORTS.get(ranking)
     if not spec:
         return {"items": [], "configured": True, "provider": provider, "error": "该平台暂无此榜单。"}
-    media_type, sort, min_votes = spec
+    media_type, sort, rating, min_votes = spec
     try:
         return await tmdb.discover({
             "platform": provider, "media_type": media_type, "region": "US",
-            "sort": sort, "rating": min_votes, "page": page,
+            "sort": sort, "rating": rating, "min_votes": min_votes, "page": page,
         })
     except Exception as exc:
         return {"items": [], "configured": True, "provider": provider, "error": "榜单加载失败，请稍后重试。", "detail": type(exc).__name__}

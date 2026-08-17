@@ -84,7 +84,8 @@ class ExploreTests(unittest.TestCase):
         self.assertEqual(query["platform"], "disney")
         self.assertEqual(query["media_type"], "tv")
         self.assertEqual(query["sort"], "vote_average.desc")
-        self.assertEqual(query["rating"], 50)
+        self.assertEqual(query["rating"], 7.0)
+        self.assertEqual(query["min_votes"], 50)
 
     def test_streaming_ranking_tmdb_unconfigured_message(self):
         from test_service import main
