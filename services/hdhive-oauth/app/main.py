@@ -31,7 +31,7 @@ import qrcode.image.svg
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .explore import RANKINGS, TMDBProvider, filter_metadata, registry
 from .douban import DoubanProvider
@@ -1558,6 +1558,7 @@ class SubscriptionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     media_type: str = Field(pattern="^(movie|tv)$")
     tmdb_id: int = Field(default=0, ge=0)
+    # 年份只用于展示/匹配，非法或越界值一律当作未提供，避免正常订阅请求因年份校验失败而 422。
     year: int | None = Field(default=None, ge=1880, le=2200)
     poster: str = Field(default="", max_length=1000)
     season: str = Field(default="", max_length=30)
@@ -1566,6 +1567,17 @@ class SubscriptionRequest(BaseModel):
     save_path: str = Field(default="", max_length=500)
     douban_id: str = Field(default="", max_length=50)
     moviepilot_id: str = Field(default="", max_length=100)
+
+    @field_validator("year", mode="before")
+    @classmethod
+    def _coerce_year(cls, v: object) -> int | None:
+        if v is None or v == "":
+            return None
+        try:
+            y = int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return y if 1880 <= y <= 2200 else None
 
 
 class SearchRequest(BaseModel):

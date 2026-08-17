@@ -185,4 +185,5 @@ def theme_head() -> str:
         + "*::-webkit-scrollbar-thumb{background:var(--scrollbar-thumb);border-radius:6px}"
         + "</style>"
         + "<script>" + _js_block() + "</script>"
+        + "<script>function apiMsg(d,fb){try{if(!d)return fb;var det=d.detail;if(typeof det==='string')return det;if(Array.isArray(det)){var m=det.map(function(e){return e&&e.msg?e.msg:''}).filter(Boolean).join('；');return m||fb}if(d.message)return d.message;return fb}catch(e){return fb}}</script>"
     )

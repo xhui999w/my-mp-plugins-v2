@@ -35,6 +35,10 @@ class ResourceItem:
     season: str = ""
     episode: str = ""
     resource_tags: list[str] = field(default_factory=list)
+    is_official: bool = False
+    is_free: bool = False
+    official_label: str = ""
+    fee_label: str = ""
     transfer_supported: bool = False
     duplicate_count: int = 1
 
@@ -154,6 +158,16 @@ class HDHiveResourceProvider(ResourceProvider):
         elif str(points_value or "").isdigit():
             points = int(points_value)
         is_unlocked = bool(raw.get("is_unlocked"))
+        # 真实影巢标签：官组(is_official) / 免费(is_free_for_user 或 0 积分) / 积分(unlock_points>0)
+        is_official = bool(raw.get("is_official"))
+        is_free = bool(raw.get("is_free_for_user")) or (points == 0)
+        official_label = "官组" if is_official else "非官组"
+        if is_free:
+            fee_label = "免费"
+        elif points and points > 0:
+            fee_label = "积分"
+        else:
+            fee_label = "未知"
         raw_pan = str(
             raw.get("pan_type") or raw.get("source_type") or raw.get("disk_type")
             or raw.get("cloud_type") or raw.get("drive_type") or raw.get("website") or ""
@@ -184,8 +198,28 @@ class HDHiveResourceProvider(ResourceProvider):
             publish_time=str(raw.get("publish_time") or raw.get("created_at") or ""),
             season=str(raw.get("season") if raw.get("season") is not None else media.get("season") or ""),
             episode=str(raw.get("episode") if raw.get("episode") is not None else media.get("episode") or ""),
-            resource_tags=[str(x) for x in tags], transfer_supported=transfer_supported,
+            resource_tags=HDHiveResourceProvider._build_tags(tags, is_official, is_free, points),
+            is_official=is_official,
+            is_free=is_free,
+            official_label=official_label,
+            fee_label=fee_label,
+            transfer_supported=transfer_supported,
         )
+
+    @staticmethod
+    def _build_tags(raw_tags: list[str], is_official: bool, is_free: bool, points: int | None) -> list[str]:
+        tags = []
+        if is_official:
+            tags.append("官组")
+        if is_free:
+            tags.append("免费")
+        elif points and points > 0:
+            tags.append("积分")
+        for t in raw_tags:
+            ts = str(t).strip()
+            if ts and ts not in tags:
+                tags.append(ts)
+        return tags
 
     async def search(self, media_type: str, tmdb_id: int, title: str = "") -> tuple[list[ResourceItem], list[dict[str, str]]]:
         if not self.configured:
@@ -257,4 +291,4 @@ def filter_resources(items: list[ResourceItem], provider: str = "", season: str 
 
 
 def filter_options(items: list[ResourceItem]) -> dict[str, list[str]]:
-    return {key: sorted({str(getattr(item, key)) for item in items if getattr(item, key)}) for key in ("provider", "uploader", "season", "resolution", "quality", "language", "source_type")}
+    return {key: sorted({str(getattr(item, key)) for item in items if getattr(item, key)}) for key in ("provider", "uploader", "season", "resolution", "quality", "language", "source_type", "official_label", "fee_label")}
