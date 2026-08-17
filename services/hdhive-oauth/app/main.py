@@ -1855,14 +1855,15 @@ async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
 
 
 @app.get("/api/web/subscription-status")
-def web_subscription_status(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), douban_id: str = Query("", max_length=50), title: str = Query("", max_length=200), year: int | None = Query(None, ge=1880, le=2200)) -> dict[str, Any]:
+def web_subscription_status(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), douban_id: str = Query("", max_length=50), title: str = Query("", max_length=200), year: str = Query("", max_length=4)) -> dict[str, Any]:
+    year_int = int(year) if year.isdigit() else None
     with database() as conn:
         if tmdb_id:
             row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, tmdb_id)).fetchone()
         elif douban_id.strip():
             row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND douban_id=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, douban_id.strip())).fetchone()
         else:
-            row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND title=? AND COALESCE(year,0)=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, title.strip(), year or 0)).fetchone()
+            row = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND title=? AND COALESCE(year,0)=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (WEB_INSTALLATION_ID, media_type, title.strip(), year_int or 0)).fetchone()
     return {"subscribed": bool(row), "id": row["id"] if row else None, "status": row["status"] if row else None}
 
 
@@ -2374,13 +2375,13 @@ def get_authorizations() -> dict[str, Any]:
     return {"definitions": AUTHORIZATION_PROVIDERS.infos(), "providers": {
         "hdhive": {"configured": True, "authorized": bool(installation),
                     "summary": str(user.get("nickname") or user.get("name") or user.get("username") or "等待授权")},
-        "p115": {"configured": bool(settings and settings["p115_cookie"]), "authorized": bool(settings and settings["p115_cookie"]),
+        "p115": {"configured": bool(settings and settings["p115_cookie"]), "authorized": bool(settings and settings["p115_cookie"]), "has_secret": bool(settings and settings["p115_cookie"]),
                  "summary": states.get("p115", {}).get("summary") or ("Cookie 已安全保存" if settings and settings["p115_cookie"] else "未配置 Cookie")},
-        "emby": {"configured": bool(settings and settings["emby_url"] and settings["emby_api_key"]),
+        "emby": {"configured": bool(settings and settings["emby_url"] and settings["emby_api_key"]), "has_secret": bool(settings and settings["emby_api_key"]),
                  "authorized": False, "url": settings["emby_url"] if settings else "", "user_id": settings["emby_user_id"] if settings else "",
                  "available": bool(states.get("emby", {}).get("available")),
                  "summary": states.get("emby", {}).get("summary") or (settings["emby_url"] if settings and settings["emby_url"] else "未配置服务器")},
-        "tmdb": {"configured": bool(settings and settings["tmdb_api_key"]), "authorized": False,
+        "tmdb": {"configured": bool(settings and settings["tmdb_api_key"]), "authorized": False, "has_secret": bool(settings and settings["tmdb_api_key"]),
                  "language": settings["tmdb_language"] if settings else "zh-CN", "summary": states.get("tmdb", {}).get("summary") or ("密钥已安全保存" if settings and settings["tmdb_api_key"] else "未配置 API Key")},
     }}
 

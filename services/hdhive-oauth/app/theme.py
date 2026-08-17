@@ -180,7 +180,7 @@ def _switcher_css() -> str:
 def theme_head() -> str:
     return (
         "<style>" + _css_block() + _switcher_css()
-        + "*{scrollbar-width:thin;scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track)}"
+        + ".nav .nav-ico{display:inline-block;width:24px;margin-right:9px;text-align:center;vertical-align:-2px;flex:none}*{scrollbar-width:thin;scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track)}"
         + "*::-webkit-scrollbar{width:10px;height:10px}*::-webkit-scrollbar-track{background:var(--scrollbar-track)}"
         + "*::-webkit-scrollbar-thumb{background:var(--scrollbar-thumb);border-radius:6px}"
         + "</style>"

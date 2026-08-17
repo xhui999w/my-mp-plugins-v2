@@ -26,7 +26,7 @@ def sidebar_html(active: str) -> str:
         parts.append(f'<div class="group">{group}</div>')
         for key, href, icon, label in items:
             cls = "nav active" if key == active else "nav"
-            parts.append(f'<a class="{cls}" href="{href}">{icon} {label}</a>')
+            parts.append(f'<a class="{cls}" href="{href}"><span class="nav-ico">{icon}</span>{label}</a>')
     parts.append('<div class="theme-switch" data-theme-switch></div>')
     return '<aside class="side">' + "".join(parts) + "</aside>"
 
