@@ -198,28 +198,13 @@ class HDHiveResourceProvider(ResourceProvider):
             publish_time=str(raw.get("publish_time") or raw.get("created_at") or ""),
             season=str(raw.get("season") if raw.get("season") is not None else media.get("season") or ""),
             episode=str(raw.get("episode") if raw.get("episode") is not None else media.get("episode") or ""),
-            resource_tags=HDHiveResourceProvider._build_tags(tags, is_official, is_free, points),
+            resource_tags=tags,
             is_official=is_official,
             is_free=is_free,
             official_label=official_label,
             fee_label=fee_label,
             transfer_supported=transfer_supported,
         )
-
-    @staticmethod
-    def _build_tags(raw_tags: list[str], is_official: bool, is_free: bool, points: int | None) -> list[str]:
-        tags = []
-        if is_official:
-            tags.append("官组")
-        if is_free:
-            tags.append("免费")
-        elif points and points > 0:
-            tags.append("积分")
-        for t in raw_tags:
-            ts = str(t).strip()
-            if ts and ts not in tags:
-                tags.append(ts)
-        return tags
 
     async def search(self, media_type: str, tmdb_id: int, title: str = "") -> tuple[list[ResourceItem], list[dict[str, str]]]:
         if not self.configured:
