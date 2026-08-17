@@ -833,7 +833,7 @@ async def streaming_ranking(tmdb: TMDBProvider, provider: str, ranking: str, pag
     media_type, sort, min_votes = spec
     try:
         return await tmdb.discover({
-            "platform": provider, "media_type": media_type, "region": "",
+            "platform": provider, "media_type": media_type, "region": "US",
             "sort": sort, "rating": min_votes, "page": page,
         })
     except Exception as exc:
