@@ -72,6 +72,7 @@ TOKEN_ENCRYPTION_KEY = required_env("TOKEN_ENCRYPTION_KEY")
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/hdhive-oauth.db"))
 OAUTH_SCOPE = os.getenv("HDHIVE_OAUTH_SCOPE", "meta query unlock").strip()
 REQUEST_TIMEOUT = max(5, min(int(os.getenv("REQUEST_TIMEOUT", "30")), 120))
+EMBY_TIMEOUT = max(3, min(int(os.getenv("EMBY_TIMEOUT", "8")), 30))
 STATE_TTL = max(120, min(int(os.getenv("OAUTH_STATE_TTL", "600")), 3600))
 
 try:
@@ -267,6 +268,30 @@ def init_database() -> None:
             last_error TEXT DEFAULT '',
             processed INTEGER DEFAULT 0
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS telegram_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            name TEXT DEFAULT '',
+            username TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            check_interval INTEGER DEFAULT 600,
+            last_message_id INTEGER DEFAULT 0,
+            last_check_at INTEGER DEFAULT 0,
+            next_check_at INTEGER DEFAULT 0,
+            last_status TEXT DEFAULT '',
+            last_error TEXT DEFAULT '',
+            processed_count INTEGER DEFAULT 0,
+            rules_json TEXT DEFAULT '{}',
+            created_at INTEGER DEFAULT 0,
+            updated_at INTEGER DEFAULT 0
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS telegram_channel_messages (
+            installation_id TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            processed_at INTEGER DEFAULT 0,
+            PRIMARY KEY (installation_id, channel_id, message_id)
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS provider_state (
             installation_id TEXT NOT NULL,
             provider TEXT NOT NULL,
@@ -399,6 +424,21 @@ def init_database() -> None:
                 else:
                     unlock_s, transfer_s = "pending", "pending"
                 conn.execute("UPDATE transfer_records SET unlock_status=?,transfer_status=? WHERE id=?", (unlock_s, transfer_s, row["id"]))
+        # 单频道 → 多频道迁移：旧 channel_name/channel_state 自动成为第一个频道记录，不丢配置。
+        existing = conn.execute("SELECT COUNT(*) FROM telegram_channels WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()[0]
+        if not existing:
+            legacy = conn.execute("SELECT channel_enabled,channel_name,channel_interval FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+            if legacy and (legacy["channel_name"] or "").strip():
+                legacy_state_row = conn.execute("SELECT last_message_id,last_check,next_check,last_status,last_error,processed FROM channel_state WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+                legacy_state = dict(legacy_state_row) if legacy_state_row else {}
+                now = int(time.time())
+                username = _normalize_channel_username(legacy["channel_name"])
+                conn.execute(
+                    """INSERT INTO telegram_channels (installation_id,name,username,enabled,check_interval,last_message_id,last_check_at,next_check_at,last_status,last_error,processed_count,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (WEB_INSTALLATION_ID, legacy["channel_name"], username, int(legacy["channel_enabled"] or 0), int(legacy["channel_interval"] or 600),
+                     int(legacy_state.get("last_message_id") or 0), int(legacy_state.get("last_check") or 0), int(legacy_state.get("next_check") or 0),
+                     str(legacy_state.get("last_status") or "等待运行"), str(legacy_state.get("last_error") or ""), int(legacy_state.get("processed") or 0), now, now))
     install_db_log_handler()
 
 
@@ -878,6 +918,76 @@ async def web_media_search(keyword: str = Query(..., min_length=1, max_length=20
         )
     return {"items": items[:30], "total": len(items), "cached": cached}
 
+def _emby_settings() -> dict[str, str]:
+    """Single source of truth for the persisted Emby configuration."""
+    with database() as conn:
+        row = conn.execute("SELECT emby_url,emby_api_key,emby_user_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if not row:
+        return {"url": "", "api_key": "", "user_id": ""}
+    return {
+        "url": str(row["emby_url"] or "").strip().rstrip("/"),
+        "api_key": _decrypt_optional(row["emby_api_key"]),
+        "user_id": str(row["emby_user_id"] or "").strip(),
+    }
+
+
+def _emby_configured(cfg: dict[str, str]) -> bool:
+    return bool(cfg.get("url") and cfg.get("api_key"))
+
+
+def _emby_items_path(cfg: dict[str, str]) -> str:
+    """Library items endpoint; falls back to the admin view when no User ID is set."""
+    if cfg.get("user_id"):
+        return f"/Users/{cfg['user_id']}/Items"
+    return "/Items"
+
+
+async def _emby_library_status(media_type: str, tmdb_id: int) -> tuple[str | None, bool, bool]:
+    cfg = _emby_settings()
+    configured = _emby_configured(cfg)
+    if not configured:
+        return None, False, False
+    try:
+        headers = {"X-Emby-Token": cfg["api_key"]}
+        params = {"Recursive": "true", "IncludeItemTypes": "Movie" if media_type == "movie" else "Series", "AnyProviderIdEquals": f"tmdb.{tmdb_id}", "Fields": "ProviderIds", "Limit": 5}
+        async with httpx.AsyncClient(timeout=EMBY_TIMEOUT) as client:
+            emby_response = await client.get(f"{cfg['url']}{_emby_items_path(cfg)}", headers=headers, params=params)
+            emby_response.raise_for_status()
+            status = "available" if emby_response.json().get("Items") else "missing"
+        return status, True, False
+    except Exception as exc:
+        logger.warning("module=media provider=emby operation=library_status error_type=%s reason=%s", type(exc).__name__, exc)
+        return None, True, True
+
+
+async def _emby_episode_status(tmdb_id: int, season: int) -> tuple[bool, bool, set[tuple[int, int]]]:
+    cfg = _emby_settings()
+    configured = _emby_configured(cfg)
+    if not configured:
+        return False, False, set()
+    emby_episode_keys: set[tuple[int, int]] = set()
+    try:
+        headers = {"X-Emby-Token": cfg["api_key"]}
+        params = {"Recursive": "true", "IncludeItemTypes": "Series", "AnyProviderIdEquals": f"tmdb.{tmdb_id}", "Fields": "ProviderIds", "Limit": 5}
+        async with httpx.AsyncClient(timeout=EMBY_TIMEOUT) as client:
+            series_response = await client.get(f"{cfg['url']}{_emby_items_path(cfg)}", headers=headers, params=params)
+            series_response.raise_for_status()
+            series_items = series_response.json().get("Items", [])
+            if series_items:
+                episode_params = {"Season": season, "Fields": "IndexNumber,ParentIndexNumber"}
+                if cfg.get("user_id"):
+                    episode_params["UserId"] = cfg["user_id"]
+                episode_response = await client.get(f"{cfg['url']}/Shows/{series_items[0]['Id']}/Episodes", headers=headers, params=episode_params)
+                episode_response.raise_for_status()
+                for emby_item in episode_response.json().get("Items", []):
+                    parent = emby_item.get("ParentIndexNumber")
+                    index = emby_item.get("IndexNumber")
+                    emby_episode_keys.add((int(season if parent is None else parent), int(index if index is not None else 0)))
+        return True, False, emby_episode_keys
+    except Exception as exc:
+        logger.warning("module=media provider=emby operation=episode_status error_type=%s reason=%s", type(exc).__name__, exc)
+        return True, True, emby_episode_keys
+
 
 @app.get("/api/web/media/detail")
 async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), title: str = Query("", max_length=200), year: str = Query("", max_length=4)) -> dict[str, Any]:
@@ -900,24 +1010,7 @@ async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"),
         "directors": [x.get("name") for x in payload.get("credits", {}).get("crew", []) if x.get("job") in ("Director", "Series Director") and x.get("name")][:4],
     })
     seasons = [{"season_number": x.get("season_number"), "name": x.get("name"), "episode_count": x.get("episode_count") or 0, "air_date": x.get("air_date") or "", "poster": f"https://image.tmdb.org/t/p/w342{x.get('poster_path')}" if x.get("poster_path") else ""} for x in payload.get("seasons", []) if int(x.get("season_number") or 0) >= 0]
-    emby_status: str | None = None
-    emby_configured = False
-    emby_error = False
-    with database() as conn:
-        settings = conn.execute("SELECT emby_url,emby_api_key,emby_user_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
-    if settings and settings["emby_url"] and settings["emby_api_key"] and settings["emby_user_id"]:
-        emby_configured = True
-        try:
-            token = _decrypt_optional(settings["emby_api_key"])
-            headers = {"X-Emby-Token": token}
-            params = {"Recursive": "true", "IncludeItemTypes": "Movie" if media_type == "movie" else "Series", "AnyProviderIdEquals": f"tmdb.{tmdb_id}", "Fields": "ProviderIds", "Limit": 5}
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                emby_response = await client.get(f"{settings['emby_url'].rstrip('/')}/Users/{settings['emby_user_id']}/Items", headers=headers, params=params)
-                emby_response.raise_for_status()
-                emby_status = "available" if emby_response.json().get("Items") else "missing"
-        except Exception as exc:
-            emby_error = True
-            logger.warning("module=media provider=emby operation=library_status error_type=%s reason=%s", type(exc).__name__, exc)
+    emby_status, emby_configured, emby_error = await _emby_library_status(media_type, tmdb_id)
     return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution, "emby_status": emby_status, "emby_configured": emby_configured, "emby_error": emby_error}
 
 @app.get("/api/web/media/season")
@@ -926,31 +1019,7 @@ async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(
     if not tmdb.configured:
         raise HTTPException(409, "TMDB 尚未配置")
     payload, cached = await tmdb.request(f"/tv/{tmdb_id}/season/{season}", ttl=3600)
-    emby_configured = False
-    emby_error = False
-    emby_episode_keys: set[tuple[int, int]] = set()
-    with database() as conn:
-        settings = conn.execute("SELECT emby_url,emby_api_key,emby_user_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
-    if settings and settings["emby_url"] and settings["emby_api_key"] and settings["emby_user_id"]:
-        emby_configured = True
-        try:
-            token = _decrypt_optional(settings["emby_api_key"])
-            headers = {"X-Emby-Token": token}
-            params = {"Recursive": "true", "IncludeItemTypes": "Series", "AnyProviderIdEquals": f"tmdb.{tmdb_id}", "Fields": "ProviderIds", "Limit": 5}
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                series_response = await client.get(f"{settings['emby_url'].rstrip('/')}/Users/{settings['emby_user_id']}/Items", headers=headers, params=params)
-                series_response.raise_for_status()
-                series_items = series_response.json().get("Items", [])
-                if series_items:
-                    episode_response = await client.get(f"{settings['emby_url'].rstrip('/')}/Shows/{series_items[0]['Id']}/Episodes", headers=headers, params={"UserId": settings["emby_user_id"], "Season": season, "Fields": "IndexNumber,ParentIndexNumber"})
-                    episode_response.raise_for_status()
-                    for emby_item in episode_response.json().get("Items", []):
-                        parent = emby_item.get("ParentIndexNumber")
-                        index = emby_item.get("IndexNumber")
-                        emby_episode_keys.add((int(season if parent is None else parent), int(index if index is not None else 0)))
-        except Exception as exc:
-            emby_error = True
-            logger.warning("module=media provider=emby operation=episode_status error_type=%s reason=%s", type(exc).__name__, exc)
+    emby_configured, emby_error, emby_episode_keys = await _emby_episode_status(tmdb_id, season)
     episodes = []
     for x in payload.get("episodes", []):
         key = (int(x.get("season_number") or season), int(x.get("episode_number") or 0))
@@ -2226,6 +2295,15 @@ class AuthorizationUpdate(BaseModel):
     language: str = Field(default="zh-CN", max_length=16)
 
 
+class ProviderTestRequest(BaseModel):
+    """Current form values used by 测试连接; empty fields fall back to saved config."""
+    url: str = Field(default="", max_length=500)
+    api_key: str = Field(default="", max_length=4000)
+    user_id: str = Field(default="", max_length=200)
+    cookie: str = Field(default="", max_length=16000)
+    language: str = Field(default="", max_length=16)
+
+
 def _decrypt_optional(value: str | None) -> str:
     return decrypt(value) if value else ""
 
@@ -2274,6 +2352,7 @@ def get_authorizations() -> dict[str, Any]:
                  "summary": states.get("p115", {}).get("summary") or ("Cookie 已安全保存" if settings and settings["p115_cookie"] else "未配置 Cookie")},
         "emby": {"configured": bool(settings and settings["emby_url"] and settings["emby_api_key"]),
                  "authorized": False, "url": settings["emby_url"] if settings else "", "user_id": settings["emby_user_id"] if settings else "",
+                 "available": bool(states.get("emby", {}).get("available")),
                  "summary": states.get("emby", {}).get("summary") or (settings["emby_url"] if settings and settings["emby_url"] else "未配置服务器")},
         "tmdb": {"configured": bool(settings and settings["tmdb_api_key"]), "authorized": False,
                  "language": settings["tmdb_language"] if settings else "zh-CN", "summary": states.get("tmdb", {}).get("summary") or ("密钥已安全保存" if settings and settings["tmdb_api_key"] else "未配置 API Key")},
@@ -2303,11 +2382,14 @@ def put_authorization(provider: str, request: AuthorizationUpdate) -> dict[str, 
             secret = encrypt(request.api_key.strip()) if request.api_key.strip() else current["tmdb_api_key"]
             conn.execute("UPDATE web_settings SET tmdb_api_key=?,tmdb_language=?,updated_at=? WHERE installation_id=?",
                          (secret, request.language.strip() or "zh-CN", int(time.time()), WEB_INSTALLATION_ID))
+    # 保存新 Emby 配置后立即作废旧连接状态，详情页下一次读取就是最新配置（无缓存可残留）。
+    if provider == "emby":
+        _save_provider_state("emby", {"configured": True, "available": False, "summary": request.url.strip().rstrip("/"), "server_name": "", "version": "", "user_name": ""})
     return {"ok": True, "configured": bool(secret)}
 
 
 @app.post("/api/web/authorizations/{provider}/test")
-async def test_authorization(provider: str) -> dict[str, Any]:
+async def test_authorization(provider: str, request: ProviderTestRequest | None = None) -> dict[str, Any]:
     settings, installation = _authorization_rows()
     if provider == "hdhive":
         if not installation:
@@ -2318,7 +2400,7 @@ async def test_authorization(provider: str) -> dict[str, Any]:
     if not settings:
         raise HTTPException(409, "Provider 尚未配置")
     if provider == "p115":
-        cookie = _decrypt_optional(settings["p115_cookie"])
+        cookie = request.cookie.strip() if request and request.cookie.strip() else _decrypt_optional(settings["p115_cookie"])
         if not cookie:
             raise HTTPException(409, "请先配置 115 Cookie")
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
@@ -2336,16 +2418,51 @@ async def test_authorization(provider: str) -> dict[str, Any]:
         _save_provider_state("p115", {"summary": summary, "uid": uid, "name": name})
         return {"ok": True, "message": f"115 连接正常：{summary}"}
     if provider == "emby":
-        url, key = settings["emby_url"], _decrypt_optional(settings["emby_api_key"])
-        if not url or not key:
-            raise HTTPException(409, "请先配置 Emby 地址和 API Key")
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.get(f"{url.rstrip('/')}/System/Info", headers={"X-Emby-Token": key})
-        if response.status_code >= 400:
-            raise HTTPException(502, f"Emby 连接失败（HTTP {response.status_code}）")
-        info = response.json()
-        _save_provider_state("emby", {"summary": f"{info.get('ServerName','服务器')} {info.get('Version','')}".strip(), "server_name": info.get("ServerName"), "version": info.get("Version")})
-        return {"ok": True, "message": f"Emby 连接正常：{info.get('ServerName','服务器')} {info.get('Version','')}"}
+        # 测试连接使用表单里当前填写的内容；留空的字段回退到已保存配置。
+        url = (request.url.strip().rstrip("/") if request and request.url.strip() else (settings["emby_url"] or "").strip().rstrip("/"))
+        key = (request.api_key.strip() if request and request.api_key.strip() else _decrypt_optional(settings["emby_api_key"]))
+        user_id = (request.user_id.strip() if request and request.user_id.strip() else (settings["emby_user_id"] or "").strip())
+        if not url:
+            raise HTTPException(409, "请先填写 Emby 地址")
+        if not key:
+            raise HTTPException(409, "请先填写 Emby API Key")
+        if not user_id:
+            raise HTTPException(409, "请先填写 Emby User ID")
+        headers = {"X-Emby-Token": key}
+        try:
+            async with httpx.AsyncClient(timeout=EMBY_TIMEOUT) as client:
+                try:
+                    info_response = await client.get(f"{url}/System/Info", headers=headers)
+                except httpx.TimeoutException as exc:
+                    raise HTTPException(502, "无法访问 Emby 服务器：连接超时，请检查地址与网络") from exc
+                except httpx.HTTPError as exc:
+                    raise HTTPException(502, f"无法访问 Emby 服务器：{type(exc).__name__}") from exc
+                if info_response.status_code in (401, 403):
+                    raise HTTPException(401, "Emby API Key 无效（HTTP 401/403）")
+                if info_response.status_code >= 400:
+                    raise HTTPException(502, f"Emby 连接失败（HTTP {info_response.status_code}）")
+                info = info_response.json()
+                try:
+                    user_response = await client.get(f"{url}/Users/{user_id}", headers=headers)
+                except httpx.TimeoutException as exc:
+                    raise HTTPException(502, "无法访问 Emby 服务器：连接超时") from exc
+                except httpx.HTTPError as exc:
+                    raise HTTPException(502, f"无法访问 Emby 服务器：{type(exc).__name__}") from exc
+                if user_response.status_code in (401, 403):
+                    raise HTTPException(401, "Emby API Key 无效（HTTP 401/403）")
+                if user_response.status_code == 404:
+                    raise HTTPException(400, "Emby User ID 无效：未找到对应用户")
+                if user_response.status_code >= 400:
+                    raise HTTPException(502, f"Emby 用户信息读取失败（HTTP {user_response.status_code}）")
+                user_info = user_response.json()
+        except HTTPException:
+            raise
+        server_name = str(info.get("ServerName") or "未知服务器")
+        version = str(info.get("Version") or "")
+        user_name = str(user_info.get("Name") or user_id)
+        summary = " · ".join(x for x in (server_name, f"v{version}" if version else "", f"用户 {user_name}" if user_name else "") if x)
+        _save_provider_state("emby", {"configured": True, "available": True, "summary": summary, "server_name": server_name, "version": version, "user_name": user_name})
+        return {"ok": True, "message": f"连接成功\nServer: {server_name}\nVersion: {version}\nUser: {user_name}"}
     if provider == "tmdb":
         token = _decrypt_optional(settings["tmdb_api_key"])
         if not token:
@@ -2487,64 +2604,219 @@ def _channel_status() -> dict[str, Any]:
 
 @app.get("/api/web/telegram/channel/status")
 def channel_status() -> dict[str, Any]:
+    # 兼容旧接口：返回第一个频道（迁移后即原单频道）的状态。
+    rows = _channel_rows()
+    if rows:
+        return {"last_message_id": rows[0]["last_message_id"], "last_check": rows[0]["last_check_at"], "next_check": rows[0]["next_check_at"],
+                "last_status": rows[0]["last_status"], "last_error": rows[0]["last_error"], "processed": rows[0]["processed_count"]}
     return _channel_status()
 
 
-async def run_channel_check() -> dict[str, Any]:
-    config = _telegram_settings(False)
-    state = _channel_status()
-    now = int(time.time())
-    processed, latest, error, status = 0, int(state.get("last_message_id") or 0), "", ""
-    try:
-        messages = await CHANNEL_MONITOR.fetch(config["channel_name"], latest)
-        # First run establishes a cursor so enabling a channel never unlocks its
-        # entire history or unexpectedly consumes points.
-        if latest == 0 and messages:
-            latest = max(message.message_id for message in messages)
-            messages = []
-            status = "首次检查已建立频道游标；只会处理之后的新消息"
-        for message in messages:
-            latest = max(latest, message.message_id)
-            for link in message.links:
-                try:
-                    if "hdhive.com/resource/" in link:
-                        slug = link.split("/resource/", 1)[1].split("?", 1)[0]
-                        await web_resource_transfer(WebResourceTransfer(provider="hdhive", resource_id=slug))
-                    else:
-                        with database() as conn:
-                            settings = conn.execute("SELECT p115_cookie,save_directory,save_folder_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
-                        if not settings or not settings["p115_cookie"]:
-                            raise P115Error("115 Cookie 未配置")
-                        await P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT).transfer(link, str(settings["save_folder_id"] or "") or settings["save_directory"] or "")
-                    processed += 1
-                except Exception as exc:  # one bad message must not stop monitoring
-                    logger.exception("channel item failed message=%s", message.message_id)
-                    error = str(exc)
-        if not (latest and not messages and status.startswith("首次检查")):
-            status = f"检查完成，发现 {len(messages)} 条新消息，处理 {processed} 个资源"
-    except Exception as exc:
-        logger.exception("channel monitor failed")
-        status, error = "检查失败", str(exc)
+def _normalize_channel_username(value: str) -> str:
+    name = str(value or "").strip().rstrip("/").split("/")[-1].lstrip("@").strip()
+    return name
+
+
+def _channel_rows() -> list[sqlite3.Row]:
     with database() as conn:
-        conn.execute("""INSERT INTO channel_state (installation_id,last_message_id,last_check,next_check,last_status,last_error,processed)
-            VALUES (?,?,?,?,?,?,?) ON CONFLICT(installation_id) DO UPDATE SET last_message_id=excluded.last_message_id,last_check=excluded.last_check,next_check=excluded.next_check,last_status=excluded.last_status,last_error=excluded.last_error,processed=channel_state.processed+excluded.processed""",
-            (WEB_INSTALLATION_ID, latest, now, now + int(config["channel_interval"]), status, error[:1000], processed))
-    return {"ok": not bool(error), "message": status if not error else f"{status}：{error}", "processed": processed}
+        return conn.execute("SELECT * FROM telegram_channels WHERE installation_id=? ORDER BY id ASC", (WEB_INSTALLATION_ID,)).fetchall()
+
+
+def _get_channel_row(channel_id: int) -> sqlite3.Row | None:
+    with database() as conn:
+        return conn.execute("SELECT * FROM telegram_channels WHERE id=? AND installation_id=?", (channel_id, WEB_INSTALLATION_ID)).fetchone()
+
+
+def _channel_dict(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    result["name"] = result.get("name") or result.get("username") or ""
+    result["enabled"] = bool(result.get("enabled"))
+    try:
+        result["rules"] = json.loads(result.get("rules_json") or "{}")
+    except ValueError:
+        result["rules"] = {}
+    for key in ("last_message_id", "last_check_at", "next_check_at", "processed_count", "created_at", "updated_at", "check_interval"):
+        result[key] = int(result.get(key) or 0)
+    return result
+
+
+class TelegramChannelUpdate(BaseModel):
+    name: str = Field(default="", max_length=200)
+    username: str = Field(default="", max_length=300)
+    enabled: bool = True
+    check_interval: int = Field(default=600, ge=60, le=86400)
+    rules: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.get("/api/web/telegram/channels")
+def list_telegram_channels() -> dict[str, Any]:
+    return {"items": [_channel_dict(row) for row in _channel_rows()]}
+
+
+@app.post("/api/web/telegram/channels")
+def create_telegram_channel(request: TelegramChannelUpdate) -> dict[str, Any]:
+    username = _normalize_channel_username(request.username)
+    if not username:
+        raise HTTPException(400, "请填写频道用户名或链接")
+    if len(username) < 5:
+        raise HTTPException(400, "频道用户名过短")
+    now = int(time.time())
+    with database() as conn:
+        cur = conn.execute("INSERT INTO telegram_channels (installation_id,name,username,enabled,check_interval,last_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                           (WEB_INSTALLATION_ID, request.name.strip(), username, int(request.enabled), request.check_interval, "等待运行", now, now))
+        channel_id = int(cur.lastrowid)
+    logger.info("module=telegram_channel operation=created channel=@%s name=%s", username, request.name.strip())
+    return {"ok": True, "channel": _channel_dict(_get_channel_row(channel_id))}
+
+
+@app.put("/api/web/telegram/channels/{channel_id}")
+def update_telegram_channel(channel_id: int, request: TelegramChannelUpdate) -> dict[str, Any]:
+    row = _get_channel_row(channel_id)
+    if not row:
+        raise HTTPException(404, "频道不存在")
+    username = _normalize_channel_username(request.username)
+    if not username:
+        raise HTTPException(400, "请填写频道用户名或链接")
+    if len(username) < 5:
+        raise HTTPException(400, "频道用户名过短")
+    now = int(time.time())
+    with database() as conn:
+        conn.execute("UPDATE telegram_channels SET name=?,username=?,enabled=?,check_interval=?,rules_json=?,updated_at=? WHERE id=? AND installation_id=?",
+                     (request.name.strip(), username, int(request.enabled), request.check_interval, json.dumps(request.rules, ensure_ascii=False), now, channel_id, WEB_INSTALLATION_ID))
+    logger.info("module=telegram_channel operation=updated channel=@%s", username)
+    return {"ok": True, "channel": _channel_dict(_get_channel_row(channel_id))}
+
+
+@app.delete("/api/web/telegram/channels/{channel_id}")
+def delete_telegram_channel(channel_id: int) -> dict[str, Any]:
+    row = _get_channel_row(channel_id)
+    if not row:
+        raise HTTPException(404, "频道不存在")
+    with database() as conn:
+        conn.execute("DELETE FROM telegram_channels WHERE id=? AND installation_id=?", (channel_id, WEB_INSTALLATION_ID))
+    # 只删除监控配置；历史解锁/转存记录保留，去重记录保留以防重新添加后误处理旧消息。
+    logger.info("module=telegram_channel operation=deleted channel=@%s", row["username"])
+    return {"ok": True}
+
+
+async def _process_channel_message(message, channel_id: int, username: str) -> int:
+    """处理单条频道消息的链接；返回成功处理的资源数。"""
+    processed = 0
+    for link in message.links:
+        if "hdhive.com/resource/" in link:
+            slug = link.split("/resource/", 1)[1].split("?", 1)[0]
+            await web_resource_transfer(WebResourceTransfer(provider="hdhive", resource_id=slug))
+        else:
+            with database() as conn:
+                settings = conn.execute("SELECT p115_cookie,save_directory,save_folder_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+            if not settings or not settings["p115_cookie"]:
+                raise P115Error("115 Cookie 未配置")
+            await P115Client(decrypt(settings["p115_cookie"]), REQUEST_TIMEOUT).transfer(link, str(settings["save_folder_id"] or "") or settings["save_directory"] or "")
+        processed += 1
+    return processed
+
+
+async def _check_one_channel(row: sqlite3.Row) -> dict[str, Any]:
+    channel_id = int(row["id"])
+    username = _normalize_channel_username(row["username"])
+    interval = int(row["check_interval"] or 600)
+    now = int(time.time())
+    latest = int(row["last_message_id"] or 0)
+    processed = failed = 0
+    error = ""
+    status = ""
+    logger.info("module=telegram_channel channel=@%s check started", username)
+    try:
+        messages = await CHANNEL_MONITOR.fetch(username, latest)
+        new_messages = [message for message in messages if message.message_id > latest]
+        if latest == 0 and new_messages:
+            latest = max(message.message_id for message in new_messages)
+            status = "首次检查已建立频道游标，只处理之后的新消息"
+            logger.info("module=telegram_channel channel=@%s first cursor=%s", username, latest)
+        else:
+            with database() as conn:
+                seen_ids = {r["message_id"] for r in conn.execute(
+                    "SELECT message_id FROM telegram_channel_messages WHERE installation_id=? AND channel_id=?", (WEB_INSTALLATION_ID, channel_id)).fetchall()}
+            pending = [message for message in new_messages if message.message_id not in seen_ids]
+            logger.info("module=telegram_channel channel=@%s new messages=%s", username, len(pending))
+            for message in pending:
+                latest = max(latest, message.message_id)
+                try:
+                    processed += await _process_channel_message(message, channel_id, username)
+                except Exception as exc:  # 单条消息失败只记录，不中断后续消息
+                    failed += 1
+                    error = str(exc)
+                    logger.exception("module=telegram_channel channel=@%s message=%s error_type=%s reason=%s", username, message.message_id, type(exc).__name__, exc)
+                finally:
+                    with database() as conn:
+                        conn.execute("INSERT OR IGNORE INTO telegram_channel_messages (installation_id,channel_id,message_id,processed_at) VALUES (?,?,?,?)",
+                                     (WEB_INSTALLATION_ID, channel_id, message.message_id, int(time.time())))
+            if pending:
+                status = f"发现 {len(pending)} 条新消息，处理 {processed} 个资源，失败 {failed} 条"
+            else:
+                status = "未发现新资源"
+            logger.info("module=telegram_channel channel=@%s processed=%s failed=%s", username, processed, failed)
+        with database() as conn:
+            conn.execute("UPDATE telegram_channels SET last_message_id=?,last_check_at=?,next_check_at=?,last_status=?,last_error=?,processed_count=processed_count+?,updated_at=? WHERE id=? AND installation_id=?",
+                         (latest, now, now + interval, status, error[:1000], processed, now, channel_id, WEB_INSTALLATION_ID))
+        return {"ok": not bool(error), "message": status if not error else f"{status}：{error}", "processed": processed, "failed": failed}
+    except Exception as exc:
+        logger.exception("module=telegram_channel channel=@%s error_type=%s reason=%s", username, type(exc).__name__, exc)
+        with database() as conn:
+            conn.execute("UPDATE telegram_channels SET last_check_at=?,next_check_at=?,last_status='检查失败',last_error=?,updated_at=? WHERE id=? AND installation_id=?",
+                         (now, now + interval, str(exc)[:1000], now, channel_id, WEB_INSTALLATION_ID))
+        return {"ok": False, "message": f"检查失败：{exc}", "processed": 0, "failed": 0}
+
+
+async def run_channel_check(channel_id: int | None = None) -> dict[str, Any]:
+    """立即检查单个频道；channel_id 为空时检查全部启用频道（互相隔离）。"""
+    if channel_id is not None:
+        row = _get_channel_row(channel_id)
+        if not row:
+            raise HTTPException(404, "频道不存在")
+        return await _check_one_channel(row)
+    rows = [row for row in _channel_rows() if row["enabled"]]
+    if not rows:
+        return {"ok": True, "message": "没有启用的频道", "processed": 0, "failed": 0}
+    results = []
+    for row in rows:
+        try:
+            results.append(await _check_one_channel(row))
+        except Exception as exc:  # 一个频道失败不能影响其他频道
+            logger.exception("module=telegram_channel channel_id=%s check_all failed", row["id"])
+            results.append({"ok": False, "message": f"检查失败：{exc}", "processed": 0, "failed": 0})
+    return {"ok": True, "results": results, "checked": len(rows)}
+
+
+@app.post("/api/web/telegram/channels/{channel_id}/check")
+async def channel_check_one(channel_id: int) -> dict[str, Any]:
+    return await run_channel_check(channel_id)
+
+
+@app.post("/api/web/telegram/channels/check")
+async def channel_check_all() -> dict[str, Any]:
+    return await run_channel_check(None)
 
 
 @app.post("/api/web/telegram/channel/check")
 async def channel_check() -> dict[str, Any]:
-    return await run_channel_check()
+    # 兼容旧接口：等价于全部检查。
+    return await run_channel_check(None)
 
 
 def _channel_worker() -> None:
     global _NEXT_SUBSCRIPTION_CHECK, _NEXT_OFFLINE_CHECK
     while True:
         try:
-            config = _telegram_settings(False)
-            state = _channel_status()
-            if config["channel_enabled"] and int(state.get("next_check") or 0) <= int(time.time()):
-                asyncio.run(run_channel_check())
+            now = int(time.time())
+            for row in _channel_rows():
+                if not row["enabled"]:
+                    continue
+                if int(row.get("next_check_at") or 0) <= now:
+                    try:
+                        asyncio.run(run_channel_check(int(row["id"])))
+                    except Exception:
+                        logger.exception("module=telegram_channel channel_id=%s scheduled check failed", row["id"])
             business = get_business_settings()
             if business["subscription_auto_transfer"] and int(time.time()) >= _NEXT_SUBSCRIPTION_CHECK:
                 with database() as conn:
@@ -2575,7 +2847,8 @@ def _channel_worker() -> None:
                     except Exception:
                         logger.exception("module=offline provider=115 operation=poll")
                 _NEXT_OFFLINE_CHECK = int(time.time()) + int(business["ed2k_poll_interval"])
-            time.sleep(min(30, max(5, int(config["channel_interval"]) // 10)))
+            intervals = [int(row["check_interval"] or 600) for row in _channel_rows() if row["enabled"]] or [600]
+            time.sleep(min(30, max(5, min(intervals) // 10)))
         except Exception:
             logger.exception("channel worker loop failed")
             time.sleep(30)

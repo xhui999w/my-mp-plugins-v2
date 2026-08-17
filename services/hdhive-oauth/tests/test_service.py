@@ -1,8 +1,10 @@
+import asyncio
 import importlib
 import os
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +27,7 @@ os.environ.update(
 SERVICE_ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(SERVICE_ROOT))
 main = importlib.import_module("app.main")
+from app.notifications import ChannelMessage
 
 
 class OAuthServiceTests(unittest.TestCase):
@@ -502,6 +505,213 @@ class OAuthServiceTests(unittest.TestCase):
             failed = self.client.get("/api/web/115/folders")
         self.assertEqual(failed.status_code, 401)
         self.assertIn("重新扫码", failed.json()["detail"])
+
+class FakeEmbyClient:
+    def __init__(self, routes):
+        self.routes = routes
+        self.request_count = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def get(self, url, *args, **kwargs):
+        self.request_count += 1
+        for suffix, payload, status in self.routes:
+            if url.endswith(suffix):
+                if isinstance(payload, Exception):
+                    raise payload
+                return FakeEmbyResponse(payload, status)
+        return FakeEmbyResponse({"Error": "not found"}, 404)
+
+
+class FakeEmbyResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class EmbyAndTelegramChannelTests(unittest.TestCase):
+    def setUp(self):
+        main.init_database()
+        self.client = TestClient(main.app)
+        with main.database() as conn:
+            conn.execute("DELETE FROM telegram_channels WHERE installation_id=?", (main.WEB_INSTALLATION_ID,))
+            conn.execute("DELETE FROM telegram_channel_messages WHERE installation_id=?", (main.WEB_INSTALLATION_ID,))
+            conn.execute("DELETE FROM provider_state WHERE installation_id=?", (main.WEB_INSTALLATION_ID,))
+            conn.execute("DELETE FROM web_settings WHERE installation_id=?", (main.WEB_INSTALLATION_ID,))
+            conn.execute("INSERT INTO web_settings (installation_id,channel_name,updated_at) VALUES (?,?,?)", (main.WEB_INSTALLATION_ID, "", int(time.time())))
+
+    def _save_emby(self, url="http://emby.local:8096", api_key="emby-secret", user_id="user-1"):
+        response = self.client.put("/api/web/authorizations/emby", json={"url": url, "api_key": api_key, "user_id": user_id})
+        self.assertEqual(response.status_code, 200)
+        return response
+
+    def test_emby_save_roundtrip_persists_and_refreshes_state(self):
+        self._save_emby()
+        providers = self.client.get("/api/web/authorizations").json()["providers"]
+        self.assertTrue(providers["emby"]["configured"])
+        self.assertEqual(providers["emby"]["url"], "http://emby.local:8096")
+        self.assertEqual(providers["emby"]["user_id"], "user-1")
+        # 重新读取（模拟刷新页面 / 重启后端）配置仍在
+        settings, _ = main._authorization_rows()
+        self.assertEqual(settings["emby_url"], "http://emby.local:8096")
+        self.assertEqual(settings["emby_user_id"], "user-1")
+        self.assertTrue(bool(settings["emby_api_key"]))
+        # 保存后 available=false，直到测试连接成功
+        self.assertFalse(providers["emby"]["available"])
+
+    def test_emby_test_connection_success_uses_form_values(self):
+        fake = FakeEmbyClient([
+            ("/System/Info", {"ServerName": "MyEmby", "Version": "4.8.0.0"}, 200),
+            ("/Users/current-user", {"Name": "小明"}, 200),
+        ])
+        with patch.object(main.httpx, "AsyncClient", return_value=fake):
+            response = self.client.post("/api/web/authorizations/emby/test", json={"url": "http://emby.local:8096", "api_key": "typed-key", "user_id": "current-user"})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("连接成功", payload["message"])
+        self.assertIn("MyEmby", payload["message"])
+        self.assertIn("4.8.0.0", payload["message"])
+        self.assertIn("小明", payload["message"])
+        with main.database() as conn:
+            state = conn.execute("SELECT state_json FROM provider_state WHERE installation_id=? AND provider='emby'", (main.WEB_INSTALLATION_ID,)).fetchone()
+        self.assertIn('"available": true', state["state_json"])
+
+    def test_emby_test_connection_invalid_key_and_timeout(self):
+        fake = FakeEmbyClient([("/System/Info", {"Error": "Unauthorized"}, 401)])
+        with patch.object(main.httpx, "AsyncClient", return_value=fake):
+            response = self.client.post("/api/web/authorizations/emby/test", json={"url": "http://emby.local:8096", "api_key": "bad", "user_id": "user-1"})
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("API Key 无效", response.json()["detail"])
+        fake = FakeEmbyClient([("/System/Info", main.httpx.ConnectTimeout("boom"), 0)])
+        with patch.object(main.httpx, "AsyncClient", return_value=fake):
+            response = self.client.post("/api/web/authorizations/emby/test", json={"url": "http://emby.local:8096", "api_key": "k", "user_id": "u"})
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("连接超时", response.json()["detail"])
+
+    def test_emby_test_connection_requires_user_id(self):
+        response = self.client.post("/api/web/authorizations/emby/test", json={"url": "http://emby.local:8096", "api_key": "k", "user_id": ""})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("User ID", response.json()["detail"])
+
+    def test_media_detail_and_season_consume_emby_config(self):
+        self._save_emby()
+        fake = FakeEmbyClient([
+            ("/Users/user-1/Items", {"Items": [{"Id": "series-1"}]}, 200),
+            ("/Shows/series-1/Episodes", {"Items": [{"IndexNumber": 1, "ParentIndexNumber": 1}]}, 200),
+        ])
+        tmdb_payload = {
+            "id": 1396, "name": "绝命毒师", "original_name": "Breaking Bad", "overview": "", "first_air_date": "2008-01-20",
+            "vote_average": 8.9, "genres": [], "production_countries": [], "status": "Ended", "credits": {"cast": [], "crew": []},
+            "seasons": [{"season_number": 1, "name": "第 1 季", "episode_count": 7, "air_date": "2008-01-20", "poster_path": None}],
+            "episodes": [{"season_number": 1, "episode_number": 1, "name": "试播集", "overview": "", "air_date": "", "still_path": None}],
+        }
+        provider = Mock()
+        provider.configured = True
+        provider.normalize = main.TMDBProvider.normalize
+        provider.request = AsyncMock(return_value=(tmdb_payload, False))
+        with patch.object(main, "explore_tmdb_provider", return_value=provider), patch.object(main.httpx, "AsyncClient", return_value=fake):
+            detail = self.client.get("/api/web/media/detail", params={"media_type": "tv", "tmdb_id": 1396}).json()
+            season = self.client.get("/api/web/media/season", params={"tmdb_id": 1396, "season": 1}).json()
+        self.assertTrue(detail["emby_configured"])
+        self.assertFalse(detail["emby_error"])
+        self.assertEqual(detail["emby_status"], "available")
+        self.assertTrue(season["emby_configured"])
+        self.assertEqual(season["stats"]["available"], 1)
+        self.assertEqual(season["items"][0]["emby_status"], "available")
+
+    def test_telegram_single_channel_migrates_to_first_record(self):
+        with main.database() as conn:
+            conn.execute("DELETE FROM telegram_channels WHERE installation_id=?", (main.WEB_INSTALLATION_ID,))
+            conn.execute("UPDATE web_settings SET channel_enabled=1,channel_name='oneonefivewpfx',channel_interval=900 WHERE installation_id=?", (main.WEB_INSTALLATION_ID,))
+            conn.execute("INSERT OR REPLACE INTO channel_state (installation_id,last_message_id,last_check,next_check,last_status,last_error,processed) VALUES (?,?,?,?,?,?,?)",
+                         (main.WEB_INSTALLATION_ID, 100, 200, 300, "正常", "", 5))
+        main.init_database()
+        with main.database() as conn:
+            rows = conn.execute("SELECT * FROM telegram_channels WHERE installation_id=?", (main.WEB_INSTALLATION_ID,)).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "oneonefivewpfx")
+        self.assertEqual(rows[0]["enabled"], 1)
+        self.assertEqual(rows[0]["check_interval"], 900)
+        self.assertEqual(rows[0]["last_message_id"], 100)
+        self.assertEqual(rows[0]["processed_count"], 5)
+
+    def test_telegram_channel_crud(self):
+        created_a = self.client.post("/api/web/telegram/channels", json={"name": "频道A", "username": "https://t.me/channel_a", "enabled": True, "check_interval": 600})
+        self.assertEqual(created_a.status_code, 200)
+        channel_a = created_a.json()["channel"]
+        created_b = self.client.post("/api/web/telegram/channels", json={"name": "频道B", "username": "@channel_b", "enabled": True, "check_interval": 900})
+        self.assertEqual(created_b.status_code, 200)
+        channel_b = created_b.json()["channel"]
+        items = self.client.get("/api/web/telegram/channels").json()["items"]
+        self.assertEqual([item["username"] for item in items], ["channel_a", "channel_b"])
+        updated = self.client.put(f"/api/web/telegram/channels/{channel_b['id']}", json={"name": "频道B2", "username": "@channel_b2", "enabled": False, "check_interval": 1200})
+        self.assertEqual(updated.json()["channel"]["username"], "channel_b2")
+        self.assertFalse(updated.json()["channel"]["enabled"])
+        deleted = self.client.delete(f"/api/web/telegram/channels/{channel_a['id']}")
+        self.assertEqual(deleted.status_code, 200)
+        items = self.client.get("/api/web/telegram/channels").json()["items"]
+        self.assertEqual([item["username"] for item in items], ["channel_b2"])
+
+    def test_telegram_channel_check_dedup_and_first_cursor(self):
+        created = self.client.post("/api/web/telegram/channels", json={"name": "频道", "username": "@demo_channel", "enabled": True, "check_interval": 600}).json()["channel"]
+        channel_id = created["id"]
+        messages = [ChannelMessage(10, "t", ["https://hdhive.com/resource/abc-1"]), ChannelMessage(11, "t", ["https://hdhive.com/resource/abc-2"])]
+        with patch.object(main.CHANNEL_MONITOR, "fetch", new=AsyncMock(return_value=messages)), patch.object(main, "web_resource_transfer", new=AsyncMock(return_value={"ok": True})) as transfer:
+            first = asyncio.run(main.run_channel_check(channel_id))
+            self.assertEqual(first["processed"], 0)
+            self.assertIn("首次检查", first["message"])
+            with main.database() as conn:
+                row = conn.execute("SELECT last_message_id FROM telegram_channels WHERE id=?", (channel_id,)).fetchone()
+            self.assertEqual(row["last_message_id"], 11)
+            transfer.assert_not_awaited()
+            # 新消息进入后正常处理，再次检查同一批消息不会重复处理
+            new_messages = [ChannelMessage(12, "t", ["https://hdhive.com/resource/abc-3"])]
+            with patch.object(main.CHANNEL_MONITOR, "fetch", new=AsyncMock(return_value=[*messages, *new_messages])):
+                second = asyncio.run(main.run_channel_check(channel_id))
+            self.assertEqual(second["processed"], 1)
+            transfer.assert_awaited_once()
+            third = asyncio.run(main.run_channel_check(channel_id))
+            self.assertEqual(third["processed"], 0)
+            transfer.assert_awaited_once()
+            with main.database() as conn:
+                dedup_count = conn.execute("SELECT COUNT(*) FROM telegram_channel_messages WHERE installation_id=? AND channel_id=?", (main.WEB_INSTALLATION_ID, channel_id)).fetchone()[0]
+            self.assertEqual(dedup_count, 1)
+
+    def test_telegram_channel_error_isolation_between_channels(self):
+        a = self.client.post("/api/web/telegram/channels", json={"name": "A", "username": "@good_channel", "enabled": True, "check_interval": 600}).json()["channel"]
+        b = self.client.post("/api/web/telegram/channels", json={"name": "B", "username": "@bad_channel", "enabled": True, "check_interval": 600}).json()["channel"]
+        with patch.object(main, "web_resource_transfer", new=AsyncMock(return_value={"ok": True})) as transfer:
+            with patch.object(main.CHANNEL_MONITOR, "fetch", new=AsyncMock(return_value=[ChannelMessage(5, "t", ["https://hdhive.com/resource/ok-1"])])):
+                asyncio.run(main.run_channel_check(a["id"]))
+
+            async def fake_fetch(username, after_id=0):
+                if username == "bad_channel":
+                    raise RuntimeError("Telegram 访问失败")
+                return [ChannelMessage(6, "t", ["https://hdhive.com/resource/ok-2"])]
+
+            with patch.object(main.CHANNEL_MONITOR, "fetch", new=fake_fetch):
+                result = asyncio.run(main.run_channel_check(None))
+        self.assertEqual(result["checked"], 2)
+        statuses = {r["ok"] for r in result["results"]}
+        self.assertEqual(statuses, {True, False})
+        self.assertEqual(transfer.await_count, 1)  # A 正常处理（首检仅建游标），B 失败不影响 A
+        with main.database() as conn:
+            bad = conn.execute("SELECT last_status,last_error FROM telegram_channels WHERE id=?", (b["id"],)).fetchone()
+        self.assertEqual(bad["last_status"], "检查失败")
+        self.assertIn("Telegram 访问失败", bad["last_error"])
 
 
 if __name__ == "__main__":
