@@ -1579,6 +1579,13 @@ class SubscriptionRequest(BaseModel):
             return None
         return y if 1880 <= y <= 2200 else None
 
+    @field_validator("douban_id", "poster", "season", "subscription_scope", "category", "save_path", "moviepilot_id", mode="before")
+    @classmethod
+    def _coerce_optional_str(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
+
 
 class SearchRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=200)

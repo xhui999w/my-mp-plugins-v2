@@ -3,4 +3,5 @@ __pycache__/
 .env
 services/hdhive-oauth/data/
 services/hdhive-oauth/.venv/
+services/hdhive-oauth/local_reg.db
 
