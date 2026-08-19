@@ -1776,6 +1776,12 @@ def web_resource_search_cached(media_type: str = Query(..., pattern="^(movie|tv)
     return payload
 
 
+@app.get("/api/web/debug/raw-resources")
+async def debug_raw_resources(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(..., ge=1)) -> dict[str, Any]:
+    """TEMP DEBUG: return the raw HDHive API response for field inspection."""
+    return await authorized_request(WEB_INSTALLATION_ID, "GET", f"/api/open/resources/{quote(media_type)}/{tmdb_id}")
+
+
 @app.get("/api/web/search-history")
 def web_search_history(limit: int = Query(20, ge=1, le=50)) -> dict[str, Any]:
     with database() as conn:
