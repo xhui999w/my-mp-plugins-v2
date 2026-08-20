@@ -21,7 +21,7 @@ SIDEBAR_NAV = (
 
 def sidebar_html(active: str) -> str:
     """生成左侧导航。active 传当前页面 key（search/rankings/explore/...）。"""
-    parts = ['<div class="logo">\u25C9 影舟 MovieArk</div>']
+    parts = ['<div class="logo"><svg viewBox="0 0 512 512" width="22" height="22" style="vertical-align:-5px;margin-right:7px;border-radius:5px" aria-hidden="true"><defs><linearGradient id="maLogoGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#E11D48"/><stop offset="1" stop-color="#F59E0B"/></linearGradient></defs><rect width="512" height="512" rx="112" fill="url(#maLogoGrad)"/><circle cx="256" cy="236" r="118" fill="none" stroke="#fff" stroke-width="16" opacity=".95"/><path d="M236 190 L320 236 L236 282 Z" fill="#fff"/></svg>影舟 MovieArk</div>']
     for group, items in SIDEBAR_NAV:
         parts.append(f'<div class="group">{group}</div>')
         for key, href, icon, label in items:

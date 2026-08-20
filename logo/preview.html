@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>影舟 MovieArk · Logo 预览</title>
+<style>
+  :root{ --red:#E11D48; --gold:#F59E0B; --ink:#0f172a; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; font-family:'PingFang SC','Microsoft YaHei',system-ui,-apple-system,sans-serif; color:var(--ink); background:#f5f6fa; }
+  .wrap{ max-width:920px; margin:0 auto; padding:32px 20px 64px; }
+  h1{ font-size:24px; margin:0 0 4px; }
+  .sub{ color:#64748b; margin:0 0 28px; font-size:14px; }
+  .card{ border-radius:18px; padding:28px; margin-bottom:22px; box-shadow:0 6px 24px rgba(15,23,42,.06); }
+  .light{ background:#ffffff; }
+  .dark{ background:#0b0e1a; color:#e5e7eb; }
+  .dark .label{ color:#94a3b8; }
+  .row{ display:flex; align-items:center; gap:28px; flex-wrap:wrap; }
+  .label{ font-size:12px; letter-spacing:1px; text-transform:uppercase; color:#94a3b8; margin-bottom:10px; }
+  .sizes{ display:flex; align-items:flex-end; gap:18px; }
+  .sizes span{ font-size:11px; color:#94a3b8; display:flex; flex-direction:column; align-items:center; gap:6px; }
+  .header-mock{ display:flex; align-items:center; gap:14px; }
+  .header-mock.dark{ background:#0b0e1a; border:1px solid #1e293b; }
+  .header-mock.light{ background:#fff; border:1px solid #e2e8f0; }
+  .header-mock .nav{ margin-left:auto; display:flex; gap:18px; font-size:14px; color:#64748b; }
+  .tip{ font-size:13px; color:#475569; line-height:1.7; }
+  code{ background:#fef2f2; color:#be123c; padding:2px 6px; border-radius:6px; font-size:12px; }
+  .gradbar{ height:8px; border-radius:6px; background:linear-gradient(90deg,var(--red),var(--gold)); margin-top:18px; }
+</style>
+</head>
+<body>
+
+<!-- 复用图标定义 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="markGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#E11D48"/><stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <symbol id="ma-mark" viewBox="0 0 512 512">
+      <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#markGrad)"/>
+      <circle cx="256" cy="236" r="118" fill="none" stroke="#ffffff" stroke-width="16" opacity="0.95"/>
+      <circle cx="256" cy="236" r="150" fill="none" stroke="#ffffff" stroke-width="6" opacity="0.35"/>
+      <path d="M236 190 L320 236 L236 282 Z" fill="#ffffff"/>
+      <path d="M120 388 Q176 414 232 388 T344 388 T456 388" fill="none" stroke="#ffffff" stroke-width="10" stroke-linecap="round" opacity="0.55"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+  <h1>影舟 · MovieArk Logo</h1>
+  <p class="sub">SVG 矢量 · 浏览器原生显示 · 可作 favicon / 应用图标 / 网站头</p>
+
+  <!-- 亮底横版 -->
+  <div class="card light">
+    <div class="label">横版 · 亮底（深字）</div>
+    <div class="row">
+      <svg width="280" height="80" viewBox="0 0 560 160" role="img" aria-label="影舟 MovieArk">
+        <use href="#ma-mark" x="0" y="0" width="160" height="160"/>
+        <text x="186" y="74" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="58" font-weight="700" fill="#0f172a">影舟</text>
+        <text x="189" y="116" font-family="'Segoe UI',system-ui,sans-serif" font-size="30" font-weight="600" letter-spacing="1" fill="#6366F1">MovieArk</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- 暗底横版 -->
+  <div class="card dark">
+    <div class="label">横版 · 暗底（白字）</div>
+    <div class="row">
+      <svg width="280" height="80" viewBox="0 0 560 160" role="img" aria-label="影舟 MovieArk">
+        <use href="#ma-mark" x="0" y="0" width="160" height="160"/>
+        <text x="186" y="74" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="58" font-weight="700" fill="#ffffff">影舟</text>
+        <text x="189" y="116" font-family="'Segoe UI',system-ui,sans-serif" font-size="30" font-weight="600" letter-spacing="1" fill="#A5B4FC">MovieArk</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- 尺寸演示（favicon 级） -->
+  <div class="card light">
+    <div class="label">图标尺寸（16 / 32 / 64 / 128）</div>
+    <div class="sizes">
+      <span><svg width="16" height="16"><use href="#ma-mark"/></svg>16</span>
+      <span><svg width="32" height="32"><use href="#ma-mark"/></svg>32</span>
+      <span><svg width="64" height="64"><use href="#ma-mark"/></svg>64</span>
+      <span><svg width="128" height="128"><use href="#ma-mark"/></svg>128</span>
+    </div>
+  </div>
+
+  <!-- 仿头部栏 -->
+  <div class="card light">
+    <div class="label">网站头部栏（亮）</div>
+    <div class="header-mock light" style="border-radius:14px; padding:14px 18px;">
+      <svg width="36" height="36"><use href="#ma-mark"/></svg>
+      <strong style="font-size:18px;">影舟 <span style="color:var(--red);font-weight:600;font-size:15px;">MovieArk</span></strong>
+      <div class="nav"><span>资源</span><span>订阅</span><span>榜单</span><span>我的</span></div>
+    </div>
+  </div>
+
+  <div class="card dark">
+    <div class="label">网站头部栏（暗）</div>
+    <div class="header-mock dark" style="border-radius:14px; padding:14px 18px;">
+      <svg width="36" height="36"><use href="#ma-mark"/></svg>
+      <strong style="font-size:18px;color:#fff;">影舟 <span style="color:#FBBF24;font-weight:600;font-size:15px;">MovieArk</span></strong>
+      <div class="nav" style="color:#94a3b8;"><span>资源</span><span>订阅</span><span>榜单</span><span>我的</span></div>
+    </div>
+  </div>
+
+  <div class="card light">
+    <div class="label">用法</div>
+    <p class="tip">
+      • 图标文件：<code>movieark-icon.svg</code>（圆角方块，渐变）<br>
+      • 横版 logo：<code>movieark-logo.svg</code>（亮底）/ <code>movieark-logo-white.svg</code>（暗底）<br>
+      • 当 favicon：<code>&lt;link rel="icon" href="movieark-icon.svg" type="image/svg+xml"&gt;</code><br>
+      • SVG 是文本矢量，所有现代浏览器原生渲染，放大不失真。
+    </p>
+    <div class="gradbar"></div>
+  </div>
+</div>
+</body>
+</html>

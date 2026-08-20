@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>影舟 MovieArk · 方案对比</title>
+<style>
+  *{ box-sizing:border-box; }
+  body{ margin:0; font-family:'PingFang SC','Microsoft YaHei',system-ui,-apple-system,sans-serif; color:#0f172a; background:#f5f6fa; }
+  .wrap{ max-width:1000px; margin:0 auto; padding:32px 20px 64px; }
+  h1{ font-size:24px; margin:0 0 4px; }
+  .sub{ color:#64748b; margin:0 0 28px; font-size:14px; }
+  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  .card{ background:#fff; border-radius:18px; padding:22px; box-shadow:0 6px 24px rgba(15,23,42,.06); }
+  .vname{ font-size:16px; font-weight:700; margin:0 0 2px; }
+  .vpal{ font-size:12px; color:#94a3b8; margin:0 0 16px; letter-spacing:.5px; }
+  .show{ display:flex; align-items:center; gap:18px; flex-wrap:wrap; margin-bottom:12px; }
+  .darkbox{ background:#0b0e1a; border-radius:14px; padding:14px; display:inline-flex; }
+  .pick{ font-size:12px; color:#6366F1; margin-top:6px; }
+  @media(max-width:680px){ .grid{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366F1"/><stop offset="0.5" stop-color="#8B5CF6"/><stop offset="1" stop-color="#06B6D4"/></linearGradient>
+    <linearGradient id="g3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#E11D48"/><stop offset="1" stop-color="#F59E0B"/></linearGradient>
+    <linearGradient id="g4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10B981"/><stop offset="1" stop-color="#06B6D4"/></linearGradient>
+
+    <!-- V1 胶片之舟 -->
+    <symbol id="v1" viewBox="0 0 512 512">
+      <rect width="512" height="512" rx="112" fill="url(#g1)"/>
+      <path d="M256 150 L322 240 L190 240 Z" fill="#fff" opacity=".96"/>
+      <rect x="92" y="304" width="328" height="60" rx="30" fill="#fff" opacity=".96"/>
+      <g fill="#6366F1">
+        <rect x="120" y="319" width="28" height="30" rx="7"/><rect x="172" y="319" width="28" height="30" rx="7"/>
+        <rect x="224" y="319" width="28" height="30" rx="7"/><rect x="276" y="319" width="28" height="30" rx="7"/>
+        <rect x="328" y="319" width="28" height="30" rx="7"/>
+      </g>
+      <path d="M110 392 Q160 412 210 392 T310 392 T410 392" fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round" opacity=".55"/>
+    </symbol>
+
+    <!-- V2 极简靛蓝 -->
+    <symbol id="v2" viewBox="0 0 512 512">
+      <rect width="512" height="512" rx="112" fill="#4F46E5"/>
+      <path d="M256 168 L330 248 L182 248 Z" fill="#fff"/>
+      <path d="M120 360 Q176 392 232 360 T344 360 T456 360" fill="none" stroke="#fff" stroke-width="12" stroke-linecap="round" opacity=".75"/>
+    </symbol>
+
+    <!-- V3 影院红金（镜头圈） -->
+    <symbol id="v3" viewBox="0 0 512 512">
+      <rect width="512" height="512" rx="112" fill="url(#g3)"/>
+      <circle cx="256" cy="236" r="118" fill="none" stroke="#fff" stroke-width="16" opacity=".95"/>
+      <circle cx="256" cy="236" r="150" fill="none" stroke="#fff" stroke-width="6" opacity=".35"/>
+      <path d="M236 190 L320 236 L236 282 Z" fill="#fff"/>
+      <path d="M120 388 Q176 414 232 388 T344 388 T456 388" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" opacity=".55"/>
+    </symbol>
+
+    <!-- V4 清新青绿 -->
+    <symbol id="v4" viewBox="0 0 512 512">
+      <rect width="512" height="512" rx="112" fill="url(#g4)"/>
+      <path d="M256 158 L326 244 L186 244 Z" fill="#fff" opacity=".97"/>
+      <rect x="100" y="312" width="312" height="52" rx="26" fill="#fff" opacity=".92"/>
+      <path d="M120 384 Q176 408 232 384 T344 384 T456 384" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" opacity=".6"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+  <h1>影舟 · MovieArk 方案对比</h1>
+  <p class="sub">4 个方向，亮底 + 暗底都看了，选一个我定稿成正式 SVG</p>
+
+  <div class="grid">
+
+    <!-- V1 -->
+    <div class="card">
+      <p class="vname">① 胶片之舟</p>
+      <p class="vpal">#6366F1 → #8B5CF6 → #06B6D4</p>
+      <div class="show">
+        <svg width="96" height="96"><use href="#v1"/></svg>
+        <div class="darkbox"><svg width="64" height="64"><use href="#v1"/></svg></div>
+        <svg width="260" height="74" viewBox="0 0 560 160">
+          <use href="#v1" x="0" y="0" width="148" height="148"/>
+          <text x="172" y="70" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="54" font-weight="700" fill="#0f172a">影舟</text>
+          <text x="175" y="110" font-family="'Segoe UI',system-ui,sans-serif" font-size="28" font-weight="600" fill="#6366F1">MovieArk</text>
+        </svg>
+      </div>
+      <p class="pick">现状方案 · 概念最贴合「影舟」</p>
+    </div>
+
+    <!-- V2 -->
+    <div class="card">
+      <p class="vname">② 极简靛蓝</p>
+      <p class="vpal">#4F46E5 纯色</p>
+      <div class="show">
+        <svg width="96" height="96"><use href="#v2"/></svg>
+        <div class="darkbox"><svg width="64" height="64"><use href="#v2"/></svg></div>
+        <svg width="260" height="74" viewBox="0 0 560 160">
+          <use href="#v2" x="0" y="0" width="148" height="148"/>
+          <text x="172" y="70" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="54" font-weight="700" fill="#0f172a">影舟</text>
+          <text x="175" y="110" font-family="'Segoe UI',system-ui,sans-serif" font-size="28" font-weight="600" fill="#4F46E5">MovieArk</text>
+        </svg>
+      </div>
+      <p class="pick">最干净 · 小尺寸最清晰</p>
+    </div>
+
+    <!-- V3 -->
+    <div class="card">
+      <p class="vname">③ 影院红金</p>
+      <p class="vpal">#E11D48 → #F59E0B</p>
+      <div class="show">
+        <svg width="96" height="96"><use href="#v3"/></svg>
+        <div class="darkbox"><svg width="64" height="64"><use href="#v3"/></svg></div>
+        <svg width="260" height="74" viewBox="0 0 560 160">
+          <use href="#v3" x="0" y="0" width="148" height="148"/>
+          <text x="172" y="70" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="54" font-weight="700" fill="#0f172a">影舟</text>
+          <text x="175" y="110" font-family="'Segoe UI',system-ui,sans-serif" font-size="28" font-weight="600" fill="#E11D48">MovieArk</text>
+        </svg>
+      </div>
+      <p class="pick">电影感强 · 暖色更吸睛</p>
+    </div>
+
+    <!-- V4 -->
+    <div class="card">
+      <p class="vname">④ 清新青绿</p>
+      <p class="vpal">#10B981 → #06B6D4</p>
+      <div class="show">
+        <svg width="96" height="96"><use href="#v4"/></svg>
+        <div class="darkbox"><svg width="64" height="64"><use href="#v4"/></svg></div>
+        <svg width="260" height="74" viewBox="0 0 560 160">
+          <use href="#v4" x="0" y="0" width="148" height="148"/>
+          <text x="172" y="70" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="54" font-weight="700" fill="#0f172a">影舟</text>
+          <text x="175" y="110" font-family="'Segoe UI',system-ui,sans-serif" font-size="28" font-weight="600" fill="#10B981">MovieArk</text>
+        </svg>
+      </div>
+      <p class="pick">明亮科技 · 差异化强</p>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

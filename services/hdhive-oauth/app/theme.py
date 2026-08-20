@@ -178,8 +178,18 @@ def _switcher_css() -> str:
 
 
 def theme_head() -> str:
+    favicon = (
+        "<link rel=\"icon\" href=\"data:image/svg+xml,"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'>"
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='%23E11D48'/><stop offset='1' stop-color='%23F59E0B'/></linearGradient></defs>"
+        "<rect width='512' height='512' rx='112' fill='url(%23g)'/>"
+        "<circle cx='256' cy='236' r='118' fill='none' stroke='%23fff' stroke-width='16'/>"
+        "<path d='M236 190 L320 236 L236 282 Z' fill='%23fff'/></svg>\">"
+    )
     return (
-        "<style>" + _css_block() + _switcher_css()
+        favicon
+        + "<style>" + _css_block() + _switcher_css()
         + ".nav .nav-ico{display:inline-block;width:24px;margin-right:9px;text-align:center;vertical-align:-2px;flex:none}*{scrollbar-width:thin;scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track)}"
         + "*::-webkit-scrollbar{width:10px;height:10px}*::-webkit-scrollbar-track{background:var(--scrollbar-track)}"
         + "*::-webkit-scrollbar-thumb{background:var(--scrollbar-thumb);border-radius:6px}"
