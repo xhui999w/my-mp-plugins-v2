@@ -228,10 +228,18 @@ class OAuthServiceTests(unittest.TestCase):
         created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": "执行测试", "media_type": "movie", "tmdb_id": 8899}).json()
         with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": [{"slug": "hit"}]})):
             result = self.client.post(f"/v1/subscriptions/{created['id']}/run", headers=self.headers).json()
-        self.assertEqual(result["status"], "resource_found")
+        # 执行成功后订阅应回到监控态(active)，而非 terminal(completed)
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["run_status"], "resource_found")
         with patch.object(main, "query_resources", new=AsyncMock(side_effect=main.HTTPException(502, "上游不可用"))):
             failed = self.client.post(f"/v1/subscriptions/{created['id']}/run", headers=self.headers).json()
         self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["run_status"], "failed")
+        # 执行后订阅记录必须仍然存在，并停留在“当前订阅”列表（不会因执行而消失）
+        listing = self.client.get("/v1/subscriptions", params={"tab": "current"}, headers=self.headers).json()
+        self.assertIn(created["id"], [item["id"] for item in listing["items"]])
+        with main.database() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM web_subscriptions WHERE id=?", (created["id"],)).fetchone()["status"], "failed")
 
     def test_explore_result_can_create_subscription_with_poster(self):
         with main.database() as conn:
@@ -434,8 +442,16 @@ class OAuthServiceTests(unittest.TestCase):
         created = main.create_subscription(main.SubscriptionRequest(title="自动转存", media_type="movie", tmdb_id=7654321), main.WEB_INSTALLATION_ID)
         with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": [{"slug": "resource-hit"}]})), patch.object(main, "web_resource_transfer", new=AsyncMock(return_value={"ok": True})), patch.object(main, "get_business_settings", return_value={"subscription_auto_transfer": True}):
             result = self.client.post(f"/api/web/subscriptions/{created['id']}/run").json()
-        self.assertEqual(result["status"], "completed")
+        # 回归：成功转存后订阅必须回到监控态(active)，且不能从当前列表消失
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["run_status"], "success")
         self.assertEqual(result["transfer_count"], 1)
+        listing = self.client.get("/api/web/subscriptions", params={"tab": "current"}).json()
+        self.assertIn(created["id"], [item["id"] for item in listing["items"]])
+        with main.database() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM web_subscriptions WHERE id=?", (created["id"],)).fetchone()["status"], "active")
+            conn.execute("DELETE FROM subscription_runs WHERE subscription_id=?", (created["id"],))
+            conn.execute("DELETE FROM web_subscriptions WHERE id=?", (created["id"],))
 
 
     def test_search_history_and_cache_persistence(self):

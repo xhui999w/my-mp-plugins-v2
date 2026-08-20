@@ -1950,7 +1950,7 @@ def list_subscriptions(
     return subscription_page(installation_id, tab, search, media_type, year, status, page, page_size, sort)
 
 
-TERMINAL_SUBSCRIPTION_STATUSES = ("completed", "cancelled", "failed", "expired")
+TERMINAL_SUBSCRIPTION_STATUSES = ("cancelled", "expired")
 
 
 def subscription_page(installation_id: str, tab: str = "current", search: str = "", media_type: str = "", year: int | None = None, status: str = "", page: int = 1, page_size: int = 20, sort: str = "created_desc") -> dict[str, Any]:
@@ -1983,7 +1983,7 @@ def subscription_page(installation_id: str, tab: str = "current", search: str = 
             FROM web_subscriptions s WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?""",
             [*params, page_size, (page - 1) * page_size],
         ).fetchall()
-        counts = conn.execute("SELECT SUM(status NOT IN ('completed','cancelled','failed','expired')), SUM(status IN ('completed','cancelled','failed','expired')) FROM web_subscriptions WHERE installation_id=?", (installation_id,)).fetchone()
+        counts = conn.execute("SELECT SUM(status NOT IN ('cancelled','expired')), SUM(status IN ('cancelled','expired')) FROM web_subscriptions WHERE installation_id=?", (installation_id,)).fetchone()
     total_pages = max(1, (total + page_size - 1) // page_size)
     return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size, "total": total, "total_pages": total_pages, "has_more": page < total_pages, "current_count": counts[0] or 0, "history_count": counts[1] or 0}
 
@@ -2017,12 +2017,21 @@ async def execute_subscription(installation_id: str, subscription_id: int) -> di
         row = conn.execute("SELECT * FROM web_subscriptions WHERE id=? AND installation_id=?", (subscription_id, installation_id)).fetchone()
         if not row:
             raise HTTPException(404, "订阅不存在")
+        old_status = row["status"]
+        # 重复点击保护：已在执行中则不再启动新任务（避免并发重复 task）
+        if old_status == "running":
+            logger.info("module=subscriptions operation=start subscription=%s old_status=running skip=already_running", subscription_id)
+            return {"ok": True, "run_id": None, "status": "running", "run_status": "skipped", "resource_count": 0, "transfer_count": 0, "error": ""}
         conn.execute("UPDATE web_subscriptions SET status='running', error='', updated_at=?, last_run_at=? WHERE id=?", (int(time.time()), int(time.time()), subscription_id))
+    logger.info("module=subscriptions operation=start subscription=%s old_status=%s new_status=running", subscription_id, old_status)
+    count = 0
+    transfer_count = 0
+    run_status = "waiting_output"
+    error = ""
     try:
         payload = await query_resources(ResourceQuery(media_type=row["media_type"], tmdb_id=row["tmdb_id"]), installation_id)
         resources = _resource_items(payload)
         count = len(resources)
-        transfer_count = 0
         settings = get_business_settings()
         with database() as conn:
             transfer_ready = installation_id == WEB_INSTALLATION_ID and bool(conn.execute("SELECT 1 FROM installations WHERE installation_id=?", (installation_id,)).fetchone()) and bool(conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=? AND COALESCE(p115_cookie,'')<>''", (installation_id,)).fetchone())
@@ -2032,18 +2041,23 @@ async def execute_subscription(installation_id: str, subscription_id: int) -> di
             if slug:
                 await web_resource_transfer(WebResourceTransfer(provider="hdhive", resource_id=slug))
                 transfer_count = 1
-        new_status = "completed" if transfer_count else ("resource_found" if count else "waiting_output")
-        error = ""
+        run_status = "success" if transfer_count else ("resource_found" if count else "waiting_output")
     except HTTPException as exc:
-        count = locals().get("count", 0); transfer_count = 0; new_status = "failed"; error = str(exc.detail)
+        run_status = "failed"; error = str(exc.detail)
+        logger.warning("module=subscriptions operation=execute subscription=%s status=failed reason=%s", subscription_id, error)
     except Exception as exc:
+        run_status = "failed"; error = str(exc)
         logger.exception("module=subscriptions operation=execute subscription=%s", subscription_id)
-        count = locals().get("count", 0); transfer_count = 0; new_status = "failed"; error = str(exc)
+    # 订阅是长期关系：单次执行完成 ≠ 订阅结束。
+    # 成功 → 回到监控态(active)，失败 → 标记为异常(failed)但记录保留（可由调度器重试）。
+    # 均不会进入 terminal(cancelled/expired)，因此不会从订阅列表消失。
+    sub_status = "failed" if run_status == "failed" else "active"
     now = int(time.time())
     with database() as conn:
-        cur = conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,transfer_count,error,created_at) VALUES (?,?,?,?,?,?,?)", (installation_id, subscription_id, new_status, count, transfer_count, error, now))
-        conn.execute("UPDATE web_subscriptions SET status=?, error=?, updated_at=? WHERE id=?", (new_status, error, now, subscription_id))
-    return {"ok": new_status != "failed", "run_id": cur.lastrowid, "status": new_status, "resource_count": count, "transfer_count": transfer_count, "error": error}
+        cur = conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,transfer_count,error,created_at) VALUES (?,?,?,?,?,?,?)", (installation_id, subscription_id, run_status, count, transfer_count, error, now))
+        conn.execute("UPDATE web_subscriptions SET status=?, error=?, updated_at=?, last_run_at=? WHERE id=?", (sub_status, error, now, now, subscription_id))
+    logger.info("module=subscriptions operation=executed subscription=%s run_status=%s sub_status=%s resource_count=%s transfer_count=%s", subscription_id, run_status, sub_status, count, transfer_count)
+    return {"ok": run_status != "failed", "run_id": cur.lastrowid, "status": sub_status, "run_status": run_status, "resource_count": count, "transfer_count": transfer_count, "error": error}
 
 
 @app.post("/v1/subscriptions/{subscription_id}/run")
@@ -2867,7 +2881,7 @@ def _channel_worker() -> None:
             if business["subscription_auto_transfer"] and int(time.time()) >= _NEXT_SUBSCRIPTION_CHECK:
                 with database() as conn:
                     auth = conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
-                    subscriptions = conn.execute("SELECT id FROM web_subscriptions WHERE installation_id=? AND status IN ('active','waiting_output','resource_found','failed') ORDER BY COALESCE(last_run_at,0) ASC LIMIT 25", (WEB_INSTALLATION_ID,)).fetchall() if auth and auth["p115_cookie"] else []
+                    subscriptions = conn.execute("SELECT id FROM web_subscriptions WHERE installation_id=? AND status IN ('active','failed','completed','waiting_output','resource_found') ORDER BY COALESCE(last_run_at,0) ASC LIMIT 25", (WEB_INSTALLATION_ID,)).fetchall() if auth and auth["p115_cookie"] else []
                 for subscription in subscriptions:
                     try:
                         asyncio.run(execute_subscription(WEB_INSTALLATION_ID, int(subscription["id"])))
