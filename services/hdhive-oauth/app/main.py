@@ -2098,7 +2098,7 @@ async def execute_subscription(installation_id: str, subscription_id: int) -> di
     try:
         tmdb_id = int(row["tmdb_id"] or 0)
         if not tmdb_id:
-            resolution = await resolve_tmdb_id(row["media_type"], row["title"] or "", str(row.get("year") or ""))
+            resolution = await resolve_tmdb_id(row["media_type"], row["title"] or "", str(row["year"] or ""))
             tmdb_id = int(resolution.get("tmdb_id") or 0)
             if tmdb_id:
                 with database() as conn:
