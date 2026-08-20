@@ -393,10 +393,16 @@ def init_database() -> None:
             ("category", "TEXT DEFAULT ''"), ("save_path", "TEXT DEFAULT ''"),
             ("updated_at", "INTEGER DEFAULT 0"), ("douban_id", "TEXT DEFAULT ''"),
             ("moviepilot_id", "TEXT DEFAULT ''"), ("error", "TEXT DEFAULT ''"),
-            ("last_run_at", "INTEGER DEFAULT 0"),
+            ("last_run_at", "INTEGER DEFAULT 0"), ("saved_episodes", "TEXT DEFAULT '{}'"),
         ):
             if name not in subscription_columns:
                 conn.execute(f"ALTER TABLE web_subscriptions ADD COLUMN {name} {definition}")
+        subscription_run_columns = {row[1] for row in conn.execute("PRAGMA table_info(subscription_runs)")}
+        for name, definition in (
+            ("summary", "TEXT DEFAULT ''"),
+        ):
+            if name not in subscription_run_columns:
+                conn.execute(f"ALTER TABLE subscription_runs ADD COLUMN {name} {definition}")
         transfer_columns = {row[1] for row in conn.execute("PRAGMA table_info(transfer_records)")}
         for name, definition in (
             ("subscription_id", "INTEGER"), ("media_type", "TEXT DEFAULT ''"),
@@ -1495,6 +1501,7 @@ class ResolveRequest(BaseModel):
 async def resolve_resource(
     request: ResolveRequest,
     installation_id: str = Depends(require_installation),
+    subscription_id: int | None = None,
 ) -> dict[str, Any]:
     slug = request.slug.strip()
     if not slug and request.resource_url:
@@ -1565,24 +1572,24 @@ async def resolve_resource(
             transfer_s = prev_transfer if prev_transfer in ("success", "processing", "failed") else "pending"
             status_s = "completed" if transfer_s == "success" else "resolved"
             conn.execute(
-                """UPDATE transfer_records SET name=?,share_url=?,status=?,resolution=?,quality=?,size=?,uploader=?,points=?,action=?,processing_status=?,source_type=?,unlock_status='unlocked',transfer_status=?,updated_at=? WHERE id=?""",
+                """UPDATE transfer_records SET name=?,share_url=?,status=?,resolution=?,quality=?,size=?,uploader=?,points=?,action=?,processing_status=?,source_type=?,unlock_status='unlocked',transfer_status=?,subscription_id=?,updated_at=? WHERE id=?""",
                 (name, url, status_s,
                  _list_text(detail.get("video_resolution")), _list_text(detail.get("source")),
                  str(detail.get("share_size") or detail.get("size") or ""), uploader,
                  int(detail.get("unlock_points") or 0), "资源解锁",
                  "completed" if transfer_s == "success" else "resolved",
-                 source_type, transfer_s, now, existing["id"]),
+                 source_type, transfer_s, subscription_id, now, existing["id"]),
             )
         else:
             conn.execute(
                 """INSERT INTO transfer_records
-                   (installation_id,slug,name,share_url,status,resolution,quality,size,uploader,points,action,processing_status,source_type,unlock_status,transfer_status,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (installation_id,slug,name,share_url,status,resolution,quality,size,uploader,points,action,processing_status,source_type,unlock_status,transfer_status,subscription_id,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (installation_id, slug, name, url, "resolved",
                  _list_text(detail.get("video_resolution")), _list_text(detail.get("source")),
                  str(detail.get("share_size") or detail.get("size") or ""), uploader,
                  int(detail.get("unlock_points") or 0), "资源解锁", "resolved", source_type,
-                 "unlocked", "pending", now, now),
+                 "unlocked", "pending", subscription_id, now, now),
             )
     return {
         "name": name,
@@ -1850,6 +1857,10 @@ def web_search_history_clear() -> dict[str, Any]:
 class WebResourceTransfer(BaseModel):
     provider: str = Field(min_length=1, max_length=50)
     resource_id: str = Field(min_length=1, max_length=200)
+    subscription_id: int | None = None
+    media_type: str = ""
+    tmdb_id: int = 0
+    season_episode: str = ""
 
 
 async def _execute_transfer(result: dict[str, Any], resource_id: str) -> dict[str, Any]:
@@ -1909,7 +1920,7 @@ async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
     if request.provider != "hdhive":
         raise HTTPException(400, "该资源来源暂不支持转存")
     try:
-        result = await resolve_resource(ResolveRequest(slug=request.resource_id, max_unlock_points=None), WEB_INSTALLATION_ID)
+        result = await resolve_resource(ResolveRequest(slug=request.resource_id, max_unlock_points=None), WEB_INSTALLATION_ID, subscription_id=request.subscription_id)
         return await _execute_transfer(result, request.resource_id)
     except P115Error as exc:
         raise HTTPException(502, str(exc)) from exc
@@ -2002,6 +2013,13 @@ async def web_create_subscription(request: SubscriptionRequest) -> dict[str, Any
             await notification_service().notify("subscription", {"title": request.title, "status": "订阅成功" if not result.get("duplicate") else "订阅已存在", "resource": f"TMDB {request.tmdb_id}", "resolution": "", "size": "", "save_path": request.save_path, "error": ""})
     except Exception:
         logger.exception("module=notifications provider=telegram operation=subscription")
+    # 订阅成功即启动第一次资源检查/转存（与手动执行、后台调度共用同一核心逻辑）。
+    # 重复点击保护在 execute_subscription 内（running 状态直接跳过），不会重复建任务。
+    if not result.get("duplicate"):
+        try:
+            asyncio.create_task(execute_subscription(WEB_INSTALLATION_ID, int(result["id"])))
+        except Exception:
+            logger.exception("module=subscriptions operation=auto_start subscription=%s", result.get("id"))
     return result
 
 
@@ -2045,8 +2063,8 @@ def subscription_page(installation_id: str, tab: str = "current", search: str = 
         total = conn.execute(f"SELECT COUNT(*) FROM web_subscriptions s WHERE {where}", params).fetchone()[0]
         rows = conn.execute(f"""SELECT s.*,
             (SELECT COUNT(*) FROM subscription_runs r WHERE r.subscription_id=s.id) AS unlock_count,
-            (SELECT COUNT(*) FROM transfer_records t WHERE t.installation_id=s.installation_id AND (t.subscription_id=s.id OR (t.subscription_id IS NULL AND t.name=s.title))) AS transfer_count,
-            (SELECT COUNT(*) FROM transfer_records t WHERE t.installation_id=s.installation_id AND (t.subscription_id=s.id OR (t.subscription_id IS NULL AND t.name=s.title)) AND t.status='resolved') AS saved_count
+            (SELECT COUNT(*) FROM transfer_records t WHERE t.installation_id=s.installation_id AND t.subscription_id=s.id) AS transfer_count,
+            (SELECT COUNT(*) FROM transfer_records t WHERE t.installation_id=s.installation_id AND t.subscription_id=s.id AND t.status IN ('completed','resolved')) AS saved_count
             FROM web_subscriptions s WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?""",
             [*params, page_size, (page - 1) * page_size],
         ).fetchall()
@@ -2061,7 +2079,7 @@ def subscription_detail(installation_id: str, subscription_id: int) -> dict[str,
         if not row:
             raise HTTPException(404, "订阅不存在")
         runs = conn.execute("SELECT id,status,resource_count,transfer_count,error,created_at FROM subscription_runs WHERE subscription_id=? ORDER BY id DESC LIMIT 20", (subscription_id,)).fetchall()
-        transfers = conn.execute("SELECT id,slug,name,share_url,status,error,created_at FROM transfer_records WHERE installation_id=? AND (subscription_id=? OR (subscription_id IS NULL AND name=?)) ORDER BY id DESC LIMIT 50", (installation_id, subscription_id, row["title"])).fetchall()
+        transfers = conn.execute("SELECT id,slug,name,share_url,status,error,created_at FROM transfer_records WHERE installation_id=? AND subscription_id=? ORDER BY id DESC LIMIT 50", (installation_id, subscription_id)).fetchall()
     return {"subscription": dict(row), "runs": [dict(x) for x in runs], "transfers": [dict(x) for x in transfers]}
 
 
@@ -2079,7 +2097,56 @@ def delete_subscription(subscription_id: int, installation_id: str = Depends(req
     return {"ok": True, "deleted_files": False, "status": "cancelled"}
 
 
+def _resolution_rank(text: str) -> int:
+    t = (text or "").upper()
+    if "2160" in t or "4K" in t:
+        return 200
+    if "1080" in t:
+        return 100
+    if "720" in t:
+        return 50
+    if "480" in t:
+        return 20
+    return 0
+
+
+def _resource_score(item: Any) -> int:
+    """资源选择打分：可直转 > 免费 > 官组 > 高分辨率 > WEB-DL。"""
+    score = 0
+    score += 1000 if getattr(item, "transfer_supported", False) else 0
+    if getattr(item, "is_free", False):
+        score += 500
+    if getattr(item, "is_official", False):
+        score += 300
+    score += _resolution_rank(getattr(item, "resolution", "") or "")
+    if "WEB-DL" in (getattr(item, "quality", "") or "").upper():
+        score += 50
+    return score
+
+
+def _covered_episodes(item: Any) -> set[int]:
+    """电视剧：从资源中解析出它覆盖的集号集合（用于追更去重）。"""
+    start = getattr(item, "episode_start", 0) or 0
+    end = getattr(item, "episode_end", 0) or 0
+    cnt = getattr(item, "episode_count", 0) or 0
+    is_complete = getattr(item, "is_complete", False)
+    eps: set[int] = set()
+    if start and end and end >= start:
+        eps.update(range(start, end + 1))
+    elif start:
+        eps.add(start)
+    elif is_complete and cnt:
+        eps.update(range(1, cnt + 1))
+    return eps
+
+
 async def execute_subscription(installation_id: str, subscription_id: int) -> dict[str, Any]:
+    """订阅核心执行逻辑（手动执行 / 订阅即执行 / 后台定时调度 共用）。
+
+    流程：解析TMDB → 搜索资源 → 归一化 → 按策略选择(免费/官组/分辨率/可直转/缺集)
+    → 自动解锁 → 自动转存 115 → 写入转存记录(subscription_id) → 更新已入库集数。
+    订阅是长期关系，单次执行完成 ≠ 订阅结束；成功后保持监控态(active)。
+    """
     with database() as conn:
         row = conn.execute("SELECT * FROM web_subscriptions WHERE id=? AND installation_id=?", (subscription_id, installation_id)).fetchone()
         if not row:
@@ -2092,9 +2159,9 @@ async def execute_subscription(installation_id: str, subscription_id: int) -> di
         conn.execute("UPDATE web_subscriptions SET status='running', error='', updated_at=?, last_run_at=? WHERE id=?", (int(time.time()), int(time.time()), subscription_id))
     logger.info("module=subscriptions operation=start subscription=%s old_status=%s new_status=running", subscription_id, old_status)
     count = 0
-    transfer_count = 0
     run_status = "waiting_output"
     error = ""
+    stats = {"searched": 0, "supported": 0, "filtered": 0, "free": 0, "need_unlock": 0, "unlocked": 0, "submitted": 0, "transferred": 0, "skipped": 0, "failed": 0}
     try:
         tmdb_id = int(row["tmdb_id"] or 0)
         if not tmdb_id:
@@ -2106,34 +2173,108 @@ async def execute_subscription(installation_id: str, subscription_id: int) -> di
         if not tmdb_id:
             raise HTTPException(409, "未匹配到 TMDB 条目，无法搜索资源（请确认完整片名后再试）")
         payload = await query_resources(ResourceQuery(media_type=row["media_type"], tmdb_id=tmdb_id), installation_id)
-        resources = _resource_items(payload)
+        raw = _resource_items(payload)
+        resources = [HDHiveResourceProvider.normalize(x) for x in raw]
         count = len(resources)
+        stats["searched"] = count
         settings = get_business_settings()
         with database() as conn:
             transfer_ready = installation_id == WEB_INSTALLATION_ID and bool(conn.execute("SELECT 1 FROM installations WHERE installation_id=?", (installation_id,)).fetchone()) and bool(conn.execute("SELECT p115_cookie FROM web_settings WHERE installation_id=? AND COALESCE(p115_cookie,'')<>''", (installation_id,)).fetchone())
-        if resources and settings["subscription_auto_transfer"] and transfer_ready:
-            first = resources[0]
-            slug = str(first.get("slug") or first.get("resource_slug") or first.get("id") or "")
-            if slug:
-                await web_resource_transfer(WebResourceTransfer(provider="hdhive", resource_id=slug))
-                transfer_count = 1
-        run_status = "success" if transfer_count else ("resource_found" if count else "waiting_output")
+        # 已入库：本订阅既往转存记录 + 已持久化的集号
+        with database() as conn:
+            saved_rows = conn.execute("SELECT slug,status FROM transfer_records WHERE installation_id=? AND subscription_id=?", (installation_id, subscription_id)).fetchall()
+        saved_slugs = {r["slug"] for r in saved_rows if r["slug"]}
+        try:
+            saved_eps = set(int(x) for x in json.loads(row.get("saved_episodes") or "{}").get("eps", []))
+        except Exception:
+            saved_eps = set()
+        season_filter = 0
+        if row["season"]:
+            m = re.search(r"\d+", str(row["season"]))
+            if m:
+                season_filter = int(m.group())
+        if not (resources and settings["subscription_auto_transfer"] and transfer_ready):
+            run_status = "success" if (transfer_ready and resources) else ("resource_found" if resources else "waiting_output")
+        else:
+            # 候选：按季过滤 + 去重已转 + 区分可直转/不可直转
+            candidates = []
+            for item in resources:
+                if season_filter and getattr(item, "season_number", 0) and getattr(item, "season_number", 0) != season_filter:
+                    continue
+                if getattr(item, "provider_resource_id", "") in saved_slugs:
+                    stats["skipped"] += 1
+                    continue
+                candidates.append(item)
+            stats["filtered"] = len(candidates)
+            supported = [c for c in candidates if getattr(c, "transfer_supported", False)]
+            unsupported = [c for c in candidates if not getattr(c, "transfer_supported", False)]
+            stats["supported"] = len(supported)
+            stats["free"] = sum(1 for c in candidates if getattr(c, "is_free", False))
+            stats["need_unlock"] = sum(1 for c in candidates if not getattr(c, "is_free", False))
+            chosen: list[Any] = []
+            if row["media_type"] == "movie":
+                pool = sorted(supported + unsupported, key=_resource_score, reverse=True)
+                chosen = pool[:1]
+            else:
+                # 电视剧追更：贪心选择能覆盖“缺失集”的最佳资源，避免重复整季转存
+                queue = sorted(supported, key=_resource_score, reverse=True) + sorted(unsupported, key=_resource_score, reverse=True)
+                for item in queue:
+                    eps = _covered_episodes(item)
+                    if not eps:
+                        continue  # 无解析集号信息，跳过（避免盲目转存）
+                    if eps <= saved_eps:
+                        stats["skipped"] += 1
+                        continue
+                    chosen.append(item)
+                    saved_eps |= eps
+                    if len(chosen) >= 20:
+                        break
+            # 逐个转存（带 subscription_id，保证“保存次数”正确统计）
+            succeeded_slugs: set[str] = set()
+            for item in chosen:
+                slug = getattr(item, "provider_resource_id", "") or ""
+                if not slug:
+                    stats["failed"] += 1
+                    continue
+                try:
+                    await web_resource_transfer(WebResourceTransfer(
+                        provider="hdhive", resource_id=slug, subscription_id=subscription_id,
+                        media_type=row["media_type"], tmdb_id=row["tmdb_id"],
+                        season_episode=getattr(item, "season_episode_label", ""),
+                    ))
+                    stats["submitted"] += 1
+                    stats["transferred"] += 1
+                    succeeded_slugs.add(slug)
+                    if not getattr(item, "is_free", False):
+                        stats["unlocked"] += 1
+                except HTTPException as exc:
+                    stats["failed"] += 1
+                    logger.warning("module=subscriptions operation=transfer subscription=%s slug=%s status=failed reason=%s", subscription_id, slug, exc.detail)
+                except Exception as exc:
+                    stats["failed"] += 1
+                    logger.exception("module=subscriptions operation=transfer subscription=%s slug=%s", subscription_id, slug)
+            # 持久化已入库集号（仅成功的资源覆盖的集）
+            for item in chosen:
+                if getattr(item, "provider_resource_id", "") in succeeded_slugs:
+                    saved_eps |= _covered_episodes(item)
+            with database() as conn:
+                conn.execute("UPDATE web_subscriptions SET saved_episodes=? WHERE id=?", (json.dumps({"eps": sorted(saved_eps)}), subscription_id))
+            run_status = "success" if stats["transferred"] else ("resource_found" if count else "waiting_output")
     except HTTPException as exc:
         run_status = "failed"; error = str(exc.detail)
         logger.warning("module=subscriptions operation=execute subscription=%s status=failed reason=%s", subscription_id, error)
     except Exception as exc:
         run_status = "failed"; error = str(exc)
         logger.exception("module=subscriptions operation=execute subscription=%s", subscription_id)
-    # 订阅是长期关系：单次执行完成 ≠ 订阅结束。
-    # 成功 → 回到监控态(active)，失败 → 标记为异常(failed)但记录保留（可由调度器重试）。
+    # 成功 → 回到监控态(active)；失败 → 异常(failed)但记录保留（可由调度器重试）。
     # 均不会进入 terminal(cancelled/expired)，因此不会从订阅列表消失。
     sub_status = "failed" if run_status == "failed" else "active"
     now = int(time.time())
     with database() as conn:
-        cur = conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,transfer_count,error,created_at) VALUES (?,?,?,?,?,?,?)", (installation_id, subscription_id, run_status, count, transfer_count, error, now))
+        cur = conn.execute("INSERT INTO subscription_runs (installation_id,subscription_id,status,resource_count,transfer_count,error,summary,created_at) VALUES (?,?,?,?,?,?,?,?)", (installation_id, subscription_id, run_status, count, stats["transferred"], error, json.dumps(stats, ensure_ascii=False), now))
         conn.execute("UPDATE web_subscriptions SET status=?, error=?, updated_at=?, last_run_at=? WHERE id=?", (sub_status, error, now, now, subscription_id))
-    logger.info("module=subscriptions operation=executed subscription=%s run_status=%s sub_status=%s resource_count=%s transfer_count=%s", subscription_id, run_status, sub_status, count, transfer_count)
-    return {"ok": run_status != "failed", "run_id": cur.lastrowid, "status": sub_status, "run_status": run_status, "resource_count": count, "transfer_count": transfer_count, "error": error}
+    logger.info("module=subscriptions operation=executed subscription=%s run_status=%s sub_status=%s searched=%s supported=%s filtered=%s free=%s need_unlock=%s unlocked=%s submitted=%s transferred=%s skipped=%s failed=%s", subscription_id, run_status, sub_status, stats["searched"], stats["supported"], stats["filtered"], stats["free"], stats["need_unlock"], stats["unlocked"], stats["submitted"], stats["transferred"], stats["skipped"], stats["failed"])
+    return {"ok": run_status != "failed", "run_id": cur.lastrowid, "status": sub_status, "run_status": run_status, "resource_count": count, "transfer_count": stats["transferred"], "error": error, "summary": stats}
 
 
 @app.post("/v1/subscriptions/{subscription_id}/run")

@@ -453,6 +453,39 @@ class OAuthServiceTests(unittest.TestCase):
             conn.execute("DELETE FROM subscription_runs WHERE subscription_id=?", (created["id"],))
             conn.execute("DELETE FROM web_subscriptions WHERE id=?", (created["id"],))
 
+    def test_subscription_selects_best_and_tags_subscription_id(self):
+        """回归：仅转存最佳可直转资源（整季包），跳过收费不可直转的；
+        转存请求带上 subscription_id；电视剧追更写入已入库集号。"""
+        now = int(main.time.time())
+        with main.database() as conn:
+            conn.execute("INSERT OR REPLACE INTO installations (installation_id,access_token,refresh_token,expires_at,user_json,updated_at) VALUES (?,?,?,?,?,?)", (main.WEB_INSTALLATION_ID, main.encrypt("access"), main.encrypt("refresh"), now + 3600, "{}", now))
+            conn.execute("INSERT INTO web_settings (installation_id,p115_cookie,updated_at) VALUES (?,?,?) ON CONFLICT(installation_id) DO UPDATE SET p115_cookie=excluded.p115_cookie", (main.WEB_INSTALLATION_ID, main.encrypt("UID=1"), now))
+        resources = [
+            {"slug": "paid-unsupported", "remark": "凡人修仙传 S01E01-E05 全5集", "pan_type": "other", "unlock_points": 20, "is_official": False, "is_free_for_user": False},
+            {"slug": "free-115-pack", "remark": "凡人修仙传 S01E01-E20 全20集", "pan_type": "115", "unlock_points": 0, "is_official": True, "is_free_for_user": True},
+        ]
+        created = main.create_subscription(main.SubscriptionRequest(title="凡人修仙传", media_type="tv", tmdb_id=106449, season="1"), main.WEB_INSTALLATION_ID)
+        captured = []
+        async def fake_transfer(req):
+            captured.append(req)
+            return {"ok": True}
+        with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": resources})), patch.object(main, "web_resource_transfer", new=fake_transfer), patch.object(main, "get_business_settings", return_value={"subscription_auto_transfer": True}):
+            result = self.client.post(f"/api/web/subscriptions/{created['id']}/run").json()
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["run_status"], "success")
+        # 仅转存最佳可直转整季包，不转收费不可直转资源
+        self.assertEqual(result["transfer_count"], 1)
+        self.assertEqual([c.resource_id for c in captured], ["free-115-pack"])
+        # 转存请求必须带上 subscription_id（保证“保存次数”能正确归并到该订阅）
+        self.assertTrue(all(c.subscription_id == created["id"] for c in captured))
+        with main.database() as conn:
+            row = conn.execute("SELECT saved_episodes FROM web_subscriptions WHERE id=?", (created["id"],)).fetchone()
+            eps = main.json.loads(row["saved_episodes"]).get("eps", [])
+            self.assertTrue(set(range(1, 21)).issubset(set(eps)))
+        with main.database() as conn:
+            conn.execute("DELETE FROM subscription_runs WHERE subscription_id=?", (created["id"],))
+            conn.execute("DELETE FROM web_subscriptions WHERE id=?", (created["id"],))
+
 
     def test_search_history_and_cache_persistence(self):
         class Registry:
