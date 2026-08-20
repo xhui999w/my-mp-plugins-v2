@@ -731,6 +731,53 @@ class EmbyAndTelegramChannelTests(unittest.TestCase):
         self.assertIn("Telegram 访问失败", bad["last_error"])
 
 
+
+    def test_split_season_title_helpers(self):
+        self.assertEqual(main.split_season_title("龙之家族 第三季"), ("龙之家族", 3))
+        self.assertEqual(main.split_season_title("海贼王 第3季"), ("海贼王", 3))
+        self.assertEqual(main.split_season_title("凡人修仙传"), ("凡人修仙传", None))
+        self.assertEqual(main.split_season_title(""), ("", None))
+        self.assertEqual(main._parse_cn_number("二十四"), 24)
+        self.assertEqual(main._parse_cn_number("十"), 10)
+
+    def test_web_subscription_resolves_tmdb_and_season_before_store(self):
+        payload = {"title": "龙之家族 第三季", "media_type": "tv", "tmdb_id": 0, "douban_id": "36666949", "year": 2026}
+        with main.database() as conn:
+            conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND douban_id=?", (main.WEB_INSTALLATION_ID, payload["douban_id"]))
+        with patch.object(main, "resolve_tmdb_id", new=AsyncMock(return_value={"tmdb_id": 139699, "season": 3, "title": "龙之家族", "year": "2022", "poster": "http://x/p.jpg"})):
+            created = self.client.post("/api/web/subscriptions", json=payload)
+        self.assertEqual(created.status_code, 200)
+        body = created.json()
+        self.assertFalse(body.get("duplicate", False))
+        self.assertEqual(body["tmdb_id"], 139699)
+        self.assertEqual(body["season"], "3")
+        with main.database() as conn:
+            row = conn.execute("SELECT tmdb_id,season FROM web_subscriptions WHERE id=?", (body["id"],)).fetchone()
+            conn.execute("DELETE FROM web_subscriptions WHERE id=?", (body["id"],))
+        self.assertEqual(row["tmdb_id"], 139699)
+        self.assertEqual(row["season"], "3")
+
+    def test_create_subscription_heals_and_deduplicates_old_zero_tmdb_record(self):
+        now = int(time.time())
+        with main.database() as conn:
+            conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND douban_id=?", (main.WEB_INSTALLATION_ID, "36554071"))
+            conn.execute("INSERT INTO web_subscriptions (installation_id,title,media_type,tmdb_id,year,poster,season,douban_id,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                         (main.WEB_INSTALLATION_ID, "重器", "tv", 0, 2026, "", "", "36554071", "failed", now, now))
+        payload = {"title": "重器", "media_type": "tv", "tmdb_id": 291856, "douban_id": "36554071", "year": 2026}
+        with patch.object(main, "resolve_tmdb_id", new=AsyncMock(return_value={"tmdb_id": 291856})):
+            first = self.client.post("/api/web/subscriptions", json=payload)
+            second = self.client.post("/api/web/subscriptions", json=payload)
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.json()["duplicate"])
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.json()["duplicate"])
+        with main.database() as conn:
+            rows = conn.execute("SELECT tmdb_id,status FROM web_subscriptions WHERE installation_id=? AND douban_id=?", (main.WEB_INSTALLATION_ID, "36554071")).fetchall()
+            conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND douban_id=?", (main.WEB_INSTALLATION_ID, "36554071"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tmdb_id"], 291856)
+        self.assertEqual(rows[0]["status"], "active")
+
 if __name__ == "__main__":
     unittest.main()
 

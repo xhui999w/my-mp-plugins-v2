@@ -880,16 +880,55 @@ async def explore_media(media_type: str, tmdb_id: int) -> dict[str, Any]:
         return {"configured": True, "data": None, "error": "详情加载失败，请稍后重试。", "detail": type(exc).__name__}
 
 
+_CN_DIGITS = {"零":0,"一":1,"二":2,"两":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9}
+_CN_SCALES = {"十":10,"百":100}
+_SEASON_SUFFIX_RE = re.compile(r"^(.*?)[\s、·,，\-–—_/（）()]*第([零一二两三四五六七八九十百\d]+)季[\s、·,，\-–—_/（）()]*$")
+
+
+def _parse_cn_number(text: str) -> int:
+    """把中文数字（含十、百）转成 int，仅用于季号解析。"""
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    total = 0
+    current = 0
+    for ch in text:
+        if ch in _CN_DIGITS:
+            current = _CN_DIGITS[ch]
+        elif ch in _CN_SCALES:
+            scale = _CN_SCALES[ch]
+            total += (current or 1) * scale
+            current = 0
+        else:
+            return 0
+    return total + current
+
+
+def split_season_title(title: str) -> tuple[str, int | None]:
+    """从“龙之家族 第三季”这类豆瓣分季标题中拆出整剧名与季号。"""
+    text = (title or "").strip()
+    if not text:
+        return text, None
+    match = _SEASON_SUFFIX_RE.match(text)
+    if not match:
+        return text, None
+    base = match.group(1).strip() or text
+    season = _parse_cn_number(match.group(2))
+    return base, (season if season > 0 else None)
+
+
 async def resolve_tmdb_id(media_type: str, title: str, year: str = "") -> dict[str, Any]:
     """通过 TMDB 标题搜索反查 TMDB ID，用于只有豆瓣/标题、没有 TMDB ID 的影视。"""
-    if not title.strip():
+    base_title, season = split_season_title(title)
+    if not base_title.strip():
         return {}
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:
         return {}
     try:
         path = "/search/movie" if media_type == "movie" else "/search/tv"
-        payload, _ = await tmdb.request(path, {"query": title.strip(), "page": 1, "include_adult": "false"}, ttl=3600)
+        payload, _ = await tmdb.request(path, {"query": base_title.strip(), "page": 1, "include_adult": "false"}, ttl=3600)
     except Exception as exc:
         logger.warning("module=media provider=tmdb operation=resolve_id error_type=%s reason=%s", type(exc).__name__, exc)
         return {}
@@ -913,9 +952,13 @@ async def resolve_tmdb_id(media_type: str, title: str, year: str = "") -> dict[s
         if best is None:
             best = candidate
         if target_year and item_year == target_year:
+            if season:
+                candidate["season"] = season
             return candidate
-    return best or {}
-
+    result = best or {}
+    if season:
+        result["season"] = season
+    return result
 
 @app.get("/api/web/media/search")
 async def web_media_search(keyword: str = Query(..., min_length=1, max_length=200), media_type: str = Query("", pattern="^(|movie|tv)$")) -> dict[str, Any]:
@@ -1018,11 +1061,13 @@ async def _emby_episode_status(tmdb_id: int, season: int) -> tuple[bool, bool, s
 @app.get("/api/web/media/detail")
 async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"), tmdb_id: int = Query(0, ge=0), title: str = Query("", max_length=200), year: str = Query("", max_length=4)) -> dict[str, Any]:
     resolution: dict[str, Any] = {}
+    season_number = None
     if not tmdb_id and title.strip():
         resolution = await resolve_tmdb_id(media_type, title, year)
         tmdb_id = int(resolution.get("tmdb_id") or 0)
+        season_number = resolution.get("season")
     if not tmdb_id:
-        return {"data": None, "seasons": [], "configured": False, "resolution": resolution}
+        return {"data": None, "seasons": [], "configured": False, "resolution": resolution, "season_number": season_number}
     tmdb = explore_tmdb_provider()
     if not tmdb.configured:
         return {"data": None, "seasons": [], "configured": False, "resolution": resolution}
@@ -1037,7 +1082,7 @@ async def web_media_detail(media_type: str = Query(..., pattern="^(movie|tv)$"),
     })
     seasons = [{"season_number": x.get("season_number"), "name": x.get("name"), "episode_count": x.get("episode_count") or 0, "air_date": x.get("air_date") or "", "poster": f"https://image.tmdb.org/t/p/w342{x.get('poster_path')}" if x.get("poster_path") else ""} for x in payload.get("seasons", []) if int(x.get("season_number") or 0) >= 0]
     emby_status, emby_configured, emby_error = await _emby_library_status(media_type, tmdb_id)
-    return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution, "emby_status": emby_status, "emby_configured": emby_configured, "emby_error": emby_error}
+    return {"data": item, "seasons": seasons, "configured": True, "cached": cached, "resolved_tmdb_id": tmdb_id, "resolution": resolution, "season_number": season_number, "emby_status": emby_status, "emby_configured": emby_configured, "emby_error": emby_error}
 
 @app.get("/api/web/media/season")
 async def web_media_season(tmdb_id: int = Query(..., gt=0), season: int = Query(..., ge=0)) -> dict[str, Any]:
@@ -1906,14 +1951,24 @@ def create_subscription(
     installation_id: str = Depends(require_installation),
 ) -> dict[str, Any]:
     now = int(time.time())
+    season_key = request.season.strip()
+    title_key = request.title.strip()
+    douban_key = request.douban_id.strip()
     with database() as conn:
-        if request.tmdb_id:
-            existing = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND tmdb_id=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (installation_id, request.media_type, request.tmdb_id, request.season.strip())).fetchone()
-        elif request.douban_id.strip():
-            existing = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND douban_id=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (installation_id, request.media_type, request.douban_id.strip(), request.season.strip())).fetchone()
-        else:
-            existing = conn.execute("SELECT id,status FROM web_subscriptions WHERE installation_id=? AND media_type=? AND title=? AND COALESCE(year,0)=? AND COALESCE(season,'')=? AND status NOT IN ('cancelled','expired') ORDER BY id DESC LIMIT 1", (installation_id, request.media_type, request.title.strip(), request.year or 0, request.season.strip())).fetchone()
+        existing = conn.execute(
+            """SELECT id,status,tmdb_id FROM web_subscriptions
+               WHERE installation_id=? AND media_type=? AND status NOT IN ('cancelled','expired') AND (
+                   (tmdb_id > 0 AND tmdb_id = ? AND COALESCE(season,'') = ?)
+                OR (douban_id <> '' AND ? <> '' AND douban_id = ? AND COALESCE(season,'') = ?)
+                OR (tmdb_id = 0 AND COALESCE(title,'') = ? AND COALESCE(year,0) = ? AND COALESCE(season,'') = ?)
+               ) ORDER BY (tmdb_id > 0) DESC, id DESC LIMIT 1""",
+            (installation_id, request.media_type, request.tmdb_id, season_key,
+             douban_key, douban_key, season_key, title_key, request.year or 0, season_key),
+        ).fetchone()
         if existing:
+            if not existing["tmdb_id"] and request.tmdb_id:
+                conn.execute("UPDATE web_subscriptions SET tmdb_id=?, status='active', error='', updated_at=? WHERE id=?", (request.tmdb_id, now, existing["id"]))
+                existing = {"id": existing["id"], "status": "active", "tmdb_id": request.tmdb_id}
             return {"id": existing["id"], "status": existing["status"], "duplicate": True, **request.model_dump()}
         cur = conn.execute(
             """INSERT INTO web_subscriptions
@@ -1929,6 +1984,18 @@ def create_subscription(
 
 @app.post("/api/web/subscriptions")
 async def web_create_subscription(request: SubscriptionRequest) -> dict[str, Any]:
+    if not request.tmdb_id and (request.title.strip() or request.douban_id.strip()):
+        resolution = await resolve_tmdb_id(request.media_type, request.title, str(request.year or ""))
+        resolved_id = int(resolution.get("tmdb_id") or 0)
+        if resolved_id:
+            payload = request.model_dump()
+            payload["tmdb_id"] = resolved_id
+            season = resolution.get("season")
+            if season and not payload.get("season"):
+                payload["season"] = str(season)
+            if resolution.get("poster") and not payload.get("poster"):
+                payload["poster"] = resolution["poster"]
+            request = SubscriptionRequest(**payload)
     result = create_subscription(request, WEB_INSTALLATION_ID)
     try:
         if _telegram_settings(False)["enabled"]:
@@ -2029,7 +2096,16 @@ async def execute_subscription(installation_id: str, subscription_id: int) -> di
     run_status = "waiting_output"
     error = ""
     try:
-        payload = await query_resources(ResourceQuery(media_type=row["media_type"], tmdb_id=row["tmdb_id"]), installation_id)
+        tmdb_id = int(row["tmdb_id"] or 0)
+        if not tmdb_id:
+            resolution = await resolve_tmdb_id(row["media_type"], row["title"] or "", str(row.get("year") or ""))
+            tmdb_id = int(resolution.get("tmdb_id") or 0)
+            if tmdb_id:
+                with database() as conn:
+                    conn.execute("UPDATE web_subscriptions SET tmdb_id=?, updated_at=? WHERE id=?", (tmdb_id, int(time.time()), subscription_id))
+        if not tmdb_id:
+            raise HTTPException(409, "未匹配到 TMDB 条目，无法搜索资源（请确认完整片名后再试）")
+        payload = await query_resources(ResourceQuery(media_type=row["media_type"], tmdb_id=tmdb_id), installation_id)
         resources = _resource_items(payload)
         count = len(resources)
         settings = get_business_settings()
