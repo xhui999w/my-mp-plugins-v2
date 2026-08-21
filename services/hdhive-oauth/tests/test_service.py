@@ -241,6 +241,47 @@ class OAuthServiceTests(unittest.TestCase):
         with main.database() as conn:
             self.assertEqual(conn.execute("SELECT status FROM web_subscriptions WHERE id=?", (created["id"],)).fetchone()["status"], "failed")
 
+    def test_current_subscription_list_includes_all_non_terminal_statuses(self):
+        now = int(main.time.time())
+        current_statuses = ("pending", "active", "running", "paused", "waiting_output", "resource_found", "completed", "failed")
+        with main.database() as conn:
+            for index, status in enumerate((*current_statuses, "cancelled", "expired"), 1):
+                conn.execute(
+                    "INSERT INTO web_subscriptions (installation_id,title,media_type,tmdb_id,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (self.installation_id, f"状态测试{index}", "movie", 910000 + index, status, now, now),
+                )
+        listing = self.client.get("/v1/subscriptions", headers=self.headers, params={"tab": "current", "page_size": 100}).json()
+        returned = {item["status"] for item in listing["items"] if item["title"].startswith("状态测试")}
+        self.assertEqual(returned, set(current_statuses))
+        history = self.client.get("/v1/subscriptions", headers=self.headers, params={"tab": "history", "page_size": 100}).json()
+        returned_history = {item["status"] for item in history["items"] if item["title"].startswith("状态测试")}
+        self.assertEqual(returned_history, {"cancelled", "expired"})
+
+    def test_running_subscription_is_not_started_twice(self):
+        created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": "重复执行保护", "media_type": "tv", "tmdb_id": 919191}).json()
+        with main.database() as conn:
+            conn.execute("UPDATE web_subscriptions SET status='running' WHERE id=?", (created["id"],))
+            before = conn.execute("SELECT COUNT(*) FROM subscription_runs WHERE subscription_id=?", (created["id"],)).fetchone()[0]
+        result = self.client.post(f"/v1/subscriptions/{created['id']}/run", headers=self.headers).json()
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["run_status"], "skipped")
+        with main.database() as conn:
+            after = conn.execute("SELECT COUNT(*) FROM subscription_runs WHERE subscription_id=?", (created["id"],)).fetchone()[0]
+            self.assertEqual(conn.execute("SELECT status FROM web_subscriptions WHERE id=?", (created["id"],)).fetchone()["status"], "running")
+        self.assertEqual(after, before)
+
+    def test_movie_and_tv_subscriptions_survive_successful_run_and_reload(self):
+        for media_type, tmdb_id in (("movie", 929201), ("tv", 929202)):
+            created = self.client.post("/v1/subscriptions", headers=self.headers, json={"title": f"{media_type}持久化测试", "media_type": media_type, "tmdb_id": tmdb_id}).json()
+            with patch.object(main, "query_resources", new=AsyncMock(return_value={"items": []})):
+                result = self.client.post(f"/v1/subscriptions/{created['id']}/run", headers=self.headers).json()
+            self.assertEqual(result["status"], "active")
+            detail = self.client.get(f"/v1/subscriptions/{created['id']}", headers=self.headers).json()
+            self.assertEqual(detail["subscription"]["status"], "active")
+            self.assertEqual(len(detail["runs"]), 1)
+            listing = self.client.get("/v1/subscriptions", headers=self.headers, params={"tab": "current", "page_size": 100}).json()
+            self.assertIn(created["id"], [item["id"] for item in listing["items"]])
+
     def test_explore_result_can_create_subscription_with_poster(self):
         with main.database() as conn:
             conn.execute("DELETE FROM web_subscriptions WHERE installation_id=? AND tmdb_id=9911", (main.WEB_INSTALLATION_ID,))
@@ -813,4 +854,3 @@ class EmbyAndTelegramChannelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
