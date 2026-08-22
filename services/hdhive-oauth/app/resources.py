@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable
+
+import httpx
 
 
 @dataclass(slots=True)
@@ -41,6 +44,13 @@ class ResourceItem:
     fee_label: str = ""
     transfer_supported: bool = False
     duplicate_count: int = 1
+    indexer: str = ""
+    magnet: str = ""
+    torrent_url: str = ""
+    seeders: int | None = None
+    leechers: int | None = None
+    category: str = ""
+    provider_sources: list[str] = field(default_factory=list)
     # 资源原始标题与影视名称分离；季/集结构化字段（从 remark/title 解析）
     media_title: str = ""
     resource_title: str = ""
@@ -453,19 +463,20 @@ class ResourceProviderRegistry:
     async def search(self, media_type: str, tmdb_id: int, title: str = "") -> tuple[list[ResourceItem], list[dict[str, str]]]:
         items: list[ResourceItem] = []
         errors: list[dict[str, str]] = []
-        for provider in self.providers:
-            if not provider.enabled or not provider.configured:
-                continue
+        active = [provider for provider in self.providers if provider.enabled and provider.configured]
+
+        async def run(provider: ResourceProvider):
             try:
                 result = await provider.search(media_type, tmdb_id, title)
                 if isinstance(result, tuple):
-                    provider_items, provider_errors = result
-                    items.extend(provider_items)
-                    errors.extend(provider_errors)
-                else:
-                    items.extend(result)
+                    return provider, result[0], result[1]
+                return provider, result, []
             except Exception as exc:  # isolation: one provider must not stop the rest
-                errors.append({"provider": provider.id, "error": str(exc)})
+                return provider, [], [{"provider": provider.id, "error": str(exc)}]
+
+        for provider, provider_items, provider_errors in await asyncio.gather(*(run(p) for p in active)):
+            items.extend(provider_items)
+            errors.extend(provider_errors)
         return deduplicate_resources(items), errors
 
     def infos(self) -> list[dict[str, Any]]:
@@ -477,7 +488,11 @@ def _clean(value: str) -> str:
 
 
 def resource_fingerprint(item: ResourceItem) -> str:
-    strong = item.share_url.strip().lower() or item.url.strip().lower()
+    infohash = magnet_infohash(item.magnet or item.share_url)
+    if infohash:
+        raw = f"btih:{infohash}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    strong = item.share_url.strip().lower() or item.url.strip().lower() or item.torrent_url.strip().lower()
     if strong:
         raw = f"link:{strong}"
     else:
@@ -492,7 +507,12 @@ def deduplicate_resources(items: list[ResourceItem]) -> list[ResourceItem]:
         key = resource_fingerprint(item)
         if key in seen:
             seen[key].duplicate_count += 1
+            sources = seen[key].provider_sources or [seen[key].provider_name]
+            if item.provider_name not in sources:
+                sources.append(item.provider_name)
+            seen[key].provider_sources = sources
             continue
+        item.provider_sources = item.provider_sources or [item.provider_name]
         seen[key] = item
         result.append(item)
     return result
@@ -505,3 +525,129 @@ def filter_resources(items: list[ResourceItem], provider: str = "", season: str 
 
 def filter_options(items: list[ResourceItem]) -> dict[str, list[str]]:
     return {key: sorted({str(getattr(item, key)) for item in items if getattr(item, key)}) for key in ("provider", "uploader", "season", "resolution", "quality", "language", "source_type", "official_label", "fee_label")}
+
+
+def magnet_infohash(value: str) -> str:
+    match = re.search(r"(?:magnet:\?[^\s]*?xt=urn:btih:)([a-z0-9]{32,40})", str(value or ""), re.I)
+    return match.group(1).lower() if match else ""
+
+
+def build_search_terms(title: str, year: str = "", media_type: str = "movie", season: str = "") -> list[str]:
+    base = re.sub(r"\s+", " ", str(title or "")).strip()
+    suffix = " ".join(x for x in (str(year or "").strip(), f"S{int(season):02d}" if str(season or "").isdigit() and media_type == "tv" else "") if x)
+    return [" ".join(x for x in (base, suffix) if x).strip()] if base else []
+
+
+def _size_text(value: Any) -> str:
+    try:
+        size = int(value or 0)
+    except (TypeError, ValueError):
+        return str(value or "")
+    if not size:
+        return ""
+    units = ("B", "KB", "MB", "GB", "TB")
+    number = float(size)
+    idx = 0
+    while number >= 1024 and idx < len(units) - 1:
+        number /= 1024
+        idx += 1
+    return f"{number:.2f} {units[idx]}"
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_directly_transferable(link: str) -> bool:
+    value = str(link or "").strip().lower()
+    return value.startswith(("magnet:?", "ed2k://")) or bool(
+        re.search(r"https?://(?:[^/]+\.)?(?:115\.com|115cdn\.com)/s/", value)
+    )
+
+
+class TorznabResourceProvider(ResourceProvider):
+    """Prowlarr/Jackett Torznab adapter. No indexer-specific scraping."""
+
+    capabilities = ("search", "magnet", "offline")
+
+    def __init__(self, provider_id: str, name: str, base_url: str, api_key: str, year: str = "", season: str = "", timeout: float = 10):
+        self.id, self.name = provider_id, name
+        self.base_url, self.api_key = base_url.rstrip("/"), api_key
+        self.year, self.season, self.timeout = year, season, timeout
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.base_url and self.api_key)
+
+    async def search(self, media_type: str, tmdb_id: int, title: str = "") -> list[ResourceItem]:
+        terms = build_search_terms(title, self.year, media_type, self.season)
+        if not terms:
+            return []
+        endpoint = f"{self.base_url}/api/v1/search" if self.id == "prowlarr" else f"{self.base_url}/api/v2.0/indexers/all/results"
+        params = {"query" if self.id == "prowlarr" else "Query": terms[0], "type": "search", "apikey": self.api_key}
+        headers = {"X-Api-Key": self.api_key} if self.id == "prowlarr" else {}
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            response = await client.get(endpoint, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        rows = payload if isinstance(payload, list) else payload.get("Results") or payload.get("results") or []
+        return [self.normalize(row) for row in rows if isinstance(row, dict)]
+
+    def normalize(self, raw: dict[str, Any]) -> ResourceItem:
+        title = str(raw.get("title") or raw.get("Title") or "未命名 BT 资源")
+        magnet = str(raw.get("magnetUrl") or raw.get("MagnetUri") or raw.get("magnet") or "")
+        torrent = str(raw.get("downloadUrl") or raw.get("Link") or raw.get("Guid") or "")
+        indexer = str(raw.get("indexer") or raw.get("Tracker") or raw.get("indexerName") or self.name)
+        se = parse_season_episode(title)
+        resolution = next((x.upper() for x in re.findall(r"(?:2160|1080|720)[Pp]|4K|8K", title)), "")
+        quality = " / ".join(re.findall(r"WEB[- .]?DL|WEBRip|BluRay|REMUX|HDTV", title, re.I))
+        item = ResourceItem(
+            provider=self.id, provider_name=self.name, provider_resource_id=str(raw.get("guid") or raw.get("Guid") or magnet_infohash(magnet) or torrent),
+            title=title, resource_title=title, media_title="", url=torrent, share_url=magnet or torrent,
+            magnet=magnet, torrent_url=torrent, indexer=indexer, size=_size_text(raw.get("size") or raw.get("Size")),
+            seeders=_safe_int(raw.get("seeders") or raw.get("Seeders")), leechers=_safe_int(raw.get("leechers") or raw.get("Peers")),
+            publish_time=str(raw.get("publishDate") or raw.get("PublishDate") or raw.get("pubDate") or ""),
+            category=str(raw.get("category") or raw.get("CategoryDesc") or "BT"), resolution=resolution, quality=quality,
+            source_type="BT / 磁力", transfer_supported=bool(magnet), season_number=int(se.get("season_number") or 0),
+            episode_start=int(se.get("episode_start") or 0), episode_end=int(se.get("episode_end") or 0),
+            episode_count=int(se.get("episode_count") or 0), is_complete=bool(se.get("is_complete")),
+            season_episode_label=build_season_episode_label(se), resource_tags=[indexer],
+        )
+        return item
+
+
+class GenericJSONResourceProvider(ResourceProvider):
+    """Opt-in adapter for public JSON aggregation APIs; never scrapes protected pages."""
+
+    capabilities = ("search", "json-api")
+
+    def __init__(self, provider_id: str, name: str, base_url: str, api_key: str = "", timeout: float = 8):
+        self.id, self.name, self.base_url, self.api_key, self.timeout = provider_id, name, base_url.strip(), api_key, timeout
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.base_url)
+
+    async def search(self, media_type: str, tmdb_id: int, title: str = "") -> list[ResourceItem]:
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            response = await client.get(self.base_url, params={"q": title, "type": media_type}, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        rows = payload if isinstance(payload, list) else payload.get("items") or payload.get("results") or payload.get("data") or []
+        result: list[ResourceItem] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            link = str(raw.get("share_url") or raw.get("url") or raw.get("link") or "")
+            title_text = str(raw.get("title") or raw.get("name") or "未命名资源")
+            se = parse_season_episode(title_text)
+            result.append(ResourceItem(provider=self.id, provider_name=self.name, provider_resource_id=str(raw.get("id") or link), title=title_text,
+                resource_title=title_text, url=link, share_url=link, source_type=str(raw.get("pan_type") or raw.get("source_type") or "第三方聚合"),
+                size=str(raw.get("size") or ""), resolution=str(raw.get("resolution") or ""), quality=str(raw.get("quality") or ""),
+                uploader=str(raw.get("uploader") or raw.get("author") or ""), publish_time=str(raw.get("publish_time") or raw.get("created_at") or ""),
+                transfer_supported=is_directly_transferable(link), season_episode_label=build_season_episode_label(se)))
+        return result

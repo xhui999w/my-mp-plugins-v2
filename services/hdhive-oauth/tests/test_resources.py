@@ -6,6 +6,9 @@ from app.resources import (
     ResourceItem,
     ResourceProvider,
     ResourceProviderRegistry,
+    GenericJSONResourceProvider,
+    TorznabResourceProvider,
+    build_search_terms,
     deduplicate_resources,
     filter_options,
     filter_resources,
@@ -75,6 +78,37 @@ class ResourceProviderTests(unittest.TestCase):
         items, errors = asyncio.run(registry.search("movie", 1, "测试"))
         self.assertEqual(len(items), 1)
         self.assertEqual(errors[0]["provider"], "broken")
+
+    def test_torznab_normalizes_bt_metadata_and_episode(self):
+        provider = TorznabResourceProvider("prowlarr", "Prowlarr", "http://localhost:9696", "secret")
+        item = provider.normalize({
+            "title": "Show.Name.S02E03.2160p.WEB-DL", "magnetUrl": "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+            "indexer": "Example", "size": 2147483648, "seeders": "bad", "leechers": 4,
+        })
+        self.assertEqual(item.provider, "prowlarr")
+        self.assertEqual(item.season_number, 2)
+        self.assertEqual(item.episode_start, 3)
+        self.assertEqual(item.seeders, 0)
+        self.assertEqual(item.leechers, 4)
+        self.assertEqual(item.size, "2.00 GB")
+        self.assertTrue(item.transfer_supported)
+
+    def test_bt_deduplication_uses_infohash_across_sources(self):
+        magnet = "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+        rows = deduplicate_resources([
+            ResourceItem("prowlarr", "Prowlarr", "1", "A", magnet=magnet),
+            ResourceItem("jackett", "Jackett", "2", "A", share_url=magnet.lower()),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].duplicate_count, 2)
+        self.assertEqual(rows[0].provider_sources, ["Prowlarr", "Jackett"])
+
+    def test_search_terms_include_year_and_tv_season(self):
+        self.assertEqual(build_search_terms("测试剧", "2026", "tv", "2"), ["测试剧 2026 S02"])
+
+    def test_generic_json_only_marks_supported_links_transferable(self):
+        provider = GenericJSONResourceProvider("pansou", "盘搜", "https://api.example/search")
+        self.assertTrue(provider.configured)
 
 
     def test_normalize_cleans_python_list_quality_and_pan_type(self):

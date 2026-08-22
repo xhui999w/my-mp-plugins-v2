@@ -40,7 +40,10 @@ from .subscriptions_ui import subscriptions_html
 from .tasks_ui import tasks_html
 from .resource_ui import resource_detail_html
 from .search_ui import search_html
-from .resources import HDHiveResourceProvider, ResourceProviderRegistry, filter_options, humanize_pan_type
+from .resources import (
+    GenericJSONResourceProvider, HDHiveResourceProvider, ResourceProviderRegistry,
+    TorznabResourceProvider, filter_options, humanize_pan_type,
+)
 from .unlocks_ui import unlocks_html
 from .logs_ui import logs_html
 from .settings_ui import settings_html
@@ -100,6 +103,16 @@ def classify_share_link(url: str) -> str:
     if OFFLINE_LINK_RE.match(url):
         return "offline"
     return "unsupported"
+
+
+def _search_media_key(media_type: str, tmdb_id: int = 0, douban_id: str = "", title: str = "", year: str = "") -> str:
+    kind = (media_type or "movie").strip().lower()
+    if int(tmdb_id or 0) > 0:
+        return f"{kind}:tmdb:{int(tmdb_id)}"
+    if str(douban_id or "").strip():
+        return f"{kind}:douban:{str(douban_id).strip()}"
+    normalized = re.sub(r"\s+", " ", str(title or "").strip().casefold())
+    return f"{kind}:title:{normalized}:{str(year or '').strip()}"
 
 
 def _list_text(value: Any) -> str:
@@ -382,9 +395,27 @@ def init_database() -> None:
             ("channel_enabled", "INTEGER DEFAULT 0"),
             ("channel_name", "TEXT DEFAULT 'oneonefivewpfx'"),
             ("channel_interval", "INTEGER DEFAULT 600"),
+            ("prowlarr_url", "TEXT DEFAULT ''"), ("prowlarr_api_key", "TEXT DEFAULT ''"), ("prowlarr_enabled", "INTEGER DEFAULT 0"),
+            ("jackett_url", "TEXT DEFAULT ''"), ("jackett_api_key", "TEXT DEFAULT ''"), ("jackett_enabled", "INTEGER DEFAULT 0"),
+            ("guanying_url", "TEXT DEFAULT ''"), ("guanying_api_key", "TEXT DEFAULT ''"), ("guanying_enabled", "INTEGER DEFAULT 0"),
+            ("pansou_url", "TEXT DEFAULT ''"), ("pansou_api_key", "TEXT DEFAULT ''"), ("pansou_enabled", "INTEGER DEFAULT 0"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE web_settings ADD COLUMN {name} {definition}")
+        history_columns = {row[1] for row in conn.execute("PRAGMA table_info(search_history)")}
+        if "media_key" not in history_columns:
+            conn.execute("ALTER TABLE search_history ADD COLUMN media_key TEXT DEFAULT ''")
+        history_rows = conn.execute("SELECT * FROM search_history ORDER BY searched_at DESC,id DESC").fetchall()
+        seen_history: set[tuple[str, str]] = set()
+        for history in history_rows:
+            key = _search_media_key(history["media_type"], history["tmdb_id"], history["douban_id"], history["title"], history["year"])
+            identity = (history["installation_id"], key)
+            if identity in seen_history:
+                conn.execute("DELETE FROM search_history WHERE id=?", (history["id"],))
+            else:
+                seen_history.add(identity)
+                conn.execute("UPDATE search_history SET media_key=? WHERE id=?", (key, history["id"]))
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_search_history_media ON search_history(installation_id,media_key)")
         subscription_columns = {row[1] for row in conn.execute("PRAGMA table_info(web_subscriptions)")}
         for name, definition in (
             ("year", "INTEGER"), ("original_title", "TEXT DEFAULT ''"),
@@ -1710,9 +1741,10 @@ async def search_resources(
         raise HTTPException(exc.status, f"{exc.code}: {exc.message}") from exc
 
 
-def resource_registry() -> ResourceProviderRegistry:
+def resource_registry(year: str = "", season: str = "") -> ResourceProviderRegistry:
     with database() as conn:
         configured = bool(conn.execute("SELECT 1 FROM installations WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone())
+        source_settings = conn.execute("SELECT * FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
 
     async def hdhive_query(media_type: str, tmdb_id: int, title: str) -> tuple[dict[str, Any], list[dict[str, str]]]:
         data: dict[str, Any] = {"items": []}
@@ -1733,7 +1765,21 @@ def resource_registry() -> ResourceProviderRegistry:
                 logger.warning("module=resources provider=hdhive operation=title_search error_type=%s reason=%s", type(exc).__name__, exc.detail)
         return data, errors
 
-    return ResourceProviderRegistry([HDHiveResourceProvider(hdhive_query, configured=configured)])
+    providers: list[Any] = [HDHiveResourceProvider(hdhive_query, configured=configured)]
+    if source_settings:
+        for provider_id, label in (("prowlarr", "Prowlarr"), ("jackett", "Jackett")):
+            if bool(source_settings[f"{provider_id}_enabled"]):
+                providers.append(TorznabResourceProvider(
+                    provider_id, label, str(source_settings[f"{provider_id}_url"] or ""),
+                    _decrypt_optional(source_settings[f"{provider_id}_api_key"]), year=year, season=season,
+                ))
+        for provider_id, label in (("guanying", "观影"), ("pansou", "盘搜")):
+            if bool(source_settings[f"{provider_id}_enabled"]):
+                providers.append(GenericJSONResourceProvider(
+                    provider_id, label, str(source_settings[f"{provider_id}_url"] or ""),
+                    _decrypt_optional(source_settings[f"{provider_id}_api_key"]),
+                ))
+    return ResourceProviderRegistry(providers)
 
 
 _CACHE_MATCH_SQL = """( (?!=0 AND tmdb_id=?) OR (?=0 AND title=? AND COALESCE(year,'')=COALESCE(?,'')) )"""
@@ -1760,21 +1806,17 @@ def _save_search_cache(media_type: str, tmdb_id: int, douban_id: str, title: str
 def _save_search_history(media_type: str, tmdb_id: int, douban_id: str, title: str, year: str, poster: str, result_count: int) -> None:
     now = int(time.time())
     history_title = title or str(tmdb_id)
+    media_key = _search_media_key(media_type, tmdb_id, douban_id, history_title, year)
     with database() as conn:
-        row = conn.execute(
-            "SELECT id FROM search_history WHERE installation_id=? AND media_type=? AND title=? AND COALESCE(year,'')=? ORDER BY id DESC LIMIT 1",
-            (WEB_INSTALLATION_ID, media_type, history_title, year),
-        ).fetchone()
-        if row:
-            conn.execute(
-                "UPDATE search_history SET tmdb_id=?,douban_id=?,poster=?,result_count=?,searched_at=? WHERE id=?",
-                (tmdb_id, douban_id, poster, result_count, now, row["id"]),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO search_history (installation_id,title,media_type,year,tmdb_id,douban_id,poster,result_count,searched_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (WEB_INSTALLATION_ID, history_title, media_type, year, tmdb_id, douban_id, poster, result_count, now),
-            )
+        conn.execute(
+            """INSERT INTO search_history (installation_id,media_key,title,media_type,year,tmdb_id,douban_id,poster,result_count,searched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(installation_id,media_key) DO UPDATE SET
+                 title=excluded.title,year=excluded.year,tmdb_id=excluded.tmdb_id,douban_id=excluded.douban_id,
+                 poster=CASE WHEN excluded.poster<>'' THEN excluded.poster ELSE search_history.poster END,
+                 result_count=excluded.result_count,searched_at=excluded.searched_at""",
+            (WEB_INSTALLATION_ID, media_key, history_title, media_type, year, tmdb_id, douban_id, poster, result_count, now),
+        )
         conn.execute(
             """DELETE FROM search_history WHERE installation_id=? AND id NOT IN (
                 SELECT id FROM search_history WHERE installation_id=? ORDER BY searched_at DESC LIMIT 20)""",
@@ -1791,24 +1833,23 @@ async def web_resource_search(media_type: str = Query(..., pattern="^(movie|tv)$
     if not tmdb_id and title.strip():
         resolution = await resolve_tmdb_id(media_type, title, year)
         resolved_tmdb_id = int(resolution.get("tmdb_id") or 0)
-    providers = resource_registry()
+    providers = resource_registry(year=year)
     items, errors = await providers.search(media_type, resolved_tmdb_id, title)
     for error in errors:
         logger.error("module=resources provider=%s operation=search error_type=ProviderError reason=%s", error["provider"], error["error"])
     source_counts: dict[str, int] = {}
     for item in items:
-        source = item.source_type or "其他来源"
+        source = item.provider_name or item.source_type or "其他来源"
         source_counts[source] = source_counts.get(source, 0) + 1
+    for provider in providers.infos():
+        count = sum(1 for item in items if item.provider == provider["id"])
+        logger.info("module=resources provider=%s operation=search results=%s", provider["id"], count)
     with database() as conn:
         settings = conn.execute("SELECT save_directory,save_folder_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
     save_path = str(settings["save_directory"] or "") if settings else ""
     save_folder_id = str(settings["save_folder_id"] or "") if settings else ""
     payload = {"items": [item.model_dump() for item in items], "filters": filter_options(items), "providers": providers.infos(), "errors": errors, "total": len(items), "source_counts": source_counts, "save_path": save_path, "save_folder_id": save_folder_id, "resolved_tmdb_id": resolved_tmdb_id or None, "resolution": resolution, "match": {"media_type": media_type, "tmdb_id": tmdb_id or None, "douban_id": douban_id or None, "title": title, "year": year}, "searched_at": int(time.time()), "cached": False}
     _save_search_cache(media_type, resolved_tmdb_id, douban_id, title, year, json.dumps(payload, ensure_ascii=False, default=str))
-    poster = ""
-    for item in items:
-        if item.uploader_avatar:
-            poster = item.uploader_avatar
     _save_search_history(media_type, resolved_tmdb_id, douban_id, title, year, poster, len(items))
     return payload
 
@@ -1856,7 +1897,7 @@ def web_search_history_clear() -> dict[str, Any]:
 
 class WebResourceTransfer(BaseModel):
     provider: str = Field(min_length=1, max_length=50)
-    resource_id: str = Field(min_length=1, max_length=200)
+    resource_id: str = Field(min_length=1, max_length=10000)
     subscription_id: int | None = None
     media_type: str = ""
     tmdb_id: int = 0
@@ -1917,8 +1958,37 @@ async def _execute_transfer(result: dict[str, Any], resource_id: str) -> dict[st
 
 @app.post("/api/web/resources/transfer")
 async def web_resource_transfer(request: WebResourceTransfer) -> dict[str, Any]:
+    if request.provider in {"prowlarr", "jackett", "guanying", "pansou"}:
+        link_type = classify_share_link(request.resource_id)
+        if request.provider in {"prowlarr", "jackett"} and link_type != "offline":
+            raise HTTPException(400, "BT 资源未返回可用的磁力链接")
+        if link_type not in {"offline", "115"}:
+            raise HTTPException(400, "该聚合结果未返回可直接处理的115或磁力链接")
+        settings = get_business_settings()
+        if link_type == "offline" and not settings["offline_enabled"]:
+            raise HTTPException(409, "请先在业务设置启用磁力云下载")
+        with database() as conn:
+            row = conn.execute("SELECT p115_cookie,save_folder_id FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        if not row or not row["p115_cookie"]:
+            raise HTTPException(409, "115 尚未授权，请先到授权中心扫码")
+        try:
+            client = P115Client(decrypt(row["p115_cookie"]), REQUEST_TIMEOUT)
+            if link_type == "offline":
+                task = await client.offline(request.resource_id, settings["ed2k_directory"])
+            else:
+                task = await client.transfer(request.resource_id, str(row["save_folder_id"] or ""))
+        except P115Error as exc:
+            logger.error("module=resources provider=%s operation=transfer error_type=P115Error reason=%s", request.provider, exc)
+            raise HTTPException(502, str(exc)) from exc
+        if link_type == "offline":
+            now = int(time.time())
+            with database() as conn:
+                conn.execute("INSERT INTO offline_tasks (installation_id,task_url,provider_task_id,status,save_path,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                             (WEB_INSTALLATION_ID, request.resource_id, str(task.get("info_hash") or task.get("task_id") or ""), "submitted", settings["ed2k_directory"], now, now))
+        logger.info("module=resources provider=%s operation=transfer_success link_type=%s", request.provider, link_type)
+        return {"ok": True, "provider": request.provider, "message": "已提交115离线下载任务" if link_type == "offline" else "115转存完成", **task}
     if request.provider != "hdhive":
-        raise HTTPException(400, "该资源来源暂不支持转存")
+        raise HTTPException(400, "该资源来源暂不支持直接转存")
     try:
         result = await resolve_resource(ResolveRequest(slug=request.resource_id, max_unlock_points=None), WEB_INSTALLATION_ID, subscription_id=request.subscription_id)
         return await _execute_transfer(result, request.resource_id)
@@ -2442,6 +2512,21 @@ class BusinessSettings(BaseModel):
     p115_security_key: str = Field(default="", max_length=64)
 
 
+class SearchSourceSettings(BaseModel):
+    prowlarr_url: str = Field(default="", max_length=500)
+    prowlarr_api_key: str = Field(default="", max_length=1000)
+    prowlarr_enabled: bool = False
+    jackett_url: str = Field(default="", max_length=500)
+    jackett_api_key: str = Field(default="", max_length=1000)
+    jackett_enabled: bool = False
+    guanying_url: str = Field(default="", max_length=500)
+    guanying_api_key: str = Field(default="", max_length=1000)
+    guanying_enabled: bool = False
+    pansou_url: str = Field(default="", max_length=500)
+    pansou_api_key: str = Field(default="", max_length=1000)
+    pansou_enabled: bool = False
+
+
 BUSINESS_SETTING_COLUMNS = (
     "root_directory,save_directory,save_folder_id,scrape_directory,save_wait_seconds,retry_count,"
     "duplicate_policy,subscription_auto_transfer,subscription_interval,offline_enabled,ed2k_directory,ed2k_poll_interval,"
@@ -2502,6 +2587,52 @@ def put_business_settings(request: BusinessSettings) -> dict[str, Any]:
              int(values["ed2k_auto_archive"]), secret, int(time.time())),
         )
     return {"ok": True, **request.model_dump()}
+
+
+@app.get("/api/web/settings/search-sources")
+def get_search_source_settings() -> dict[str, Any]:
+    init_database()
+    with database() as conn:
+        row = conn.execute("SELECT prowlarr_url,prowlarr_api_key,prowlarr_enabled,jackett_url,jackett_api_key,jackett_enabled,guanying_url,guanying_api_key,guanying_enabled,pansou_url,pansou_api_key,pansou_enabled FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+    if not row:
+        return SearchSourceSettings().model_dump()
+    data = dict(row)
+    for provider in ("prowlarr", "jackett", "guanying", "pansou"):
+        data[f"{provider}_enabled"] = bool(data[f"{provider}_enabled"])
+        data[f"{provider}_has_api_key"] = bool(data.pop(f"{provider}_api_key", ""))
+    return data
+
+
+@app.put("/api/web/settings/search-sources")
+def put_search_source_settings(request: SearchSourceSettings) -> dict[str, Any]:
+    values = request.model_dump()
+    for provider in ("prowlarr", "jackett", "guanying", "pansou"):
+        if values[f"{provider}_enabled"] and not str(values[f"{provider}_url"] or "").strip():
+            raise HTTPException(422, f"启用 {provider} 前请填写服务地址")
+        if values[f"{provider}_enabled"] and provider in {"prowlarr", "jackett"} and not str(values[f"{provider}_api_key"] or "").strip():
+            with database() as conn:
+                current_key = conn.execute(f"SELECT {provider}_api_key FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+            if not current_key or not current_key[f"{provider}_api_key"]:
+                raise HTTPException(422, f"启用 {provider} 前请填写 API Key")
+    with database() as conn:
+        current = conn.execute("SELECT * FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        if not current:
+            conn.execute("INSERT INTO web_settings (installation_id,updated_at) VALUES (?,?)", (WEB_INSTALLATION_ID, int(time.time())))
+            current = conn.execute("SELECT * FROM web_settings WHERE installation_id=?", (WEB_INSTALLATION_ID,)).fetchone()
+        stored: dict[str, Any] = {}
+        for provider in ("prowlarr", "jackett", "guanying", "pansou"):
+            key = str(values[f"{provider}_api_key"] or "").strip()
+            stored[f"{provider}_api_key"] = encrypt(key) if key else str(current[f"{provider}_api_key"] or "")
+        conn.execute("""UPDATE web_settings SET
+            prowlarr_url=?,prowlarr_api_key=?,prowlarr_enabled=?,jackett_url=?,jackett_api_key=?,jackett_enabled=?,
+            guanying_url=?,guanying_api_key=?,guanying_enabled=?,pansou_url=?,pansou_api_key=?,pansou_enabled=?,updated_at=?
+            WHERE installation_id=?""", (
+            values["prowlarr_url"].strip(), stored["prowlarr_api_key"], int(values["prowlarr_enabled"]),
+            values["jackett_url"].strip(), stored["jackett_api_key"], int(values["jackett_enabled"]),
+            values["guanying_url"].strip(), stored["guanying_api_key"], int(values["guanying_enabled"]),
+            values["pansou_url"].strip(), stored["pansou_api_key"], int(values["pansou_enabled"]), int(time.time()), WEB_INSTALLATION_ID,
+        ))
+    return {"ok": True}
 
 
 @app.post("/api/web/settings/ed2k-test")

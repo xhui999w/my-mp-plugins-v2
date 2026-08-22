@@ -553,6 +553,31 @@ class OAuthServiceTests(unittest.TestCase):
         cleared = self.client.delete("/api/web/search-history").json()
         self.assertEqual(cleared["deleted"], 1)
 
+    def test_search_history_upserts_same_media_and_keeps_distinct_year(self):
+        main._save_search_history("movie", 123, "", "旧标题", "2025", "first.jpg", 1)
+        main._save_search_history("movie", 123, "", "新标题", "2025", "", 4)
+        main._save_search_history("movie", 0, "", "同名作品", "2024", "a.jpg", 2)
+        main._save_search_history("movie", 0, "", "同名作品", "2025", "b.jpg", 3)
+        with main.database() as conn:
+            tmdb = conn.execute("SELECT * FROM search_history WHERE media_key='movie:tmdb:123'").fetchall()
+            same_title = conn.execute("SELECT * FROM search_history WHERE title='同名作品' ORDER BY year").fetchall()
+        self.assertEqual(len(tmdb), 1)
+        self.assertEqual(tmdb[0]["title"], "新标题")
+        self.assertEqual(tmdb[0]["poster"], "first.jpg")
+        self.assertEqual(tmdb[0]["result_count"], 4)
+        self.assertEqual([row["year"] for row in same_title], ["2024", "2025"])
+
+    def test_search_source_settings_mask_secrets_and_validate_required_values(self):
+        invalid = self.client.put("/api/web/settings/search-sources", json={"prowlarr_enabled": True})
+        self.assertEqual(invalid.status_code, 422)
+        saved = self.client.put("/api/web/settings/search-sources", json={
+            "prowlarr_enabled": True, "prowlarr_url": "http://prowlarr:9696", "prowlarr_api_key": "secret-key",
+        })
+        self.assertEqual(saved.status_code, 200)
+        data = self.client.get("/api/web/settings/search-sources").json()
+        self.assertTrue(data["prowlarr_has_api_key"])
+        self.assertNotIn("prowlarr_api_key", data)
+
     def test_unlock_transfer_status_migration(self):
         now = int(main.time.time())
         with main.database() as conn:
